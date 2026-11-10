@@ -8,12 +8,14 @@ import { StyleSheet, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { ConfirmDialogHost, ToastHost } from '@/components/Overlays';
+import { installDevGlobals } from '@/lib/devGlobals';
 import { startOnlineTracking } from '@/lib/online';
 import { queryClient } from '@/lib/queryClient';
 import { useSession } from '@/state/session';
 import { colors } from '@/theme';
 
 void SplashScreen.preventAutoHideAsync().catch(() => undefined);
+installDevGlobals();
 
 export default function RootLayout() {
   // If the fonts fail to load the app still opens, in the system font.

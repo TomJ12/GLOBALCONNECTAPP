@@ -14,14 +14,17 @@ function handleError(error: unknown): void {
   if (isProviderError(error) && error.kind === 'unauthorized') onUnauthorized?.();
 }
 
-export function createQueryClient(options: { retry?: boolean } = {}): QueryClient {
-  const retry = options.retry ?? true;
+/** `forTests` turns off retries and cache-expiry timers so a test run can finish cleanly. */
+export function createQueryClient(options: { forTests?: boolean } = {}): QueryClient {
+  const retry = !options.forTests;
+  const gcTime = options.forTests ? Infinity : undefined;
   return new QueryClient({
     queryCache: new QueryCache({ onError: handleError }),
     mutationCache: new MutationCache({ onError: handleError }),
     defaultOptions: {
       queries: {
         staleTime: 15_000,
+        ...(gcTime === undefined ? {} : { gcTime }),
         // One automatic retry, and only for failures that might pass on a second try.
         retry: (failureCount, error) => retry && failureCount < 1 && isProviderError(error) && error.retryable,
         retryDelay: 600,
@@ -31,6 +34,7 @@ export function createQueryClient(options: { retry?: boolean } = {}): QueryClien
         // Never retry or queue anything that moves money. The person decides.
         retry: false,
         networkMode: 'always',
+        ...(gcTime === undefined ? {} : { gcTime }),
       },
     },
   });

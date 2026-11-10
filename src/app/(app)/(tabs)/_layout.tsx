@@ -1,17 +1,27 @@
 import { Tabs } from 'expo-router/js-tabs';
 import { ArrowLeftRight, House, Send, TrendingUp } from 'lucide-react-native';
 
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
 import { colors, fonts } from '@/theme';
 
 export default function TabsLayout() {
+  const insets = useSafeAreaInsets();
   return (
     <Tabs
       screenOptions={{
         headerShown: false,
         tabBarActiveTintColor: colors.primaryPressed,
         tabBarInactiveTintColor: colors.textMuted,
-        tabBarLabelStyle: { fontFamily: fonts.medium, fontSize: 12 },
-        tabBarStyle: { backgroundColor: colors.card, borderTopColor: colors.hairline },
+        tabBarLabelStyle: { fontFamily: fonts.medium, fontSize: 12, lineHeight: 16 },
+        // Tall enough for a 44pt target and an unclipped label on every platform.
+        tabBarStyle: {
+          backgroundColor: colors.card,
+          borderTopColor: colors.hairline,
+          height: 76 + insets.bottom,
+          paddingTop: 8,
+          paddingBottom: 10 + insets.bottom,
+        },
         sceneStyle: { backgroundColor: colors.background },
       }}
     >
