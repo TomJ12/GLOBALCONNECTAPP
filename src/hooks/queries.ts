@@ -14,7 +14,9 @@ import {
 
 import { getAlertsStore, type NewRateAlert } from '@/alerts';
 import { getProviderClient } from '@/api';
+import { ProviderError } from '@/api/errors';
 import type { BookConversionRequest, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
+import { clearSignInAttempt, loadSignInAttempt, newDeviceSecret, saveSignInAttempt } from '@/lib/signInAttempt';
 import { useSession } from '@/state/session';
 
 export const queryKeys = {
@@ -145,13 +147,33 @@ export function uniqueById<T extends { id: string }>(items: readonly T[]): T[] {
 
 // --- Sign-in ------------------------------------------------------------------
 
+/** Asks for a login link and remembers, on this device only, the secret that goes with it. */
 export function useRequestMagicLink() {
-  return useMutation({ mutationFn: (email: string) => getProviderClient().requestMagicLink(email) });
+  return useMutation({
+    mutationFn: async (email: string) => {
+      const secret = newDeviceSecret();
+      const link = await getProviderClient().requestMagicLink(email, secret);
+      await saveSignInAttempt({ requestId: link.requestId, secret });
+      return link;
+    },
+  });
 }
 
+/**
+ * Completes a login link or code. Only works on the device that asked for it:
+ * without the matching secret stored here, it is refused before anything is sent.
+ */
 export function useVerifyMagicLink() {
   return useMutation({
-    mutationFn: (input: { requestId: string; code: string }) => getProviderClient().verifyMagicLink(input.requestId, input.code),
+    mutationFn: async (input: { requestId: string; code: string }) => {
+      const attempt = await loadSignInAttempt();
+      if (!attempt || attempt.requestId !== input.requestId) {
+        throw new ProviderError('forbidden', { detail: 'Login link was not requested on this device' });
+      }
+      const session = await getProviderClient().verifyMagicLink(input.requestId, input.code, attempt.secret);
+      await clearSignInAttempt();
+      return session;
+    },
   });
 }
 

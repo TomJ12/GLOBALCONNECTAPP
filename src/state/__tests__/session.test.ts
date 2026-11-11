@@ -6,12 +6,12 @@ import { ProviderError } from '@/api/errors';
 import { createInactivityHandler } from '@/lib/inactivity';
 import { queryClient } from '@/lib/queryClient';
 import { useSession } from '@/state/session';
-import { installMockBackend } from '@/test/utils';
+import { installMockBackend, TEST_DEVICE_SECRET } from '@/test/utils';
 
 async function signInThroughStore(email = 'finance@example.com'): Promise<void> {
   const client = getProviderClient();
-  const link = await client.requestMagicLink(email);
-  useSession.getState().startSession(await client.verifyMagicLink(link.requestId, link.devCode ?? ''));
+  const link = await client.requestMagicLink(email, TEST_DEVICE_SECRET);
+  useSession.getState().startSession(await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET));
 }
 
 describe('session', () => {
@@ -34,7 +34,7 @@ describe('session', () => {
 
   it('leaves nothing on the device that could sign back in', async () => {
     await signInThroughStore();
-    await getProviderClient().listBalances();
+    await getAlertsStore('finance@example.com').create({ base: 'EUR', quote: 'USD', direction: 'above', targetRate: '1.2' });
     const session = useSession.getState().session;
     // The session holds who the user is and no credential of any kind.
     expect(Object.keys(session ?? {})).toEqual(['user']);
@@ -43,7 +43,9 @@ describe('session', () => {
     const keys = await AsyncStorage.getAllKeys();
     const stored = await Promise.all(keys.map((key) => AsyncStorage.getItem(key)));
     const everything = JSON.stringify([keys, stored]).toLowerCase();
-    expect(everything).not.toMatch(/token|credential|device|finance@example\.com/);
+    expect(everything).not.toMatch(/token|credential|device|secret|finance@example\.com/);
+    // With no money movement in doubt, sign-out leaves the device storage empty.
+    expect(keys).toEqual([]);
     // The only way back in is a new emailed link.
     const client = getProviderClient() as unknown as Record<string, unknown>;
     const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(client));
@@ -93,21 +95,29 @@ describe('session', () => {
     expect(useSession.getState().signedOutReason).toBe('inactive');
   });
 
-  it('keeps each person\'s rate alerts separate on a shared device', async () => {
+  it("keeps each person's rate alerts separate, and deletes them from the device on sign-out", async () => {
     expect(alertsStorageKey('a@example.com')).not.toBe(alertsStorageKey('b@example.com'));
     expect(alertsStorageKey(' A@Example.com ')).toBe(alertsStorageKey('a@example.com'));
     expect(alertsStorageKey('a@example.com')).not.toContain('example');
 
     await signInThroughStore('a@example.com');
-    const mine = getAlertsStore('a@example.com');
-    const created = await mine.create({ base: 'EUR', quote: 'USD', direction: 'above', targetRate: '1.2' });
-    await useSession.getState().signOut();
+    const created = await getAlertsStore('a@example.com').create({ base: 'EUR', quote: 'USD', direction: 'above', targetRate: '1.2' });
+    expect(await AsyncStorage.getItem(alertsStorageKey('a@example.com'))).toContain(created.id);
 
-    // Sign-out drops the in-memory copy: the next user gets a different store object and none of A's alerts.
-    expect(getAlertsStore('a@example.com')).not.toBe(mine);
+    // B signs in on the same device while A's alerts are still stored: B sees none of them.
+    useSession.setState({ session: null });
     await signInThroughStore('b@example.com');
-    const theirs = await getAlertsStore('b@example.com').list();
-    expect(theirs.map((alert) => alert.id)).not.toContain(created.id);
-    expect((await getAlertsStore('a@example.com').list()).map((alert) => alert.id)).toContain(created.id);
+    expect((await getAlertsStore('b@example.com').list()).map((alert) => alert.id)).not.toContain(created.id);
+    await getAlertsStore('b@example.com').create({ base: 'GBP', quote: 'USD', direction: 'below', targetRate: '1.1' });
+
+    // B signs out: B's alerts are deleted from the device, A's are untouched.
+    await useSession.getState().signOut();
+    expect(await AsyncStorage.getItem(alertsStorageKey('b@example.com'))).toBeNull();
+    expect(await AsyncStorage.getItem(alertsStorageKey('a@example.com'))).toContain(created.id);
+
+    // A signs in and out: now nothing of anyone's is left.
+    await signInThroughStore('a@example.com');
+    await useSession.getState().signOut();
+    expect(await AsyncStorage.getAllKeys()).toEqual([]);
   });
 });

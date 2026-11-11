@@ -14,6 +14,7 @@ import type {
   CompanyProfile,
   Conversion,
   CurrencyCode,
+  ListResult,
   ForwardContract,
   MagicLinkRequest,
   NewBeneficiary,
@@ -32,8 +33,13 @@ import type {
 
 export interface ProviderClient {
   // Sign-in. The client keeps the session token internally.
-  requestMagicLink(email: string): Promise<MagicLinkRequest>;
-  verifyMagicLink(requestId: string, code: string): Promise<Session>;
+  /**
+   * `deviceSecret` is a random value this device makes up and keeps. The same
+   * value must be presented at verification, so a link opened on any other
+   * device does not sign anyone in.
+   */
+  requestMagicLink(email: string, deviceSecret: string): Promise<MagicLinkRequest>;
+  verifyMagicLink(requestId: string, code: string, deviceSecret: string): Promise<Session>;
   signOut(): Promise<void>;
 
   getCompanyProfile(): Promise<CompanyProfile>;
@@ -56,7 +62,8 @@ export interface ProviderClient {
   findConversionByIdempotencyKey(idempotencyKey: string): Promise<Conversion | null>;
   listForwardContracts(): Promise<ForwardContract[]>;
 
-  listBeneficiaries(): Promise<Beneficiary[]>;
+  /** Every saved payee, up to a large cap. `truncated` is true if the cap was reached. */
+  listBeneficiaries(): Promise<ListResult<Beneficiary>>;
   createBeneficiary(input: NewBeneficiary): Promise<Beneficiary>;
 
   listPayments(request: PageRequest): Promise<Page<Payment>>;

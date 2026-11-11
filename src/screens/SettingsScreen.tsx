@@ -96,6 +96,20 @@ function DeveloperPanel() {
         />
       </View>
 
+      <View style={styles.switchRow}>
+        <AppText variant="label" style={styles.grow}>
+          Fail only requests that change something
+        </AppText>
+        <Switch
+          accessibilityLabel="Fail only requests that change something"
+          accessibilityHint="Reads keep working, so outcome checks are not failed by the same switch"
+          value={controls.failWritesOnly}
+          onValueChange={(failWritesOnly) => setControls({ failWritesOnly })}
+          trackColor={{ true: colors.primary, false: colors.disabledBg }}
+          testID="dev-writes-only-switch"
+        />
+      </View>
+
       <Button
         variant="secondary"
         label="Reset sample data"

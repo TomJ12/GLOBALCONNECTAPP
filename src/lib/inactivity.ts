@@ -12,7 +12,7 @@ export function createInactivityHandler(options: {
   limitMs?: number;
   now?: () => number;
 }): (state: AppStateStatus) => void {
-  const now = options.now ?? Date.now;
+  const now = options.now ?? (() => Date.now());
   const limitMs = options.limitMs ?? INACTIVITY_LOCK_MS;
   let leftAt: number | null = null;
   return (state) => {

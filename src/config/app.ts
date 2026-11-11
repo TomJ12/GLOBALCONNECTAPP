@@ -24,3 +24,19 @@ export const SAMPLE_PLAN_NAME = 'Business Standard';
 export const FORWARD_TENORS_MONTHS: readonly number[] = [1, 3, 6, 12];
 
 export const APP_NAME = 'Global Connect';
+
+/**
+ * After a payment or conversion whose outcome is unknown (no answer, timeout),
+ * the request may still be on its way to being applied. The app keeps checking
+ * for this long before it lets the customer try again, and never says "nothing
+ * happened" on the strength of one early check.
+ *
+ * PLACEHOLDER VALUES: [PROCESSING WINDOW — confirm with the provider how long a
+ * timed-out request can still be applied]. Mutable so tests can shorten them.
+ */
+export const outcomeCheckTiming = {
+  /** How long to keep the form blocked and keep checking. */
+  windowMs: 90_000,
+  /** How often to check within the window. */
+  intervalMs: 5_000,
+};

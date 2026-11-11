@@ -1,8 +1,11 @@
+import { CurrencycloudClient } from '../adapters/currencycloud/client';
+import { MOCK_MAGIC_LINK_CODE, MockCurrencycloudServer } from '../adapters/currencycloud/mockServer';
 import { createCurrencycloudMock } from '../adapters/currencycloudMock';
 import { ProviderError, type ProviderErrorKind } from '../errors';
 import { DEFAULT_MOCK_CONTROLS, mockControlsFromEnv, sanitizeMockControls, type MockControls } from '../mockControls';
 import type { ProviderClient } from '../provider';
 
+const SECRET = 's'.repeat(64);
 const START = Date.parse('2026-11-10T12:00:00.000Z');
 
 function setup(overrides: Partial<MockControls> = {}, extra: { clientSkewMs?: number; requestTimeoutMs?: number } = {}) {
@@ -22,8 +25,8 @@ function setup(overrides: Partial<MockControls> = {}, extra: { clientSkewMs?: nu
 
 async function signedIn(overrides: Partial<MockControls> = {}, extra: { clientSkewMs?: number; requestTimeoutMs?: number } = {}) {
   const context = setup(overrides, extra);
-  const link = await context.client.requestMagicLink('Finance@Example.com');
-  await context.client.verifyMagicLink(link.requestId, link.devCode ?? '');
+  const link = await context.client.requestMagicLink('Finance@Example.com', SECRET);
+  await context.client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET);
   return context;
 }
 
@@ -48,27 +51,48 @@ describe('sign-in', () => {
 
   it('signs in with a magic link, once', async () => {
     const { client } = setup();
-    const link = await client.requestMagicLink('Finance@Example.com');
+    const link = await client.requestMagicLink('Finance@Example.com', SECRET);
     expect(link.email).toBe('finance@example.com');
-    await expectKind(client.verifyMagicLink(link.requestId, 'wrong'), 'unauthorized');
-    const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '');
+    await expectKind(client.verifyMagicLink(link.requestId, 'wrong', SECRET), 'unauthorized');
+    const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET);
     expect(session.user.email).toBe('finance@example.com');
     expect(await balanceOf(client, 'GBP')).toBe('101964.00');
-    await expectKind(client.verifyMagicLink(link.requestId, link.devCode ?? ''), 'unauthorized');
+    await expectKind(client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET), 'unauthorized');
   });
 
   it('rejects a bad email and an expired link', async () => {
     const { client, clock } = setup();
-    await expectKind(client.requestMagicLink('not-an-email'), 'validation');
-    const link = await client.requestMagicLink('a@b.co');
+    await expectKind(client.requestMagicLink('not-an-email', SECRET), 'validation');
+    const link = await client.requestMagicLink('a@b.co', SECRET);
     clock.now += 16 * 60 * 1000;
-    await expectKind(client.verifyMagicLink(link.requestId, link.devCode ?? ''), 'unauthorized');
+    await expectKind(client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET), 'unauthorized');
+  });
+
+  it('a link only completes with the secret of the device that requested it', async () => {
+    const { client } = setup();
+    await expectKind(client.requestMagicLink('a@b.co', 'short'), 'validation');
+    const link = await client.requestMagicLink('a@b.co', SECRET);
+    // Someone else holding the emailed code, on another device, gets nowhere.
+    await expectKind(client.verifyMagicLink(link.requestId, link.devCode ?? '', 'x'.repeat(64)), 'unauthorized');
+    await expectKind(client.listBalances(), 'unauthorized');
+    await expect(client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET)).resolves.toMatchObject({ user: { email: 'a@b.co' } });
+  });
+
+  it('gives each email its own user id', async () => {
+    const { client } = setup();
+    const ids: string[] = [];
+    for (const email of ['a@example.com', 'b@example.com', 'a@example.com']) {
+      const link = await client.requestMagicLink(email, SECRET);
+      ids.push((await client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET)).user.id);
+    }
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids[0]).toBe(ids[2]);
   });
 
   it('signs out, and nothing but a new link signs back in', async () => {
     const { client } = setup();
-    const link = await client.requestMagicLink('a@b.co');
-    const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '');
+    const link = await client.requestMagicLink('a@b.co', SECRET);
+    const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET);
     // A session carries who the user is and nothing that could start another session.
     expect(Object.keys(session)).toEqual(['user']);
     await client.signOut();
@@ -225,10 +249,10 @@ describe('quotes and conversions', () => {
 describe('payees and payments', () => {
   it('lists and creates payees', async () => {
     const { client } = await signedIn();
-    expect((await client.listBeneficiaries()).map((payee) => payee.name)).toEqual(['Brightway Electronics Co.', 'Meridian Logistics GmbH', 'Harbour Print Ltd']);
+    expect((await client.listBeneficiaries()).items.map((payee) => payee.name)).toEqual(['Brightway Electronics Co.', 'Meridian Logistics GmbH', 'Harbour Print Ltd']);
     const created = await client.createBeneficiary({ name: 'New Supplier Ltd', entityType: 'company', currency: 'GBP', bankCountry: 'GB', sortCode: '12-34-56', accountNumber: '12345678' });
     expect(created).toMatchObject({ name: 'New Supplier Ltd', sortCode: '123456', accountNumber: '12345678' });
-    expect((await client.listBeneficiaries())[0]?.id).toBe(created.id);
+    expect((await client.listBeneficiaries()).items[0]?.id).toBe(created.id);
     await expectKind(client.createBeneficiary({ name: 'No Bank', entityType: 'company', currency: 'GBP', bankCountry: 'GB' }), 'validation');
   });
 
@@ -326,6 +350,7 @@ describe('failure injection', () => {
     ['malformed', 'malformed_response'],
     ['wrong_shape', 'malformed_response'],
     ['lost_response', 'network'],
+    ['forbidden', 'forbidden'],
   ];
 
   it.each(forced)('forced %s becomes a typed %s error', async (forcedError, kind) => {
@@ -440,6 +465,86 @@ describe('processed but response lost', () => {
   });
 });
 
+describe('failure injection scopes', () => {
+  it('"writes only" fails changes but leaves reads, and so reconciliation, working', async () => {
+    const { client, controls } = await signedIn();
+    const quote = await client.createQuote({ kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' });
+    controls.forcedError = 'lost_response';
+    controls.failWritesOnly = true;
+    await expectKind(client.bookConversion({ quote, idempotencyKey: 'scoped' }), 'network');
+    // Still under the same forced error, the check gets through.
+    await expect(client.findConversionByIdempotencyKey('scoped')).resolves.toMatchObject({ sellAmount: '1000.00' });
+    expect(await balanceOf(client, 'GBP')).toBe('100964.00');
+  });
+
+  it('"applied late": the write fails now and lands afterwards; an early check sees nothing', async () => {
+    const { client, controls } = await signedIn();
+    controls.forcedError = 'applied_late';
+    controls.lateApplyMs = 120;
+    const input = { beneficiaryId: 'sample-beneficiary-harbour', amount: '250.00', currency: 'GBP', reference: 'LATE-1', reason: 'LATE-1', idempotencyKey: 'late-1' };
+    await expectKind(client.createPayment(input), 'network');
+    // Reads are unaffected, and right now there is honestly no record.
+    expect(await client.findPaymentByIdempotencyKey('late-1')).toBeNull();
+    expect(await balanceOf(client, 'GBP')).toBe('101964.00');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await client.findPaymentByIdempotencyKey('late-1')).toMatchObject({ amount: '250.00' });
+    expect(await balanceOf(client, 'GBP')).toBe('101714.00');
+  });
+});
+
+describe('payee lookups', () => {
+  type Spied = { transport: { request: (request: { path: string }) => Promise<unknown> } };
+  const spyOnTransport = (client: ProviderClient) => jest.spyOn((client as unknown as Spied).transport, 'request');
+
+  it('labels a page of payments by looking up only the payees on it, then uses the cache', async () => {
+    const { client } = await signedIn();
+    for (let index = 0; index < 150; index += 1) {
+      await client.createBeneficiary({ name: `Supplier ${index}`, entityType: 'company', currency: 'GBP', bankCountry: 'GB', sortCode: '123456', accountNumber: '12345678' });
+    }
+    await client.signOut(); // empties the payee cache
+    const link = await client.requestMagicLink('finance@example.com', SECRET);
+    await client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET);
+
+    const requests = spyOnTransport(client);
+    const page = await client.listPayments({ page: 1, perPage: 25 });
+    expect(page.items.every((payment) => payment.beneficiaryName !== null)).toBe(true);
+    const paths = requests.mock.calls.map(([request]) => request.path);
+    // One request for the page, plus one per DISTINCT payee on it (three in the sample data). Never the whole list.
+    expect(paths.filter((path) => path === '/v2/beneficiaries/find')).toEqual([]);
+    expect(paths.filter((path) => /^\/v2\/beneficiaries\/[^/]+$/.test(path))).toHaveLength(3);
+    expect(paths).toHaveLength(4);
+
+    requests.mockClear();
+    await client.listPayments({ page: 1, perPage: 25 });
+    expect(requests).toHaveBeenCalledTimes(1);
+  });
+
+  it('reaching the page cap truncates the payee list instead of failing, and payments still load', async () => {
+    const controls: MockControls = { ...DEFAULT_MOCK_CONTROLS, latencyMs: 0 };
+    const server = new MockCurrencycloudServer({ getControls: () => controls });
+    const client = new CurrencycloudClient(server, { planName: null, devMagicLinkCode: MOCK_MAGIC_LINK_CODE, maxPages: 2 });
+    const link = await client.requestMagicLink('finance@example.com', SECRET);
+    await client.verifyMagicLink(link.requestId, link.devCode ?? '', SECRET);
+    for (let index = 0; index < 250; index += 1) {
+      await client.createBeneficiary({ name: `Supplier ${index}`, entityType: 'company', currency: 'GBP', bankCountry: 'GB', sortCode: '123456', accountNumber: '12345678' });
+    }
+    const payees = await client.listBeneficiaries();
+    expect(payees.truncated).toBe(true);
+    expect(payees.items).toHaveLength(200);
+    // The sample payees are beyond the cap (oldest, so last). Payments and approvals still resolve them.
+    expect((await client.listPayments({ page: 1, perPage: 25 })).items[0]?.beneficiaryName).toBe('Brightway Electronics Co.');
+    expect((await client.listPendingApprovals())[0]?.beneficiary?.name).toBe('Brightway Electronics Co.');
+  });
+
+  it('approvals always read the payee fresh, never from the cache', async () => {
+    const { client } = await signedIn();
+    await client.listPendingApprovals();
+    const requests = spyOnTransport(client);
+    await client.listPendingApprovals();
+    expect(requests.mock.calls.map(([request]) => request.path)).toContain('/v2/beneficiaries/sample-beneficiary-brightway');
+  });
+});
+
 describe('timeouts, paging and clocks', () => {
   it('gives up on a request that never answers, as an outcome-unknown timeout', async () => {
     const { client, controls } = await signedIn({}, { requestTimeoutMs: 40 });
@@ -462,8 +567,9 @@ describe('timeouts, paging and clocks', () => {
       await client.createBeneficiary({ name: `Supplier ${index}`, entityType: 'company', currency: 'GBP', bankCountry: 'GB', sortCode: '123456', accountNumber: '12345678' });
     }
     const all = await client.listBeneficiaries();
-    expect(all).toHaveLength(123);
-    expect(new Set(all.map((payee) => payee.id)).size).toBe(123);
+    expect(all.truncated).toBe(false);
+    expect(all.items).toHaveLength(123);
+    expect(new Set(all.items.map((payee) => payee.id)).size).toBe(123);
     // A pending payment to a payee beyond the first page still resolves its details.
     expect((await client.listPendingApprovals())[0]?.beneficiary?.name).toBe('Brightway Electronics Co.');
   });
@@ -504,7 +610,8 @@ describe('mock controls', () => {
         EXPO_PUBLIC_MOCK_QUOTE_TTL_S: '10',
         EXPO_PUBLIC_MOCK_OFFLINE: '1',
       }),
-    ).toEqual({ latencyMs: 1200, failureRate: 0.25, forcedError: 'rate_limited', quoteTtlSeconds: 10, offline: true });
+    ).toEqual({ ...DEFAULT_MOCK_CONTROLS, latencyMs: 1200, failureRate: 0.25, forcedError: 'rate_limited', quoteTtlSeconds: 10, offline: true });
+    expect(mockControlsFromEnv({ EXPO_PUBLIC_MOCK_FORCE_ERROR: 'forbidden', EXPO_PUBLIC_MOCK_FAIL_WRITES_ONLY: '1' })).toMatchObject({ forcedError: 'forbidden', failWritesOnly: true });
     expect(mockControlsFromEnv({ EXPO_PUBLIC_MOCK_FORCE_ERROR: 'lost_response' }).forcedError).toBe('lost_response');
     expect(mockControlsFromEnv({ EXPO_PUBLIC_MOCK_LATENCY_MS: 'fast', EXPO_PUBLIC_MOCK_FAILURE_RATE: '7', EXPO_PUBLIC_MOCK_FORCE_ERROR: 'boom', EXPO_PUBLIC_MOCK_QUOTE_TTL_S: '0' })).toEqual({
       ...DEFAULT_MOCK_CONTROLS,
@@ -514,12 +621,14 @@ describe('mock controls', () => {
   });
 
   it('sanitises anything the panel could send', () => {
-    expect(sanitizeMockControls({ latencyMs: -5, failureRate: Number.NaN, quoteTtlSeconds: 1e9, forcedError: 'x' as never })).toEqual({
+    expect(sanitizeMockControls({ latencyMs: -5, failureRate: Number.NaN, quoteTtlSeconds: 1e9, forcedError: 'x' as never, lateApplyMs: -1 })).toEqual({
       latencyMs: 0,
       failureRate: 0,
       forcedError: 'none',
       quoteTtlSeconds: 3600,
       offline: false,
+      failWritesOnly: false,
+      lateApplyMs: 0,
     });
   });
 });

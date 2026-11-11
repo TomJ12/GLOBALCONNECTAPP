@@ -1,22 +1,16 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import { storageLabel } from '@/lib/hash';
+
 import type { AlertsStore } from './AlertsStore';
 import { LocalAlertsStore } from './localAlertsStore';
 
 const stores = new Map<string, AlertsStore>();
 let override: AlertsStore | null = null;
 
-/**
- * Storage key for one person's alerts. The email is hashed (FNV-1a, not for
- * security) so no email address is left readable in device storage.
- */
+/** Storage key for one person's alerts. The email is hashed so it is not left readable in device storage. */
 export function alertsStorageKey(userKey: string): string {
-  let hash = 0x811c9dc5;
-  for (const char of userKey.trim().toLowerCase()) {
-    hash ^= char.charCodeAt(0);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return `globalconnect.alerts.v1.${hash.toString(16).padStart(8, '0')}`;
+  return `globalconnect.alerts.v1.${storageLabel(userKey)}`;
 }
 
 /**
@@ -34,12 +28,24 @@ export function getAlertsStore(userKey: string): AlertsStore {
   return store;
 }
 
-/**
- * Drop every in-memory copy. Called on sign-out. The saved alerts stay on the
- * device under that person's own key: they are preferences, not credentials.
- */
+/** Drop every in-memory copy. Called whenever a session starts or ends. */
 export function resetAlertsStores(): void {
   stores.clear();
+}
+
+/**
+ * Delete one person's saved alerts from this device. Called on sign-out, so
+ * signing out leaves nothing of theirs behind. (Product decision, default for
+ * now: it means alerts do not survive a sign-out, including the automatic one
+ * after time in the background.)
+ */
+export async function deleteAlertsFor(userKey: string): Promise<void> {
+  stores.delete(userKey);
+  try {
+    await AsyncStorage.removeItem(alertsStorageKey(userKey));
+  } catch {
+    // Nothing useful to do.
+  }
 }
 
 export function setAlertsStoreForTests(next: AlertsStore | null): void {

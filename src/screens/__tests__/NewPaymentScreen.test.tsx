@@ -1,16 +1,20 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { act, fireEvent, screen } from '@testing-library/react-native';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { getProviderClient } from '@/api';
+import * as confirmModule from '@/lib/confirmAction';
+import { paymentMatchesRequest } from '@/lib/paymentMatch';
+import { pendingStorageKey } from '@/lib/pendingOutcome';
 import { NewPaymentScreen, paymentOutcomeCopy } from '@/screens/NewPaymentScreen';
-import { installMockBackend, renderScreen, setControls, signIn } from '@/test/utils';
+import { useSession } from '@/state/session';
+import { installMockBackend, renderScreen, setControls, setOutcomeTiming, signIn, sleep, TEST_DEVICE_SECRET } from '@/test/utils';
 
 async function gbpBalance(): Promise<string | undefined> {
   return (await getProviderClient().listBalances()).find((balance) => balance.currency === 'GBP')?.amount;
 }
 
-async function toReview(amount: string, reference: string): Promise<void> {
-  await fireEvent.press(await screen.findByRole('button', { name: /Harbour Print Ltd/ }));
+async function toReview(amount: string, reference: string, payee: RegExp = /Harbour Print Ltd/): Promise<void> {
+  await fireEvent.press(await screen.findByRole('button', { name: payee }));
   await fireEvent.changeText(screen.getByTestId('payment-amount'), amount);
   await fireEvent.changeText(screen.getByTestId('payment-reference'), reference);
   await fireEvent.press(screen.getByRole('button', { name: 'Continue' }));
@@ -21,11 +25,21 @@ async function sendAndConfirm(): Promise<void> {
   await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
 }
 
+async function signInAs(email: string): Promise<string> {
+  const client = getProviderClient();
+  const link = await client.requestMagicLink(email, TEST_DEVICE_SECRET);
+  const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET);
+  useSession.getState().startSession(session);
+  return session.user.id;
+}
+
 describe('NewPaymentScreen', () => {
   beforeEach(async () => {
     const mock = installMockBackend();
+    useSession.setState({ session: null, signedOutReason: null });
     await signIn(mock.client);
     await AsyncStorage.clear();
+    setOutcomeTiming(700, 100);
   });
 
   it('walks payee -> amount -> review -> confirm -> outcome', async () => {
@@ -42,6 +56,7 @@ describe('NewPaymentScreen', () => {
     expect(createSpy).not.toHaveBeenCalled();
     await fireEvent.press(screen.getByTestId('confirm-dialog-confirm'));
     expect(await screen.findByTestId('payment-outcome-title')).toHaveTextContent('Payment on its way');
+    expect(screen.queryByText(/different from the payment you confirmed/)).not.toBeOnTheScreen();
     expect(await gbpBalance()).toBe('101714.00');
   });
 
@@ -73,7 +88,6 @@ describe('NewPaymentScreen', () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Continue' }));
       expect(screen.queryByTestId('send-payment')).not.toBeOnTheScreen();
     }
-    // A decimal comma is understood, not turned into a larger number.
     await fireEvent.changeText(screen.getByTestId('payment-amount'), '12,5');
     await fireEvent.changeText(screen.getByTestId('payment-reference'), 'HP-1');
     await fireEvent.press(screen.getByRole('button', { name: 'Continue' }));
@@ -81,6 +95,8 @@ describe('NewPaymentScreen', () => {
   });
 
   it('pays once on a double press', async () => {
+    // The confirm step is answered at once, so the ONLY thing between two taps and two payments is the lock.
+    jest.spyOn(confirmModule, 'confirmAction').mockResolvedValue(true);
     const createSpy = jest.spyOn(getProviderClient(), 'createPayment');
     await renderScreen(<NewPaymentScreen />);
     await toReview('100', 'HP-1');
@@ -89,82 +105,170 @@ describe('NewPaymentScreen', () => {
       fireEvent.press(send);
       fireEvent.press(send);
     });
-    await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
     await screen.findByTestId('payment-outcome-title');
     expect(createSpy).toHaveBeenCalledTimes(1);
     expect(await gbpBalance()).toBe('101864.00');
   });
 
-  it('M1: a lost response blocks editing and resending until the outcome is known, then shows the real payment', async () => {
+  it('a lost response blocks editing and resending, then shows the real payment', async () => {
     const createSpy = jest.spyOn(getProviderClient(), 'createPayment');
     await renderScreen(<NewPaymentScreen />);
     await toReview('100', 'HP-1');
     setControls({ forcedError: 'lost_response' });
     await sendAndConfirm();
 
-    // The payment was made, but nobody knows yet. No way to change the amount or send again.
-    expect(await screen.findByText(/We still cannot confirm whether your payment went through/)).toBeOnTheScreen();
+    expect(await screen.findByText(/we are checking whether your payment went through/)).toBeOnTheScreen();
     expect(screen.queryByTestId('send-payment')).not.toBeOnTheScreen();
     expect(screen.queryByTestId('payment-amount')).not.toBeOnTheScreen();
+    // Past the window and still blocked, because no check has been able to get an answer.
+    await sleep(1000);
+    expect(screen.queryByTestId('send-payment')).not.toBeOnTheScreen();
 
     setControls({ forcedError: 'none' });
-    await fireEvent.press(screen.getByTestId('payment-recheck'));
     expect(await screen.findByTestId('payment-outcome-title')).toHaveTextContent('Payment on its way');
     expect(screen.getByTestId('payment-outcome-amount')).toHaveTextContent('£100.00');
     expect(createSpy).toHaveBeenCalledTimes(1);
     expect(await gbpBalance()).toBe('101864.00');
   });
 
-  it('M1: an unknown outcome survives leaving the screen', async () => {
+  it('a payment that lands AFTER the app gave up is found: one early "not found" does not release the form', async () => {
+    setOutcomeTiming(1500, 100);
+    const client = getProviderClient();
+    const createSpy = jest.spyOn(client, 'createPayment');
+    const findSpy = jest.spyOn(client, 'findPaymentByIdempotencyKey');
+    await renderScreen(<NewPaymentScreen />);
+    await toReview('100', 'HP-1');
+    setControls({ forcedError: 'applied_late', lateApplyMs: 400 });
+    await sendAndConfirm();
+    await screen.findByText(/we are checking whether your payment went through/);
+
+    await waitFor(() => expect(findSpy.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(await gbpBalance()).toBe('101964.00');
+    // Still blocked, and nothing on screen says the money did not move.
+    expect(screen.queryByTestId('send-payment')).not.toBeOnTheScreen();
+    expect(screen.queryByTestId('payment-amount')).not.toBeOnTheScreen();
+    expect(screen.queryByText(/No money has left|did not go through|found no record/)).not.toBeOnTheScreen();
+
+    expect(await screen.findByTestId('payment-outcome-amount', undefined, { timeout: 3000 })).toHaveTextContent('£100.00');
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(await gbpBalance()).toBe('101864.00');
+  });
+
+  it('releases the form only after the whole window, with wording that does not claim nothing happened', async () => {
+    await renderScreen(<NewPaymentScreen />);
+    await toReview('100', 'HP-1');
+    setControls({ forcedError: 'network', failWritesOnly: true });
+    const started = Date.now();
+    await sendAndConfirm();
+    await screen.findByText(/we are checking whether your payment went through/);
+    await fireEvent.press(screen.getByTestId('payment-recheck'));
+    expect(screen.queryByTestId('send-payment')).not.toBeOnTheScreen();
+
+    expect(await screen.findByText(/found no record of that payment. Check Payments and your balance/, undefined, { timeout: 3000 })).toBeOnTheScreen();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(700);
+    expect(screen.queryByText(/No money has left|did not go through/)).not.toBeOnTheScreen();
+    expect(screen.getByTestId('send-payment')).toBeOnTheScreen();
+    expect(await gbpBalance()).toBe('101964.00');
+  });
+
+  it('records the attempt on the device BEFORE sending, so closing the app mid-request cannot lose it', async () => {
+    const userId = await signInAs('finance@example.com');
+    const storageKey = pendingStorageKey('payment', userId);
+    const client = getProviderClient();
+    const real = client.createPayment.bind(client);
+    let storedWhenSent: string | null = null;
+    // The server makes the payment, but this app never hears back (as if it were closed mid-request).
+    const spy = jest.spyOn(client, 'createPayment').mockImplementationOnce(async (input) => {
+      storedWhenSent = await AsyncStorage.getItem(storageKey);
+      await real(input);
+      return new Promise<never>(() => undefined);
+    });
+    const first = await renderScreen(<NewPaymentScreen />);
+    await toReview('100', 'HP-1');
+    await sendAndConfirm();
+    await waitFor(async () => expect(await gbpBalance()).toBe('101864.00'));
+    expect(JSON.parse(storedWhenSent ?? '{}')).toMatchObject({ key: spy.mock.calls[0]?.[0].idempotencyKey });
+    first.queryClient.clear();
+    await screen.unmount();
+
+    // Reopen: the pending payment is reconciled before a new one can be started.
+    spy.mockClear();
+    await renderScreen(<NewPaymentScreen />);
+    expect(await screen.findByTestId('payment-outcome-amount')).toHaveTextContent('£100.00');
+    expect(spy).not.toHaveBeenCalled();
+    expect(await gbpBalance()).toBe('101864.00');
+    expect(await AsyncStorage.getItem(storageKey)).toBeNull();
+  });
+
+  it('a pending payment belongs to the person who sent it: the next user of the device is not blocked and sees nothing of it', async () => {
+    const userA = await signInAs('a@example.com');
     const first = await renderScreen(<NewPaymentScreen />);
     await toReview('100', 'HP-1');
     setControls({ forcedError: 'lost_response' });
     await sendAndConfirm();
-    await screen.findByText(/We still cannot confirm/);
+    await screen.findByText(/we are checking whether your payment went through/);
     first.queryClient.clear();
     await screen.unmount();
-
     setControls({ forcedError: 'none' });
-    const createSpy = jest.spyOn(getProviderClient(), 'createPayment');
+    await useSession.getState().signOut();
+
+    const userB = await signInAs('b@example.com');
+    expect(userB).not.toBe(userA);
+    expect(pendingStorageKey('payment', userB)).not.toBe(pendingStorageKey('payment', userA));
     await renderScreen(<NewPaymentScreen />);
-    expect(await screen.findByTestId('payment-outcome-amount')).toHaveTextContent('£100.00');
-    expect(createSpy).not.toHaveBeenCalled();
-    expect(await gbpBalance()).toBe('101864.00');
+    // B gets the normal first step: not blocked, and not shown A's £100 payment.
+    expect(await screen.findByText('Who are you paying?')).toBeOnTheScreen();
+    await sleep(300);
+    expect(screen.queryByTestId('payment-outcome-amount')).not.toBeOnTheScreen();
+    expect(screen.queryByText(/we are checking/)).not.toBeOnTheScreen();
+    // A's record is still there for A.
+    expect(await AsyncStorage.getItem(pendingStorageKey('payment', userA))).not.toBeNull();
   });
 
-  it('M1: the key is bound to the payment. Same details reuse it; a changed amount gets a new one', async () => {
+  it('the key is bound to payee, amount and reference: the same payment reuses it, any change gets a new one', async () => {
     const client = getProviderClient();
+    // A second payee in the SAME currency, so that only the payee differs in the last step.
+    const other = await client.createBeneficiary({ name: 'Second Sterling Ltd', entityType: 'company', currency: 'GBP', bankCountry: 'GB', sortCode: '123456', accountNumber: '12345678' });
     const createSpy = jest.spyOn(client, 'createPayment');
     await renderScreen(<NewPaymentScreen />);
     await toReview('100', 'HP-1');
+    const keys = () => createSpy.mock.calls.map(([input]) => input.idempotencyKey);
+    const refuse = async () => {
+      setControls({ forcedError: 'rate_limited' });
+      await sendAndConfirm();
+      await screen.findByText(/Too many requests/);
+      setControls({ forcedError: 'none' });
+    };
 
-    // Attempt 1 never reaches the server.
-    setControls({ forcedError: 'network' });
-    await sendAndConfirm();
-    await screen.findByText(/We still cannot confirm/);
-    setControls({ forcedError: 'none' });
-    await fireEvent.press(screen.getByTestId('payment-recheck'));
-    expect(await screen.findByText(/did not go through. No money has left your account/)).toBeOnTheScreen();
+    await refuse();
+    await refuse();
+    expect(keys()[1]).toBe(keys()[0]); // same payment, same key
 
-    // Attempt 2, same details, is refused outright (not ambiguous).
-    setControls({ forcedError: 'rate_limited' });
-    await sendAndConfirm();
-    await screen.findByText(/Too many requests/);
-    setControls({ forcedError: 'none' });
-    expect(createSpy.mock.calls[1]?.[0].idempotencyKey).toBe(createSpy.mock.calls[0]?.[0].idempotencyKey);
+    // Different reference only.
+    await fireEvent.press(screen.getByRole('button', { name: 'Back' }));
+    await fireEvent.changeText(screen.getByTestId('payment-reference'), 'HP-2');
+    await fireEvent.press(screen.getByRole('button', { name: 'Continue' }));
+    await refuse();
+    expect(keys()[2]).not.toBe(keys()[0]);
 
-    // Change the amount: a different payment, a different key, and the result shows the new amount.
+    // Different amount only.
     await fireEvent.press(screen.getByRole('button', { name: 'Back' }));
     await fireEvent.changeText(screen.getByTestId('payment-amount'), '200');
     await fireEvent.press(screen.getByRole('button', { name: 'Continue' }));
-    await sendAndConfirm();
-    expect(await screen.findByTestId('payment-outcome-amount')).toHaveTextContent('£200.00');
-    expect(createSpy.mock.calls[2]?.[0].idempotencyKey).not.toBe(createSpy.mock.calls[0]?.[0].idempotencyKey);
-    expect(createSpy.mock.calls[2]?.[0].amount).toBe('200.00');
-    expect(await gbpBalance()).toBe('101764.00');
+    await refuse();
+    expect(keys()[3]).not.toBe(keys()[2]);
+
+    // Different payee only (same amount and reference typed again).
+    await fireEvent.press(screen.getByRole('button', { name: 'Back' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Back' }));
+    await toReview('200', 'HP-2', /Second Sterling Ltd/);
+    await refuse();
+    expect(createSpy.mock.calls[4]?.[0]).toMatchObject({ beneficiaryId: other.id, amount: '200.00', currency: 'GBP', reference: 'HP-2' });
+    expect(keys()[4]).not.toBe(keys()[3]);
+    expect(new Set(keys()).size).toBe(4);
   });
 
-  it('M7: the outcome copy follows the status the backend reported', async () => {
+  it('the outcome copy follows the status the backend reported', async () => {
     expect(paymentOutcomeCopy('processing')).toMatchObject({ title: 'Payment on its way', tone: 'positive' });
     expect(paymentOutcomeCopy('sent')).toMatchObject({ title: 'Payment sent', tone: 'positive' });
     expect(paymentOutcomeCopy('awaiting_approval')).toMatchObject({ title: 'Not sent yet', tone: 'warning' });
@@ -181,5 +285,23 @@ describe('NewPaymentScreen', () => {
     expect(await screen.findByTestId('payment-outcome-title')).toHaveTextContent('Not sent yet');
     expect(screen.queryByText(/on its way/i)).not.toBeOnTheScreen();
     expect(screen.queryByText('[DELIVERY ESTIMATE]')).not.toBeOnTheScreen();
+  });
+
+  it('warns when the payment the backend created differs from the one that was sent', async () => {
+    const sent = { beneficiaryId: 'b1', amount: '100.00', currency: 'GBP', reference: 'HP-1' };
+    expect(paymentMatchesRequest({ ...sent, amount: '100' }, sent)).toBe(true);
+    expect(paymentMatchesRequest({ ...sent, amount: '1000.00' }, sent)).toBe(false);
+    expect(paymentMatchesRequest({ ...sent, beneficiaryId: 'b2' }, sent)).toBe(false);
+    expect(paymentMatchesRequest({ ...sent, currency: 'USD' }, sent)).toBe(false);
+    expect(paymentMatchesRequest({ ...sent, reference: 'HP-2' }, sent)).toBe(false);
+
+    const client = getProviderClient();
+    const real = client.createPayment.bind(client);
+    jest.spyOn(client, 'createPayment').mockImplementationOnce(async (input) => ({ ...(await real(input)), amount: '1000.00' }));
+    await renderScreen(<NewPaymentScreen />);
+    await toReview('100', 'HP-1');
+    await sendAndConfirm();
+    expect(await screen.findByText(/different from the payment you confirmed/)).toBeOnTheScreen();
+    expect(screen.getByTestId('payment-outcome-amount')).toHaveTextContent('£1,000.00');
   });
 });

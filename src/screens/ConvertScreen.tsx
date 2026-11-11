@@ -14,12 +14,12 @@ import { ChipGroup, SegmentedControl } from '@/components/Controls';
 import { Header } from '@/components/Header';
 import { Screen } from '@/components/Screen';
 import { InlineMessage } from '@/components/StateViews';
-import { FORWARD_TENORS_MONTHS, SUPPORTED_CURRENCIES } from '@/config/app';
+import { FORWARD_TENORS_MONTHS, SUPPORTED_CURRENCIES, outcomeCheckTiming } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useBalances, useBookConversion, useFindConversionByKey } from '@/hooks/queries';
 import { useAppIsActive } from '@/hooks/useAppIsActive';
 import { quoteRequestKey, useHeldQuote } from '@/hooks/useHeldQuote';
-import { useOutcomeCheck, type OutcomeCheckResult } from '@/hooks/useOutcomeCheck';
+import { useOutcomeCheck, type OutcomeResolution } from '@/hooks/useOutcomeCheck';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
 import { confirmAction } from '@/lib/confirmAction';
 import { formatDate, settlementDateAfterMonths } from '@/lib/dates';
@@ -83,16 +83,20 @@ export function ConvertScreen() {
     setAttempt(null);
     setNotice(null);
   };
-  const applyCheck = (check: OutcomeCheckResult<Conversion>) => {
-    if (check.status === 'found') finish(check.value);
-    else if (check.status === 'not_found') {
-      setNotice({ tone: 'warning', text: 'That conversion did not go through. Nothing was converted. You can try again.' });
-    } else {
-      setNotice({ tone: 'danger', text: 'We still cannot confirm whether your conversion went through. Do not try again yet. Check again in a moment.' });
+  const windowSeconds = Math.round(outcomeCheckTiming.windowMs / 1000);
+  const checkingText = `We did not get an answer, so we are checking whether your conversion went through. This can take up to ${windowSeconds} seconds. Do not convert again.`;
+  const applyResolution = (resolution: OutcomeResolution<Conversion>) => {
+    if (resolution.status === 'found') finish(resolution.value);
+    else {
+      // The window passed with no record. That is not proof, so the wording does not claim it.
+      setNotice({
+        tone: 'warning',
+        text: `We kept checking for ${windowSeconds} seconds and found no record of that conversion. Check your balances and Activity before converting again.`,
+      });
     }
   };
-  const outcome = useOutcomeCheck<Conversion>('conversion', (key) => findByKey.mutateAsync(key), applyCheck);
-  const outcomeUnknown = outcome.pendingKey !== null;
+  const outcome = useOutcomeCheck<Conversion>('conversion', (key) => findByKey.mutateAsync(key), applyResolution);
+  const outcomeUnknown = outcome.blocked;
 
   const fixedCurrency = fixedSide === 'sell' ? sellCurrency : buyCurrency;
   // The text is read against the CURRENT currency every render, so after a swap or
@@ -153,7 +157,7 @@ export function ConvertScreen() {
   };
 
   const confirm = useSingleFlight(async () => {
-    if (!quote || !request || insufficient || outcomeUnknown) return;
+    if (!quote || !request || insufficient || outcomeUnknown || !outcome.ready) return;
     setNotice(null);
     if (isQuoteExpired(quote, Date.now(), EXPIRY_SAFETY_MS)) {
       setNotice({ tone: 'warning', text: 'That rate expired. Check the new rate and confirm again.' });
@@ -183,18 +187,31 @@ export function ConvertScreen() {
       setAttempt({ signature, key });
       setConfirmedQuote(quote);
       try {
-        finish(await book.mutateAsync({ quote, idempotencyKey: key }));
+        // Recorded on the device BEFORE it is sent, so closing the app mid-request cannot lose it.
+        await outcome.begin(key, signature);
+      } catch {
+        setNotice({ tone: 'danger', text: 'We could not start this conversion safely on this device. Nothing was sent. Try again.' });
+        return;
+      }
+      try {
+        const conversion = await book.mutateAsync({ quote, idempotencyKey: key });
+        await outcome.settle();
+        finish(conversion);
       } catch (caught) {
         const providerError = toProviderError(caught);
+        if (providerError.outcomeUnknown) {
+          // It may have been booked, or may still be on its way. Block and keep checking.
+          setNotice({ tone: 'info', text: checkingText });
+          outcome.markUnknown();
+          return;
+        }
+        // A definite refusal: nothing was booked, so the record can go.
+        await outcome.settle();
         if (providerError.kind === 'quote_expired') {
           setNotice({ tone: 'warning', text: 'That rate expired. Check the new rate and confirm again.' });
           held.refresh();
         } else if (providerError.kind === 'insufficient_funds') {
           setNotice({ tone: 'danger', text: `There is not enough ${quote.sellCurrency} in your balance for this conversion.` });
-        } else if (providerError.outcomeUnknown) {
-          // It may have been booked. Find out before anything else is allowed.
-          setNotice({ tone: 'info', text: 'We did not get an answer. Checking whether your conversion went through…' });
-          applyCheck(await outcome.markUnknown(key));
         } else {
           setNotice({ tone: 'danger', text: providerError.userMessage });
         }
@@ -205,7 +222,7 @@ export function ConvertScreen() {
   });
 
   const recheck = useSingleFlight(async () => {
-    applyCheck(await outcome.recheck());
+    await outcome.checkNow();
   });
 
   const reset = () => {
@@ -271,7 +288,7 @@ export function ConvertScreen() {
   }
 
   const quoteUsable = quote !== null && !held.isExpired;
-  const canSubmit = quoteUsable && !insufficient && online && !held.isFetching && !outcomeUnknown;
+  const canSubmit = quoteUsable && !insufficient && online && !held.isFetching && !outcomeUnknown && outcome.ready;
   const needsNewRate = !outcomeUnknown && !held.isFetching && (held.error !== null || (quote !== null && held.isExpired));
   const buttonLabel =
     kind === 'forward'
@@ -400,6 +417,7 @@ export function ConvertScreen() {
       </Card>
 
       {notice ? <InlineMessage tone={notice.tone}>{notice.text}</InlineMessage> : null}
+      {outcomeUnknown && !notice ? <InlineMessage tone="info">{checkingText}</InlineMessage> : null}
       {held.error && !held.isFetching && !outcomeUnknown ? (
         <InlineMessage tone="danger">
           {held.error.kind === 'validation' ? 'We cannot quote that amount. Try a different amount.' : `We could not get a rate. ${held.error.userMessage}`}

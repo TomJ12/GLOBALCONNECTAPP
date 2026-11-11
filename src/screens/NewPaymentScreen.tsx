@@ -16,14 +16,16 @@ import { Screen } from '@/components/Screen';
 import { SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { TextField } from '@/components/TextField';
+import { outcomeCheckTiming } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useBalances, useBeneficiaries, useCreatePayment, useFindPaymentByKey } from '@/hooks/queries';
-import { useOutcomeCheck, type OutcomeCheckResult } from '@/hooks/useOutcomeCheck';
+import { useOutcomeCheck, type OutcomeResolution } from '@/hooks/useOutcomeCheck';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
 import { confirmAction } from '@/lib/confirmAction';
 import { newIdempotencyKey } from '@/lib/ids';
 import { amountInputMessage, compareAmounts, formatMoney, readAmountInput } from '@/lib/money';
 import { useIsOnline } from '@/lib/online';
+import { paymentMatchesRequest, type PaymentFacts } from '@/lib/paymentMatch';
 import { colors, spacing } from '@/theme';
 
 import { describeBeneficiaryAccount } from './shared';
@@ -80,6 +82,8 @@ export function NewPaymentScreen() {
    * with a new key; retry the same one and the key is reused.
    */
   const [attempt, setAttempt] = useState<{ signature: string; key: string } | null>(null);
+  /** What was last sent, kept to compare with what the backend says it created. */
+  const [sent, setSent] = useState<PaymentFacts | null>(null);
 
   const finish = (payment: Payment) => {
     setResult(payment);
@@ -87,16 +91,20 @@ export function NewPaymentScreen() {
     setNotice(null);
     setStep('done');
   };
-  const applyCheck = (check: OutcomeCheckResult<Payment>) => {
-    if (check.status === 'found') finish(check.value);
-    else if (check.status === 'not_found') {
-      setNotice({ tone: 'warning', text: 'That payment did not go through. No money has left your account. You can try again.' });
-    } else {
-      setNotice({ tone: 'danger', text: 'We still cannot confirm whether your payment went through. Do not send it again yet. Check again in a moment.' });
+  const windowSeconds = Math.round(outcomeCheckTiming.windowMs / 1000);
+  const checkingText = `We did not get an answer, so we are checking whether your payment went through. This can take up to ${windowSeconds} seconds. Do not send it again.`;
+  const applyResolution = (resolution: OutcomeResolution<Payment>) => {
+    if (resolution.status === 'found') finish(resolution.value);
+    else {
+      // The window passed with no record. That is not proof, so the wording does not claim it.
+      setNotice({
+        tone: 'warning',
+        text: `We kept checking for ${windowSeconds} seconds and found no record of that payment. Check Payments and your balance before sending it again.`,
+      });
     }
   };
-  const outcome = useOutcomeCheck<Payment>('payment', (key) => findByKey.mutateAsync(key), applyCheck);
-  const outcomeUnknown = outcome.pendingKey !== null;
+  const outcome = useOutcomeCheck<Payment>('payment', (key) => findByKey.mutateAsync(key), applyResolution);
+  const outcomeUnknown = outcome.blocked;
 
   const currency = payee?.currency ?? 'GBP';
   const read = readAmountInput(amountText, currency);
@@ -146,7 +154,7 @@ export function NewPaymentScreen() {
   };
 
   const send = useSingleFlight(async () => {
-    if (!payee || amount === null || amountError || referenceError || outcomeUnknown) return;
+    if (!payee || amount === null || amountError || referenceError || outcomeUnknown || !outcome.ready) return;
     setNotice(null);
     const confirmed = await confirmAction({
       title: 'Send this payment?',
@@ -157,25 +165,35 @@ export function NewPaymentScreen() {
     const signature = [payee.id, amount, currency, trimmedReference].join('|');
     const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('payment');
     setAttempt({ signature, key });
+    setSent({ beneficiaryId: payee.id, amount, currency, reference: trimmedReference });
     try {
-      finish(
-        await createPayment.mutateAsync({
-          beneficiaryId: payee.id,
-          amount,
-          currency,
-          reference: trimmedReference,
-          // The provider requires a reason. Until the product decides what to ask, the reference is reused.
-          reason: trimmedReference,
-          idempotencyKey: key,
-        }),
-      );
+      // Recorded on the device BEFORE it is sent, so closing the app mid-request cannot lose it.
+      await outcome.begin(key, signature);
+    } catch {
+      setNotice({ tone: 'danger', text: 'We could not start this payment safely on this device. Nothing was sent. Try again.' });
+      return;
+    }
+    try {
+      const payment = await createPayment.mutateAsync({
+        beneficiaryId: payee.id,
+        amount,
+        currency,
+        reference: trimmedReference,
+        // The provider requires a reason. Until the product decides what to ask, the reference is reused.
+        reason: trimmedReference,
+        idempotencyKey: key,
+      });
+      await outcome.settle();
+      finish(payment);
     } catch (caught) {
       const providerError = toProviderError(caught);
       if (providerError.outcomeUnknown) {
-        // It may have been created. Find out before anything else is allowed.
-        setNotice({ tone: 'info', text: 'We did not get an answer. Checking whether your payment went through…' });
-        applyCheck(await outcome.markUnknown(key));
+        // It may have been created, or may still be on its way. Block and keep checking.
+        setNotice({ tone: 'info', text: checkingText });
+        outcome.markUnknown();
       } else {
+        // A definite refusal: nothing was created, so the record can go.
+        await outcome.settle();
         setNotice({
           tone: 'danger',
           text:
@@ -190,11 +208,12 @@ export function NewPaymentScreen() {
   });
 
   const recheck = useSingleFlight(async () => {
-    applyCheck(await outcome.recheck());
+    await outcome.checkNow();
   });
 
   if (step === 'done' && result) {
     const copy = paymentOutcomeCopy(result.status);
+    const mismatch = sent !== null && !paymentMatchesRequest(result, sent);
     const Icon = copy.tone === 'positive' ? CircleCheck : copy.tone === 'warning' ? Clock : CircleAlert;
     const iconColor = copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
     return (
@@ -210,6 +229,11 @@ export function NewPaymentScreen() {
           <AppText tone="muted" align="center">{`To ${result.beneficiaryName ?? payee?.name ?? 'your payee'}, reference ${result.reference}`}</AppText>
           <AppText align="center">{copy.body}</AppText>
         </Card>
+        {mismatch ? (
+          <InlineMessage tone="danger">
+            These details are different from the payment you confirmed. What is shown here is what was created. Contact support before sending anything else.
+          </InlineMessage>
+        ) : null}
         <Card padded={false}>
           <DetailRow label="Payment ID" value={result.shortReference} />
           {copy.tone === 'positive' ? (
@@ -231,7 +255,7 @@ export function NewPaymentScreen() {
         footer={<Button label="Check again" onPress={recheck.run} loading={recheck.busy || outcome.isChecking} disabled={!online} testID="payment-recheck" />}
       >
         <InlineMessage tone={notice?.tone ?? 'info'}>
-          {notice?.text ?? 'We are checking whether your last payment went through. Do not send it again yet.'}
+          {notice?.text ?? checkingText}
         </InlineMessage>
       </Screen>
     );
@@ -247,12 +271,12 @@ export function NewPaymentScreen() {
         <QueryState
           query={beneficiaries}
           skeleton={<SkeletonList rows={3} label="Loading payees" />}
-          isEmpty={(data) => data.length === 0}
+          isEmpty={(data) => data.items.length === 0}
           empty={<EmptyState title="No saved payees" body="Add a payee to send your first payment." />}
         >
           {(data) => (
             <Card padded={false}>
-              {data.map((beneficiary, index) => (
+              {data.items.map((beneficiary, index) => (
                 <View key={beneficiary.id}>
                   {index > 0 ? <Divider /> : null}
                   <ListRow
@@ -269,6 +293,9 @@ export function NewPaymentScreen() {
             </Card>
           )}
         </QueryState>
+        {beneficiaries.data?.truncated ? (
+          <InlineMessage tone="info">{`Showing the first ${beneficiaries.data.items.length} payees. There are more that are not listed here.`}</InlineMessage>
+        ) : null}
         <Button
           variant="secondary"
           label="Add a new payee"

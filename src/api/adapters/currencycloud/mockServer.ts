@@ -17,6 +17,8 @@ import type { Transport, TransportParams, TransportRequest, TransportResponse } 
 export const MOCK_MAGIC_LINK_CODE = 'SAMPLE-LINK-CODE';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** Requests that change something. Used by "writes only" failure injection and "applied late". */
+const WRITE_PATHS = [/\/conversions\/create$/, /\/payments\/create$/, /\/payments\/authorise$/, /\/payments\/[^/]+\/delete$/, /\/beneficiaries\/create$/];
 const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
 
 /** Sample rates: units of each currency per 1 GBP. */
@@ -68,7 +70,7 @@ interface State {
   conversions: Json[];
   transactions: Json[];
   quotes: Map<string, StoredQuote>;
-  magicLinks: Map<string, { email: string; expiresAtMs: number }>;
+  magicLinks: Map<string, { email: string; expiresAtMs: number; deviceSecret: string }>;
   tokens: Set<string>;
   idempotentPayments: Map<string, Json>;
   idempotentConversions: Map<string, Json>;
@@ -108,6 +110,10 @@ function fail(status: number, errorCode: string, field: string, code: string, me
       error_messages: { [field]: [{ code, message, params: {} }] },
     }),
   };
+}
+
+function contactSlug(email: string): string {
+  return email.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
 }
 
 function pairFor(a: string, b: string): { base: string; quote: string } {
@@ -161,10 +167,19 @@ export class MockCurrencycloudServer implements Transport {
       // Never answers. The client's own timeout has to end the wait.
       return new Promise<TransportResponse>(() => undefined);
     }
-    if (controls.offline || controls.forcedError === 'network') {
+    if (controls.offline) throw new TypeError('Network request failed');
+    const isWrite = WRITE_PATHS.some((pattern) => pattern.test(request.path));
+    // "Writes only" leaves reads working, so a reconciliation check is not failed by the same switch.
+    const forced = controls.failWritesOnly && !isWrite ? 'none' : controls.forcedError;
+    if (forced === 'network') throw new TypeError('Network request failed');
+    if (forced === 'applied_late' && isWrite) {
+      // The caller gives up now; the request still lands later.
+      setTimeout(() => this.route(request), controls.lateApplyMs);
       throw new TypeError('Network request failed');
     }
-    switch (controls.forcedError) {
+    switch (forced) {
+      case 'forbidden':
+        return fail(403, 'permission_denied', 'base', 'permission_denied', 'You do not have permission to perform this action');
       case 'unauthorized':
         return fail(401, 'auth_failed', 'username', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
       case 'rate_limited':
@@ -227,6 +242,11 @@ export class MockCurrencycloudServer implements Transport {
     if (key === 'POST /v2/payments/create') return this.createPayment(params);
     if (key === 'POST /v2/payments/authorise') return this.authorisePayments(params);
 
+    const beneficiaryMatch = /^\/v2\/beneficiaries\/([^/]+)$/.exec(path);
+    if (method === 'GET' && beneficiaryMatch) {
+      const beneficiary = this.state.beneficiaries.find((row) => row.id === beneficiaryMatch[1]);
+      return beneficiary ? ok(beneficiary) : this.notFound();
+    }
     const contactMatch = /^\/v2\/contacts\/([^/]+)$/.exec(path);
     if (method === 'GET' && contactMatch) {
       const contact = this.state.contacts.get(contactMatch[1] ?? '');
@@ -349,16 +369,22 @@ export class MockCurrencycloudServer implements Transport {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
       return fail(400, 'auth_invalid_user_login_details', 'email', 'email_is_in_invalid_format', 'email is in invalid format');
     }
+    // The link only works on the device that asked for it: the device sends a secret now and again at verification.
+    const deviceSecret = one(params, 'device_secret') ?? '';
+    if (deviceSecret.length < 32) {
+      return fail(400, 'auth_invalid_user_login_details', 'device_secret', 'device_secret_is_too_short', 'device_secret is too short');
+    }
     const requestId = this.nextId('link');
     const expiresAtMs = this.now() + MAGIC_LINK_TTL_MS;
-    this.state.magicLinks.set(requestId, { email, expiresAtMs });
+    this.state.magicLinks.set(requestId, { email, expiresAtMs, deviceSecret });
     return ok({ request_id: requestId, email, expires_at: new Date(expiresAtMs).toISOString() });
   }
 
   private sessionBody(email: string): TransportResponse {
     const token = this.nextId('token');
     this.state.tokens.add(token);
-    this.state.me = { ...this.state.me, email_address: email };
+    // Each email is its own contact, so two people on one device never share an identity.
+    this.state.me = { ...this.state.me, id: `sample-contact-${contactSlug(email)}`, email_address: email };
     this.state.contacts.set(this.state.me.id, this.state.me);
     return ok({
       auth_token: token,
@@ -371,6 +397,7 @@ export class MockCurrencycloudServer implements Transport {
     const badLink = () => fail(401, 'auth_failed', 'code', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
     if (!link || link.expiresAtMs <= this.now()) return badLink();
     if (one(params, 'code') !== MOCK_MAGIC_LINK_CODE) return badLink();
+    if (one(params, 'device_secret') !== link.deviceSecret) return badLink();
     this.state.magicLinks.delete(one(params, 'request_id') ?? '');
     return this.sessionBody(link.email);
   }

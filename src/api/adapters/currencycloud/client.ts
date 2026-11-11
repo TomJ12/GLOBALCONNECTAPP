@@ -14,8 +14,10 @@ import type {
   Beneficiary,
   BookConversionRequest,
   CompanyProfile,
+  Beneficiary as BeneficiaryType,
   Conversion,
   ForwardContract,
+  ListResult,
   MagicLinkRequest,
   NewBeneficiary,
   NewPayment,
@@ -83,16 +85,21 @@ export interface CurrencycloudClientOptions {
   devMagicLinkCode?: string | null;
   /** Give up waiting for a response after this long. */
   requestTimeoutMs?: number;
+  /** Most pages a "read everything" loop will fetch (100 rows each). */
+  maxPages?: number;
   now?: () => number;
 }
 
 const MAX_PAGE_SIZE = 100;
-/** Safety stop for "read every page" loops: 50 pages of 100. */
-const MAX_PAGES = 50;
+/** Default safety stop for "read every page" loops: 50 pages of 100. Reaching it truncates; it is not an error. */
+const DEFAULT_MAX_PAGES = 50;
+/** How long a payee looked up for a list row is reused. Approvals always look payees up fresh. */
+const PAYEE_CACHE_MS = 5 * 60 * 1000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 
 export class CurrencycloudClient implements ProviderClient {
   private token: string | null = null;
+  private readonly payeeCache = new Map<string, { at: number; payee: BeneficiaryType | null }>();
   private readonly now: () => number;
 
   constructor(
@@ -137,18 +144,21 @@ export class CurrencycloudClient implements ProviderClient {
 
   // --- Sign-in ----------------------------------------------------------------
 
-  async requestMagicLink(email: string): Promise<MagicLinkRequest> {
+  async requestMagicLink(email: string, deviceSecret: string): Promise<MagicLinkRequest> {
     const raw = await this.call(rawMagicLinkRequest, 'POST', '/v2/authenticate/magic_link/request', {
       email: email.trim().toLowerCase(),
+      device_secret: deviceSecret,
     });
     return mapMagicLinkRequest(raw, this.options.devMagicLinkCode ?? null);
   }
 
-  async verifyMagicLink(requestId: string, code: string): Promise<Session> {
+  async verifyMagicLink(requestId: string, code: string, deviceSecret: string): Promise<Session> {
     const raw = await this.call(rawAppSession, 'POST', '/v2/authenticate/magic_link/verify', {
       request_id: requestId,
       code,
+      device_secret: deviceSecret,
     });
+    this.payeeCache.clear();
     const { session, token } = mapSession(raw);
     this.token = token;
     return session;
@@ -158,6 +168,7 @@ export class CurrencycloudClient implements ProviderClient {
     const token = this.token;
     // Drop the token first so the app is signed out even if the request fails.
     this.token = null;
+    this.payeeCache.clear();
     if (!token) return;
     try {
       await this.transport.request({ method: 'POST', path: '/v2/authenticate/close_session', token });
@@ -166,24 +177,28 @@ export class CurrencycloudClient implements ProviderClient {
     }
   }
 
-  /** Read every page of a list endpoint, so nothing past the first page is silently dropped. */
+  /**
+   * Read every page of a list endpoint, up to the page cap. Reaching the cap is
+   * reported as `truncated`, not thrown: a very large account must still load.
+   */
   private async allPages<S extends z.ZodType, T>(
     schema: S,
     method: 'GET' | 'POST',
     path: string,
     params: TransportParams,
     pick: (page: z.infer<S>) => { items: T[]; nextPage: number },
-  ): Promise<T[]> {
+  ): Promise<ListResult<T>> {
     const all: T[] = [];
+    const maxPages = this.options.maxPages ?? DEFAULT_MAX_PAGES;
     let page = 1;
-    for (let count = 0; count < MAX_PAGES; count += 1) {
+    for (let count = 0; count < maxPages; count += 1) {
       const raw = await this.call(schema, method, path, { ...params, page: String(page), per_page: String(MAX_PAGE_SIZE) });
       const { items, nextPage } = pick(raw);
       all.push(...items);
-      if (nextPage <= page) return all;
+      if (nextPage <= page) return { items: all, truncated: false };
       page = nextPage;
     }
-    throw new ProviderError('malformed_response', { detail: `More than ${MAX_PAGES} pages from ${path}` });
+    return { items: all, truncated: true };
   }
 
   // --- Accounts ---------------------------------------------------------------
@@ -198,7 +213,7 @@ export class CurrencycloudClient implements ProviderClient {
       items: page.balances,
       nextPage: page.pagination.next_page,
     }));
-    return rows.map(mapBalance);
+    return rows.items.map(mapBalance);
   }
 
   async getAccountDetails(currency: string): Promise<AccountDetails> {
@@ -279,7 +294,7 @@ export class CurrencycloudClient implements ProviderClient {
       items: page.conversions,
       nextPage: page.pagination.next_page,
     }));
-    return rows.filter(isOpenForward).map(mapForwardContract);
+    return rows.items.filter(isOpenForward).map(mapForwardContract);
   }
 
   async findConversionByIdempotencyKey(idempotencyKey: string): Promise<Conversion | null> {
@@ -291,36 +306,68 @@ export class CurrencycloudClient implements ProviderClient {
 
   // --- Payees -----------------------------------------------------------------
 
-  async listBeneficiaries(): Promise<Beneficiary[]> {
+  async listBeneficiaries(): Promise<ListResult<Beneficiary>> {
     const rows = await this.allPages(rawFindBeneficiaries, 'POST', '/v2/beneficiaries/find', {}, (page) => ({
       items: page.beneficiaries,
       nextPage: page.pagination.next_page,
     }));
-    return rows.map(mapBeneficiary);
+    const items = rows.items.map(mapBeneficiary);
+    const at = this.now();
+    for (const payee of items) this.payeeCache.set(payee.id, { at, payee });
+    return { items, truncated: rows.truncated };
   }
 
   async createBeneficiary(input: NewBeneficiary): Promise<Beneficiary> {
     const raw = await this.call(rawBeneficiary, 'POST', '/v2/beneficiaries/create', toCreateBeneficiaryParams(input));
-    return mapBeneficiary(raw);
+    const payee = mapBeneficiary(raw);
+    this.payeeCache.set(payee.id, { at: this.now(), payee });
+    return payee;
   }
 
-  private async beneficiaryNames(): Promise<Map<string, string>> {
-    const beneficiaries = await this.listBeneficiaries();
-    return new Map(beneficiaries.map((beneficiary) => [beneficiary.id, beneficiary.name]));
+  /**
+   * Look up just these payees, one request per id that is not cached. The whole
+   * payee list is never downloaded to label a page of payments.
+   * `fresh` skips the cache: used where the details are about to be approved.
+   * A payee that cannot be found is null; only an expired session is rethrown.
+   */
+  private async payeesById(ids: readonly string[], fresh = false): Promise<Map<string, Beneficiary>> {
+    const found = new Map<string, Beneficiary>();
+    const now = this.now();
+    await Promise.all(
+      [...new Set(ids)].map(async (id) => {
+        const cached = this.payeeCache.get(id);
+        if (!fresh && cached && now - cached.at < PAYEE_CACHE_MS) {
+          if (cached.payee) found.set(id, cached.payee);
+          return;
+        }
+        try {
+          const payee = mapBeneficiary(await this.call(rawBeneficiary, 'GET', `/v2/beneficiaries/${encodeURIComponent(id)}`));
+          this.payeeCache.set(id, { at: now, payee });
+          found.set(id, payee);
+        } catch (error) {
+          if (error instanceof ProviderError && error.kind === 'unauthorized') throw error;
+          if (error instanceof ProviderError && error.kind === 'not_found') this.payeeCache.set(id, { at: now, payee: null });
+        }
+      }),
+    );
+    return found;
+  }
+
+  private async payeeNames(ids: readonly string[]): Promise<Map<string, string>> {
+    const payees = await this.payeesById(ids);
+    return new Map([...payees].map(([id, payee]) => [id, payee.name]));
   }
 
   // --- Payments ---------------------------------------------------------------
 
   async listPayments(request: PageRequest): Promise<Page<Payment>> {
-    const [raw, names] = await Promise.all([
-      this.call(rawFindPayments, 'GET', '/v2/payments/find', {
-        page: String(request.page),
-        per_page: String(request.perPage),
-        order: 'created_at',
-        order_asc_desc: 'desc',
-      }),
-      this.beneficiaryNames(),
-    ]);
+    const raw = await this.call(rawFindPayments, 'GET', '/v2/payments/find', {
+      page: String(request.page),
+      per_page: String(request.perPage),
+      order: 'created_at',
+      order_asc_desc: 'desc',
+    });
+    const names = await this.payeeNames(raw.payments.map((payment) => payment.beneficiary_id));
     return mapPage(
       raw.pagination,
       raw.payments.map((payment) => mapPayment(payment, names)),
@@ -337,7 +384,7 @@ export class CurrencycloudClient implements ProviderClient {
       unique_request_id: input.idempotencyKey,
     });
     // The payment is made at this point. Do not fail it because the name lookup failed.
-    const names = await this.beneficiaryNames().catch(() => new Map<string, string>());
+    const names = await this.payeeNames([raw.beneficiary_id]).catch(() => new Map<string, string>());
     return mapPayment(raw, names);
   }
 
@@ -345,24 +392,22 @@ export class CurrencycloudClient implements ProviderClient {
     const raw = await this.call(rawFindPayments, 'GET', '/v2/payments/find', { unique_request_id: idempotencyKey });
     const match = raw.payments.find((payment) => payment.unique_request_id === idempotencyKey);
     if (!match) return null;
-    const names = await this.beneficiaryNames().catch(() => new Map<string, string>());
+    const names = await this.payeeNames([match.beneficiary_id]).catch(() => new Map<string, string>());
     return mapPayment(match, names);
   }
 
   async listPendingApprovals(): Promise<PendingApproval[]> {
-    const [payments, beneficiaries] = await Promise.all([
-      this.allPages(
-        rawFindPayments,
-        'GET',
-        '/v2/payments/find',
-        { status: 'awaiting_authorisation', order: 'created_at', order_asc_desc: 'desc' },
-        (page) => ({ items: page.payments, nextPage: page.pagination.next_page }),
-      ),
-      this.listBeneficiaries(),
-    ]);
-    const raw = { payments };
-    const byId = new Map(beneficiaries.map((beneficiary) => [beneficiary.id, beneficiary]));
-    const names = new Map(beneficiaries.map((beneficiary) => [beneficiary.id, beneficiary.name]));
+    const pending = await this.allPages(
+      rawFindPayments,
+      'GET',
+      '/v2/payments/find',
+      { status: 'awaiting_authorisation', order: 'created_at', order_asc_desc: 'desc' },
+      (page) => ({ items: page.payments, nextPage: page.pagination.next_page }),
+    );
+    const raw = { payments: pending.items };
+    // Fresh, not cached: these are the bank details someone is about to approve.
+    const byId = await this.payeesById(raw.payments.map((payment) => payment.beneficiary_id), true);
+    const names = new Map([...byId].map(([id, payee]) => [id, payee.name]));
     const creatorIds = [...new Set(raw.payments.map((payment) => payment.creator_contact_id).filter(Boolean))] as string[];
     const creators = new Map<string, RawContact>();
     await Promise.all(

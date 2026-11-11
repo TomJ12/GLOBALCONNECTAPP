@@ -10,6 +10,12 @@
  * `lost_response` is different from the others: the server APPLIES the request and
  * then the connection drops, so the caller sees a network error for something that
  * happened. It is the mode that exercises idempotency keys and reconciliation.
+ * `applied_late` goes further: a WRITE fails at once with a network error and is
+ * applied `lateApplyMs` later, like a request that lands after the client gave up.
+ * Reads are not affected by it.
+ *
+ *   EXPO_PUBLIC_MOCK_FAIL_WRITES_ONLY  1 = forced errors hit only requests that change
+ *                                      something, so reads (and reconciliation) still work
  *   EXPO_PUBLIC_MOCK_QUOTE_TTL_S     e.g. 10
  *   EXPO_PUBLIC_MOCK_OFFLINE         1 to start "offline"
  */
@@ -22,6 +28,8 @@ export const FORCED_ERRORS = [
   'malformed',
   'wrong_shape',
   'lost_response',
+  'applied_late',
+  'forbidden',
 ] as const;
 export type ForcedError = (typeof FORCED_ERRORS)[number];
 
@@ -34,6 +42,8 @@ export const FORCED_ERROR_LABELS: Record<ForcedError, string> = {
   malformed: 'Broken JSON',
   wrong_shape: 'Wrong shape',
   lost_response: 'Applied, reply lost',
+  applied_late: 'Applied late',
+  forbidden: '403',
 };
 
 export interface MockControls {
@@ -49,6 +59,10 @@ export interface MockControls {
   offline: boolean;
   /** Never answer at all, to exercise the client's request timeout. Tests only; not in the panel. */
   hang?: boolean;
+  /** Apply forced errors only to requests that change something. Reads keep working. */
+  failWritesOnly: boolean;
+  /** With `applied_late`: how long after the failure the write is applied. */
+  lateApplyMs: number;
 }
 
 export const DEFAULT_MOCK_CONTROLS: MockControls = {
@@ -57,6 +71,8 @@ export const DEFAULT_MOCK_CONTROLS: MockControls = {
   forcedError: 'none',
   quoteTtlSeconds: 30,
   offline: false,
+  failWritesOnly: false,
+  lateApplyMs: 3000,
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -82,6 +98,8 @@ export function sanitizeMockControls(input: Partial<MockControls>): MockControls
       3600,
     ),
     offline: Boolean(merged.offline),
+    failWritesOnly: Boolean(merged.failWritesOnly),
+    lateApplyMs: clamp(Number.isFinite(merged.lateApplyMs) ? Math.round(merged.lateApplyMs) : 3000, 0, 600_000),
     ...(merged.hang ? { hang: true } : {}),
   };
 }
@@ -96,5 +114,6 @@ export function mockControlsFromEnv(env: MockEnv): MockControls {
     forcedError: FORCED_ERRORS.includes(forced as ForcedError) ? (forced as ForcedError) : 'none',
     quoteTtlSeconds: numberFrom(env.EXPO_PUBLIC_MOCK_QUOTE_TTL_S, DEFAULT_MOCK_CONTROLS.quoteTtlSeconds, 1, 3600),
     offline: env.EXPO_PUBLIC_MOCK_OFFLINE === '1' || env.EXPO_PUBLIC_MOCK_OFFLINE === 'true',
+    failWritesOnly: env.EXPO_PUBLIC_MOCK_FAIL_WRITES_ONLY === '1',
   });
 }

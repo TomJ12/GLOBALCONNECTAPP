@@ -1,9 +1,7 @@
-import { useRouter } from 'expo-router';
 import { Mail } from 'lucide-react-native';
 import { useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 
-import { isMockBackend } from '@/api';
 import { toProviderError } from '@/api/errors';
 import type { MagicLinkRequest } from '@/api/types';
 import { AppText } from '@/components/AppText';
@@ -17,11 +15,12 @@ import { useRequestMagicLink, useVerifyMagicLink } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
 import { isValidEmail } from '@/lib/validation';
 import { useSession, type SignedOutReason } from '@/state/session';
-import { colors, radii, sizes, spacing } from '@/theme';
+import { colors, radii, spacing } from '@/theme';
 
 export function signInErrorMessage(error: unknown): string {
   const providerError = toProviderError(error);
   if (providerError.kind === 'unauthorized') return 'That link or code is not valid or has expired. Request a new one.';
+  if (providerError.kind === 'forbidden') return 'That login link was not requested on this device. Request a new one here.';
   if (providerError.kind === 'validation') return 'Enter the email address registered on your account.';
   return providerError.userMessage;
 }
@@ -33,7 +32,6 @@ const SIGNED_OUT_MESSAGES: Record<Exclude<SignedOutReason, null>, string> = {
 
 /** Sign-in is by emailed link or code, every time. Nothing is kept on the device between sessions. */
 export function SignInScreen() {
-  const router = useRouter();
   const signedOutReason = useSession((state) => state.signedOutReason);
   const startSession = useSession((state) => state.startSession);
   const requestLink = useRequestMagicLink();
@@ -85,7 +83,7 @@ export function SignInScreen() {
           {APP_NAME.toUpperCase()}
         </AppText>
         <AppText variant="heading" tone="onDark">
-          Your currency accounts, in your pocket
+          {disclosures.signInTagline}
         </AppText>
       </View>
 
@@ -116,7 +114,7 @@ export function SignInScreen() {
             maxLength={254}
           />
           <Button
-            label="Send secure login link"
+            label="Send login link"
             icon={<Mail color={colors.textOnDark} size={20} />}
             onPress={sendLink.run}
             loading={sendLink.busy}
@@ -128,7 +126,7 @@ export function SignInScreen() {
             Check your email
           </AppText>
           <AppText tone="onDarkMuted">
-            {`We sent a secure login link to ${link.email}. Open it on this phone, or type the code from the email here.`}
+            {`We sent a login link to ${link.email}. Open it on this phone, or type the code from the email here. It only works on the device that asked for it.`}
           </AppText>
           <TextField
             tone="navy"
@@ -182,20 +180,11 @@ export function SignInScreen() {
       <View style={styles.footer}>
         <AppText variant="caption" tone="onDarkMuted">{`New to ${APP_NAME}? ${disclosures.openAccount}`}</AppText>
         <AppText variant="caption" tone="onDarkMuted">
+          {disclosures.signInAssurance}
+        </AppText>
+        <AppText variant="caption" tone="onDarkMuted">
           {disclosures.regulatoryFooter}
         </AppText>
-        {isMockBackend() ? (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Developer settings"
-            onPress={() => router.push('/settings')}
-            style={styles.devLink}
-          >
-            <AppText variant="label" tone="onDarkMuted" style={styles.underline}>
-              Developer settings
-            </AppText>
-          </Pressable>
-        ) : null}
       </View>
     </Screen>
   );
@@ -207,6 +196,4 @@ const styles = StyleSheet.create({
   block: { gap: spacing.md },
   devCard: { gap: spacing.sm, padding: spacing.lg, borderRadius: radii.card, borderWidth: 1, borderColor: colors.navyBorder, borderStyle: 'dashed' },
   footer: { marginTop: 'auto', gap: spacing.sm, paddingTop: spacing.xl },
-  devLink: { minHeight: sizes.touchTarget, justifyContent: 'center', alignSelf: 'flex-start' },
-  underline: { textDecorationLine: 'underline' },
 });

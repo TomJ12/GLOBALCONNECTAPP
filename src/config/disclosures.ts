@@ -16,6 +16,10 @@ export const disclosures = {
   forwardTerms: '[FORWARD CONTRACT TERMS — deposit, margin and cancellation]',
   alertDelivery: '[RATE ALERT DELIVERY — how and when alerts are sent]',
   openAccount: '[HOW TO OPEN AN ACCOUNT]',
+  /** Marketing line on the sign-in screen. */
+  signInTagline: '[SIGN-IN TAGLINE]',
+  /** Any reassurance about how sign-in is protected. Do not describe it as "secure" in a screen. */
+  signInAssurance: '[SIGN-IN SECURITY WORDING]',
 } as const;
 
 export type DisclosureKey = keyof typeof disclosures;

@@ -1,6 +1,6 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Check, CircleAlert, CircleCheck, Clock } from 'lucide-react-native';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
@@ -14,6 +14,7 @@ import { QueryState } from '@/components/QueryState';
 import { Screen } from '@/components/Screen';
 import { SkeletonCard, SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
+import { outcomeCheckTiming } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useApprovePayment, useBalances, usePendingApprovals, useRejectPayment } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
@@ -28,7 +29,36 @@ import { describeBeneficiaryAccount, maskAccountIdentifier } from './shared';
 
 export type ReviewOutcome =
   | { kind: 'approved'; amount: string; payee: string; result: ApprovalResult }
-  | { kind: 'rejected'; amount: string; payee: string };
+  | { kind: 'rejected'; amount: string; payee: string }
+  /** We could not read the answer, and the payment has since left the pending list. We do not know why. */
+  | { kind: 'no_longer_pending'; attempted: 'approve' | 'reject'; amount: string; payee: string };
+
+/** Everything an approver is agreeing to. If any of it changes, the approval must be looked at again. */
+export function approvalSignature(approval: PendingApproval): string {
+  const { payment, beneficiary } = approval;
+  return JSON.stringify([
+    payment.amount,
+    payment.currency,
+    payment.reference,
+    payment.status,
+    payment.beneficiaryId,
+    approval.approvalsRemaining,
+    beneficiary
+      ? [beneficiary.name, beneficiary.bankCountry, beneficiary.iban, beneficiary.accountNumber, beneficiary.sortCode, beneficiary.bic, beneficiary.routingNumber]
+      : null,
+  ]);
+}
+
+/** Truthful wording when the payment is simply gone from the pending list after an unread answer. */
+export function noLongerPendingCopy(attempted: 'approve' | 'reject'): { title: string; body: string } {
+  return {
+    title: 'No longer waiting for approval',
+    body:
+      attempted === 'approve'
+        ? 'We did not get a clear answer to your approval. This payment is no longer waiting, which may be because of your approval or because someone else approved or rejected it. Check Payments for its status.'
+        : 'We did not get a clear answer to your rejection. This payment is no longer waiting, which may be because of your rejection or because someone else approved or rejected it. Do not assume it was cancelled: check Payments for its status.',
+  };
+}
 
 /** What to say after an approval, from what the backend reported. "Approved" alone is not enough. */
 export function approvalOutcomeCopy(result: ApprovalResult): { title: string; body: string; tone: 'positive' | 'warning' | 'danger' } {
@@ -80,8 +110,10 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   const reject = useRejectPayment();
   const online = useIsOnline();
   const [error, setError] = useState<string | null>(null);
-  /** True after an action whose outcome we could not establish. Nothing more is allowed until a check succeeds. */
-  const [unresolved, setUnresolved] = useState<'approve' | 'reject' | null>(null);
+  /** Set after an action whose outcome we could not establish. Nothing more is allowed until it is resolved. */
+  const [unresolved, setUnresolved] = useState<{ kind: 'approve' | 'reject'; startedAt: number } | null>(null);
+  const windowSeconds = Math.round(outcomeCheckTiming.windowMs / 1000);
+  const { refetch } = approvals;
 
   const amount = formatMoney(payment.amount, payment.currency);
   const payee = payment.beneficiaryName ?? 'Unknown payee';
@@ -91,37 +123,64 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   const accountLine = beneficiary ? describeBeneficiaryAccount(beneficiary) : null;
 
   /**
-   * After a failure that may have been applied, ask the backend what is true.
-   * Approve and reject take no idempotency key (the provider's endpoints do not
-   * accept one); they are safe to repeat because a payment that is no longer
-   * waiting cannot be approved again. This check tells the person which it was.
+   * After an answer we could not read, ask the backend what is true, and keep
+   * asking for the whole processing window. One early look proves nothing: the
+   * request may still be on its way. Approve and reject take no idempotency key
+   * (the provider's endpoints do not accept one); they are safe to repeat because
+   * a payment that is no longer waiting cannot be approved or rejected again.
    */
-  const reconcile = async (kind: 'approve' | 'reject') => {
-    const fresh = await approvals.refetch();
-    if (!fresh.isSuccess) {
-      setUnresolved(kind);
-      setError('We could not confirm whether that went through. Do not try again yet. Check again in a moment.');
-      return;
-    }
-    setUnresolved(null);
-    const current = fresh.data.find((item) => item.payment.id === payment.id);
-    if (!current) {
-      onOutcome(
-        kind === 'approve'
-          ? { kind: 'approved', amount, payee, result: { status: 'unknown', approvalsRemaining: 0 } }
-          : { kind: 'rejected', amount, payee },
-      );
-    } else if (kind === 'approve' && current.approvalsRemaining < approval.approvalsRemaining) {
-      onOutcome({ kind: 'approved', amount, payee, result: { status: 'awaiting_approval', approvalsRemaining: current.approvalsRemaining } });
-    } else {
-      setError(kind === 'approve' ? 'Your approval did not go through. You can try again.' : 'The payment was not rejected. You can try again.');
-    }
-  };
+  const checkOutcome = useCallback(
+    async (pending: { kind: 'approve' | 'reject'; startedAt: number }) => {
+      const fresh = await refetch();
+      if (fresh.isError || !fresh.data) return; // Could not ask. Stay blocked and ask again.
+      const current = fresh.data.find((item) => item.payment.id === payment.id);
+      if (!current) {
+        // Gone from the pending list. That does not say WHO did WHAT, so the outcome does not claim it.
+        setUnresolved(null);
+        onOutcome({ kind: 'no_longer_pending', attempted: pending.kind, amount, payee });
+      } else if (pending.kind === 'approve' && current.approvalsRemaining < approval.approvalsRemaining) {
+        setUnresolved(null);
+        onOutcome({ kind: 'approved', amount, payee, result: { status: 'awaiting_approval', approvalsRemaining: current.approvalsRemaining } });
+      } else if (Date.now() - pending.startedAt >= outcomeCheckTiming.windowMs) {
+        setUnresolved(null);
+        setError(`We kept checking for ${windowSeconds} seconds and this payment is still waiting for approval. Look at it again before you retry.`);
+      }
+    },
+    [refetch, payment.id, approval.approvalsRemaining, amount, payee, onOutcome, windowSeconds],
+  );
+
+  useEffect(() => {
+    if (!unresolved) return;
+    // Look at once (on the next tick), then at intervals for the rest of the window.
+    const first = setTimeout(() => void checkOutcome(unresolved), 0);
+    const timer = setInterval(() => void checkOutcome(unresolved), outcomeCheckTiming.intervalMs);
+    return () => {
+      clearTimeout(first);
+      clearInterval(timer);
+    };
+  }, [unresolved, checkOutcome]);
 
   // One lock for both buttons: approving and rejecting can never overlap.
   const action = useSingleFlight(async (kind: 'approve' | 'reject') => {
     if (unresolved) return;
     setError(null);
+
+    // Act on what is true NOW, not on the copy this screen loaded earlier.
+    const fresh = await refetch();
+    if (fresh.isError || !fresh.data) {
+      setError('We could not check that this payment is still up to date. Try again.');
+      return;
+    }
+    const current = fresh.data.find((item) => item.payment.id === payment.id);
+    if (!current) {
+      setError('This payment no longer needs approval.');
+      return;
+    }
+    if (approvalSignature(current) !== approvalSignature(approval)) {
+      setError('This payment changed after you opened it. Check the details shown now, then confirm again.');
+      return;
+    }
+
     const details = `${amount} to ${payee}${accountLine ? `, ${accountLine}` : ''}. Reference ${payment.reference}.`;
     const confirmed =
       kind === 'approve'
@@ -134,6 +193,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
             tone: 'danger',
           });
     if (!confirmed) return;
+    const startedAt = Date.now();
     try {
       if (kind === 'approve') {
         onOutcome({ kind: 'approved', amount, payee, result: await approve.mutateAsync(payment.id) });
@@ -144,7 +204,12 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
     } catch (caught) {
       const providerError = toProviderError(caught);
       if (providerError.outcomeUnknown) {
-        await reconcile(kind);
+        setError(`We did not get an answer, so we are checking whether that went through. This can take up to ${windowSeconds} seconds. Do not try again.`);
+        const pending = { kind, startedAt };
+        setUnresolved(pending);
+        // Look once straight away, from here rather than from an effect: the list refresh that
+        // follows a mutation can take this part of the screen away before an effect would run.
+        await checkOutcome(pending);
         return;
       }
       setError(
@@ -158,7 +223,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   });
 
   const recheck = useSingleFlight(async () => {
-    if (unresolved) await reconcile(unresolved);
+    if (unresolved) await checkOutcome(unresolved);
   });
 
   const remaining = approval.approvalsRemaining;
@@ -288,7 +353,9 @@ export function PaymentReviewScreen() {
     const copy =
       outcome.kind === 'approved'
         ? approvalOutcomeCopy(outcome.result)
-        : { title: 'Rejected', body: 'The payment was cancelled. No money has left your account.', tone: 'positive' as const };
+        : outcome.kind === 'no_longer_pending'
+          ? { ...noLongerPendingCopy(outcome.attempted), tone: 'warning' as const }
+          : { title: 'Rejected', body: 'The payment was cancelled. No money has left your account.', tone: 'positive' as const };
     const Icon = copy.tone === 'positive' ? CircleCheck : copy.tone === 'warning' ? Clock : CircleAlert;
     const iconColor = outcome.kind === 'rejected' ? colors.textMuted : copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
     return (

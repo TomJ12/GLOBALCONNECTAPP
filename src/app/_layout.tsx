@@ -48,7 +48,6 @@ export default function RootLayout() {
           <Stack.Screen name="(app)" />
           <Stack.Screen name="sign-in" options={{ contentStyle: { backgroundColor: colors.navy }, animation: 'fade' }} />
           <Stack.Screen name="magic-link" options={{ contentStyle: { backgroundColor: colors.navy } }} />
-          <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
         </Stack>
         <ConfirmDialogHost />
         <ToastHost />

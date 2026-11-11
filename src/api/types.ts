@@ -65,6 +65,12 @@ export interface AccountDetails {
   bic: string | null;
 }
 
+/** A list that may have been cut short. `truncated` means more exist than were read. */
+export interface ListResult<T> {
+  items: T[];
+  truncated: boolean;
+}
+
 export type TransactionKind = 'payment' | 'conversion' | 'funding' | 'fee' | 'other';
 export type TransactionStatus = 'completed' | 'pending' | 'cancelled';
 

@@ -39,7 +39,7 @@ describe('compliance guards', () => {
 
   it('does not hard-code fee, timing, rate or regulatory claims anywhere in UI code', () => {
     const claims =
-      /\b(no fees?|free of charge|instantly|same[- ]day|within \d+ (minutes|hours|days)|FCA|regulated by|authorised by|safeguard|live rates?|real[- ]time|guaranteed|best rate|mid[- ]market)/i;
+      /\b(no fees?|free of charge|instantly|same[- ]day|within \d+ (minutes|hours|days)|FCA|regulated by|authorised by|safeguard|live rates?|real[- ]time|guaranteed|best rate|mid[- ]market|secure|encrypted)/i;
     const offenders: string[] = [];
     for (const dir of UI_DIRS) {
       // config/disclosures.ts is where such wording lives, as bracketed placeholders checked above.

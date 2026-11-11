@@ -1,8 +1,9 @@
 import { act, fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { getProviderClient } from '@/api';
-import { approvalOutcomeCopy, PaymentReviewScreen } from '@/screens/PaymentReviewScreen';
-import { installMockBackend, renderScreen, setControls, signIn } from '@/test/utils';
+import * as confirmModule from '@/lib/confirmAction';
+import { approvalOutcomeCopy, noLongerPendingCopy, PaymentReviewScreen } from '@/screens/PaymentReviewScreen';
+import { installMockBackend, renderScreen, setControls, setOutcomeTiming, signIn, sleep } from '@/test/utils';
 
 const expoRouter = jest.requireMock<{ __setParams: (params: Record<string, string>) => void }>('expo-router');
 
@@ -18,6 +19,7 @@ describe('PaymentReviewScreen', () => {
     await signIn(mock.client);
     paymentId = (await mock.client.listPendingApprovals())[0]?.payment.id ?? '';
     expoRouter.__setParams({ id: paymentId });
+    setOutcomeTiming(700, 100);
   });
 
   it('shows the payment with placeholders for fee and arrival', async () => {
@@ -61,6 +63,8 @@ describe('PaymentReviewScreen', () => {
   });
 
   it('approves once when the button is pressed twice', async () => {
+    // The confirm step is answered at once, so the ONLY thing between two taps and two approvals is the lock.
+    jest.spyOn(confirmModule, 'confirmAction').mockResolvedValue(true);
     const approveSpy = jest.spyOn(getProviderClient(), 'approvePayment');
     await renderScreen(<PaymentReviewScreen />);
     const approve = await screen.findByTestId('approve-button');
@@ -68,7 +72,6 @@ describe('PaymentReviewScreen', () => {
       fireEvent.press(approve);
       fireEvent.press(approve);
     });
-    await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
     expect(await screen.findByTestId('review-outcome-title')).toHaveTextContent('Approved');
     expect(approveSpy).toHaveBeenCalledTimes(1);
     expect(await usdBalance()).toBe('39491.00');
@@ -169,33 +172,124 @@ describe('PaymentReviewScreen', () => {
     expect(approvalOutcomeCopy({ status: 'processing', approvalsRemaining: 2 }).body).toMatch(/2 more approvals are needed/);
   });
 
-  it('a lost reply to an approval is reconciled: approved once, and reported as approved', async () => {
+  it('a lost reply to an approval: approved once, and the outcome does not claim to know why it left the list', async () => {
     const approveSpy = jest.spyOn(getProviderClient(), 'approvePayment');
     await renderScreen(<PaymentReviewScreen />);
     await fireEvent.press(await screen.findByTestId('approve-button'));
     setControls({ forcedError: 'lost_response' });
     await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
-    // The check cannot get through either: blocked, with a way to check again.
-    expect(await screen.findByText(/could not confirm whether that went through/)).toBeOnTheScreen();
+    // Checks cannot get through either: blocked, past the window, for as long as that lasts.
+    expect(await screen.findByText(/we are checking whether that went through/)).toBeOnTheScreen();
+    await sleep(1000);
     expect(screen.queryByTestId('approve-button')).not.toBeOnTheScreen();
 
     setControls({ forcedError: 'none' });
-    await fireEvent.press(screen.getByTestId('review-recheck'));
-    expect(await screen.findByTestId('review-outcome-title')).toBeOnTheScreen();
+    expect(await screen.findByTestId('review-outcome-title')).toHaveTextContent('No longer waiting for approval');
+    expect(screen.getByText(/may be because of your approval or because someone else approved or rejected it/)).toBeOnTheScreen();
     expect(approveSpy).toHaveBeenCalledTimes(1);
     expect(await usdBalance()).toBe('39491.00');
   });
 
-  it('an approval that never reached the server is reported as not done and can be retried', async () => {
+  it('an approval that lands AFTER the app gave up is found: one early look does not say it failed', async () => {
+    setOutcomeTiming(1500, 100);
+    const client = getProviderClient();
+    const listSpy = jest.spyOn(client, 'listPendingApprovals');
     await renderScreen(<PaymentReviewScreen />);
     await fireEvent.press(await screen.findByTestId('approve-button'));
-    setControls({ forcedError: 'network' });
+    setControls({ forcedError: 'applied_late', lateApplyMs: 400 });
     await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
-    await screen.findByText(/could not confirm whether that went through/);
-    setControls({ forcedError: 'none' });
+    await screen.findByText(/we are checking whether that went through/);
+    listSpy.mockClear();
+    await waitFor(() => expect(listSpy.mock.calls.length).toBeGreaterThanOrEqual(2));
+    // The server has not acted yet. The screen must stay blocked and must not say it did not go through.
+    expect(await usdBalance()).toBe('57891.00');
+    expect(screen.queryByTestId('approve-button')).not.toBeOnTheScreen();
+    expect(screen.queryByText(/did not go through|still waiting for approval/)).not.toBeOnTheScreen();
+
+    expect(await screen.findByTestId('review-outcome-title', undefined, { timeout: 3000 })).toBeOnTheScreen();
+    expect(await usdBalance()).toBe('39491.00');
+  });
+
+  it('releases the buttons only after the whole window, without claiming the approval failed', async () => {
+    await renderScreen(<PaymentReviewScreen />);
+    await fireEvent.press(await screen.findByTestId('approve-button'));
+    setControls({ forcedError: 'network', failWritesOnly: true });
+    const started = Date.now();
+    await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
+    await screen.findByText(/we are checking whether that went through/);
     await fireEvent.press(screen.getByTestId('review-recheck'));
-    expect(await screen.findByText(/did not go through. You can try again/)).toBeOnTheScreen();
+    expect(screen.queryByTestId('approve-button')).not.toBeOnTheScreen();
+
+    expect(await screen.findByText(/this payment is still waiting for approval. Look at it again/, undefined, { timeout: 3000 })).toBeOnTheScreen();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(700);
     expect(screen.getByTestId('approve-button')).toBeEnabled();
     expect(await usdBalance()).toBe('57891.00');
+  });
+
+  it('an unread answer to a rejection never says the payment was cancelled or that no money left', async () => {
+    expect(noLongerPendingCopy('reject').body).toMatch(/Do not assume it was cancelled/);
+    expect(JSON.stringify([noLongerPendingCopy('reject'), noLongerPendingCopy('approve')])).not.toMatch(/No money has left|was cancelled\./);
+
+    await renderScreen(<PaymentReviewScreen />);
+    await fireEvent.press(await screen.findByTestId('reject-button'));
+    setControls({ forcedError: 'lost_response', failWritesOnly: true });
+    await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
+    expect(await screen.findByTestId('review-outcome-title')).toHaveTextContent('No longer waiting for approval');
+    expect(screen.queryByText(/No money has left your account/)).not.toBeOnTheScreen();
+    expect(screen.getByText(/Do not assume it was cancelled/)).toBeOnTheScreen();
+  });
+
+  it('re-reads the payment before confirming and stops if it changed since the screen loaded', async () => {
+    const client = getProviderClient();
+    const approveSpy = jest.spyOn(client, 'approvePayment');
+    await renderScreen(<PaymentReviewScreen />);
+    await screen.findByTestId('review-amount');
+
+    // Between loading the screen and pressing Approve, the payee's account is changed elsewhere.
+    const real = await client.listPendingApprovals();
+    jest.spyOn(client, 'listPendingApprovals').mockResolvedValue(
+      real.map((approval) => ({ ...approval, beneficiary: approval.beneficiary && { ...approval.beneficiary, accountNumber: '999999999999' } })),
+    );
+    await fireEvent.press(screen.getByTestId('approve-button'));
+    expect(await screen.findByText(/This payment changed after you opened it/)).toBeOnTheScreen();
+    expect(screen.queryByText('Approve this payment?')).not.toBeOnTheScreen();
+    expect(approveSpy).not.toHaveBeenCalled();
+    // The screen now shows the new details, and a second, informed press goes ahead.
+    expect(await screen.findByText('•••• 9999')).toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('approve-button'));
+    expect(await screen.findByText(/USD account ending 9999/)).toBeOnTheScreen();
+  });
+
+  it('also stops when the amount changed, and when the latest state cannot be read', async () => {
+    const client = getProviderClient();
+    const approveSpy = jest.spyOn(client, 'approvePayment');
+    await renderScreen(<PaymentReviewScreen />);
+    await screen.findByTestId('review-amount');
+    const real = await client.listPendingApprovals();
+    const listSpy = jest.spyOn(client, 'listPendingApprovals');
+    listSpy.mockResolvedValueOnce(real.map((approval) => ({ ...approval, payment: { ...approval.payment, amount: '81400.00' } })));
+    await fireEvent.press(screen.getByTestId('approve-button'));
+    expect(await screen.findByText(/This payment changed after you opened it/)).toBeOnTheScreen();
+
+    setControls({ forcedError: 'server' });
+    await fireEvent.press(screen.getByTestId('reject-button'));
+    expect(await screen.findByText(/could not check that this payment is still up to date/)).toBeOnTheScreen();
+    setControls({ forcedError: 'none' });
+    expect(approveSpy).not.toHaveBeenCalled();
+    expect(await getProviderClient().listPendingApprovals()).toHaveLength(1);
+  });
+
+  it('shows a masked IBAN when the payee is paid by IBAN', async () => {
+    const client = getProviderClient();
+    const real = await client.listPendingApprovals();
+    jest.spyOn(client, 'listPendingApprovals').mockResolvedValue(
+      real.map((approval) => ({
+        ...approval,
+        beneficiary: approval.beneficiary && { ...approval.beneficiary, accountNumber: null, iban: 'DE89370400440532013000', bankCountry: 'DE' },
+      })),
+    );
+    await renderScreen(<PaymentReviewScreen />);
+    expect(await screen.findByLabelText('IBAN: •••• 3000')).toBeOnTheScreen();
+    expect(screen.queryByText(/DE8937/)).not.toBeOnTheScreen();
   });
 });
