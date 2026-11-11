@@ -1,4 +1,4 @@
-import { formatCountdown, isQuoteExpired, msUntilExpiry, secondsUntilExpiry } from '../quote';
+import { conversionMatchesQuote, formatCountdown, isQuoteExpired, msUntilExpiry, secondsUntilExpiry } from '../quote';
 
 const T0 = Date.parse('2026-11-10T12:00:00.000Z');
 const quote = { expiresAt: '2026-11-10T12:00:30.000Z' };
@@ -36,5 +36,21 @@ describe('quote expiry', () => {
     expect(formatCountdown(0)).toBe('0:00');
     expect(formatCountdown(-3)).toBe('0:00');
     expect(formatCountdown(9.9)).toBe('0:09');
+  });
+});
+
+describe('conversionMatchesQuote', () => {
+  const quoted = { sellCurrency: 'GBP', buyCurrency: 'USD', sellAmount: '1000.00', buyAmount: '1300.00', rate: '1.3000' };
+
+  it('accepts the same figures however they are written', () => {
+    expect(conversionMatchesQuote({ ...quoted, sellAmount: '1000', rate: '1.3' }, quoted)).toBe(true);
+  });
+
+  it('flags any difference in amount, rate or currency', () => {
+    expect(conversionMatchesQuote({ ...quoted, buyAmount: '1299.99' }, quoted)).toBe(false);
+    expect(conversionMatchesQuote({ ...quoted, sellAmount: '1000.01' }, quoted)).toBe(false);
+    expect(conversionMatchesQuote({ ...quoted, rate: '1.2999' }, quoted)).toBe(false);
+    expect(conversionMatchesQuote({ ...quoted, buyCurrency: 'EUR' }, quoted)).toBe(false);
+    expect(conversionMatchesQuote({ ...quoted, buyAmount: 'lots' }, quoted)).toBe(false);
   });
 });

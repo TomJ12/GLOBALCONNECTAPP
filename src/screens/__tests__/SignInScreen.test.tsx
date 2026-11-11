@@ -1,14 +1,23 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 
+import { MOCK_MAGIC_LINK_CODE } from '@/api/adapters/currencycloud/mockServer';
+import { MagicLinkScreen } from '@/screens/MagicLinkScreen';
 import { SignInScreen } from '@/screens/SignInScreen';
 import { useSession } from '@/state/session';
 import { installMockBackend, renderScreen, setControls } from '@/test/utils';
 
+const expoRouter = jest.requireMock<{ __setParams: (params: Record<string, string>) => void; router: { replace: jest.Mock } }>('expo-router');
+
+async function requestLink(): Promise<void> {
+  await fireEvent.changeText(screen.getByLabelText('Registered email address'), 'finance@example.com');
+  await fireEvent.press(screen.getByRole('button', { name: 'Send secure login link' }));
+  expect(await screen.findByText('Check your email')).toBeOnTheScreen();
+}
+
 describe('SignInScreen', () => {
-  beforeEach(async () => {
+  beforeEach(() => {
     installMockBackend();
-    useSession.setState({ session: null, remembered: null, signedOutReason: null, hydrated: true });
-    await useSession.getState().forgetDevice();
+    useSession.setState({ session: null, signedOutReason: null });
   });
 
   it('validates the email before sending anything', async () => {
@@ -18,45 +27,38 @@ describe('SignInScreen', () => {
     expect(screen.queryByText('Check your email')).not.toBeOnTheScreen();
   });
 
-  it('sends a link, completes it with the dev shortcut and offers quick unlock', async () => {
+  it('signs in with the code typed from the email', async () => {
     await renderScreen(<SignInScreen />);
-    await fireEvent.changeText(screen.getByLabelText('Registered email address'), 'finance@example.com');
-    await fireEvent.press(screen.getByRole('button', { name: 'Send secure login link' }));
-    expect(await screen.findByText('Check your email')).toBeOnTheScreen();
-    expect(screen.getByText(/finance@example.com/)).toBeOnTheScreen();
-
-    await fireEvent.press(screen.getByTestId('dev-complete-link'));
-    expect(await screen.findByText('Unlock faster next time?')).toBeOnTheScreen();
-    // Not signed in until the person has answered the offer.
-    expect(useSession.getState().session).toBeNull();
-
-    await fireEvent.press(screen.getByRole('button', { name: 'Turn on quick unlock' }));
-    await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
+    await requestLink();
+    await fireEvent.changeText(screen.getByTestId('magic-code'), MOCK_MAGIC_LINK_CODE);
+    await fireEvent.press(screen.getByTestId('verify-code'));
     await waitFor(() => expect(useSession.getState().session?.user.email).toBe('finance@example.com'));
-    expect(useSession.getState().remembered?.biometricEnabled).toBe(true);
   });
 
-  it('signs in without remembering the device when quick unlock is declined', async () => {
+  it('rejects a wrong or empty code with a clear message and stays signed out', async () => {
     await renderScreen(<SignInScreen />);
-    await fireEvent.changeText(screen.getByLabelText('Registered email address'), 'finance@example.com');
-    await fireEvent.press(screen.getByRole('button', { name: 'Send secure login link' }));
-    await fireEvent.press(await screen.findByTestId('dev-complete-link'));
-    await fireEvent.press(await screen.findByRole('button', { name: 'Not now' }));
-    await waitFor(() => expect(useSession.getState().session).not.toBeNull());
-    expect(useSession.getState().remembered).toBeNull();
-  });
-
-  it('offers unlock to a returning user and shows a clear error when it fails', async () => {
-    useSession.setState({ remembered: { email: 'finance@example.com', displayName: 'Sample User', biometricEnabled: true } });
-    await renderScreen(<SignInScreen />);
-    expect(screen.getByText('Already set up on this phone')).toBeOnTheScreen();
-    // No credential is stored, so unlocking must fail safely rather than sign in.
-    await fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
-    await fireEvent.press(await screen.findByTestId('confirm-dialog-confirm'));
-    // The stale device is forgotten and the email form comes back.
-    expect(await screen.findByLabelText('Registered email address')).toBeOnTheScreen();
-    expect(useSession.getState().remembered).toBeNull();
+    await requestLink();
+    await fireEvent.press(screen.getByTestId('verify-code'));
+    expect(await screen.findByText('Error: Enter the code from the email.')).toBeOnTheScreen();
+    await fireEvent.changeText(screen.getByTestId('magic-code'), 'WRONG');
+    await fireEvent.press(screen.getByTestId('verify-code'));
+    expect(await screen.findByText(/not valid or has expired/)).toBeOnTheScreen();
     expect(useSession.getState().session).toBeNull();
+  });
+
+  it('the developer shortcut completes the link on the mock', async () => {
+    await renderScreen(<SignInScreen />);
+    await requestLink();
+    await fireEvent.press(screen.getByTestId('dev-complete-link'));
+    await waitFor(() => expect(useSession.getState().session).not.toBeNull());
+  });
+
+  it('offers no unlock of any kind: email is the only way in', async () => {
+    useSession.setState({ signedOutReason: 'inactive' });
+    await renderScreen(<SignInScreen />);
+    expect(screen.getByText(/signed out because the app was in the background/)).toBeOnTheScreen();
+    expect(screen.queryByText(/unlock/i)).not.toBeOnTheScreen();
+    expect(screen.getByLabelText('Registered email address')).toBeOnTheScreen();
   });
 
   it('shows a readable message when the service is down', async () => {
@@ -65,5 +67,36 @@ describe('SignInScreen', () => {
     await fireEvent.changeText(screen.getByLabelText('Registered email address'), 'finance@example.com');
     await fireEvent.press(screen.getByRole('button', { name: 'Send secure login link' }));
     expect(await screen.findByText(/We could not reach the service/)).toBeOnTheScreen();
+  });
+});
+
+describe('MagicLinkScreen (deep link)', () => {
+  beforeEach(() => {
+    useSession.setState({ session: null, signedOutReason: null });
+    expoRouter.router.replace.mockClear();
+  });
+
+  it('verifies the link in the URL and signs in', async () => {
+    const mock = installMockBackend();
+    const link = await mock.client.requestMagicLink('finance@example.com');
+    expoRouter.__setParams({ request: link.requestId, code: MOCK_MAGIC_LINK_CODE });
+    await renderScreen(<MagicLinkScreen />);
+    await waitFor(() => expect(useSession.getState().session?.user.email).toBe('finance@example.com'));
+    expect(expoRouter.router.replace).toHaveBeenCalledWith('/');
+  });
+
+  it('explains a bad or incomplete link and does not sign in', async () => {
+    installMockBackend();
+    expoRouter.__setParams({ request: 'nope', code: 'nope' });
+    await renderScreen(<MagicLinkScreen />);
+    expect(await screen.findByText(/not valid or has expired/)).toBeOnTheScreen();
+    expect(useSession.getState().session).toBeNull();
+  });
+
+  it('handles a link with missing parts', async () => {
+    installMockBackend();
+    expoRouter.__setParams({});
+    await renderScreen(<MagicLinkScreen />);
+    expect(screen.getByText(/incomplete/)).toBeOnTheScreen();
   });
 });

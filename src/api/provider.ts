@@ -7,6 +7,7 @@
  */
 import type {
   AccountDetails,
+  ApprovalResult,
   Balance,
   Beneficiary,
   BookConversionRequest,
@@ -33,8 +34,6 @@ export interface ProviderClient {
   // Sign-in. The client keeps the session token internally.
   requestMagicLink(email: string): Promise<MagicLinkRequest>;
   verifyMagicLink(requestId: string, code: string): Promise<Session>;
-  /** Start a session from a credential stored on this device, after a biometric check. */
-  resumeSession(deviceCredential: string): Promise<Session>;
   signOut(): Promise<void>;
 
   getCompanyProfile(): Promise<CompanyProfile>;
@@ -50,6 +49,11 @@ export interface ProviderClient {
   createQuote(request: QuoteRequest): Promise<Quote>;
   /** Book a spot or forward conversion at a held quote. */
   bookConversion(request: BookConversionRequest): Promise<Conversion>;
+  /**
+   * Reconciliation: the conversion booked with this key, or null if there is none.
+   * Used after a booking whose outcome is unknown, before allowing another attempt.
+   */
+  findConversionByIdempotencyKey(idempotencyKey: string): Promise<Conversion | null>;
   listForwardContracts(): Promise<ForwardContract[]>;
 
   listBeneficiaries(): Promise<Beneficiary[]>;
@@ -57,7 +61,13 @@ export interface ProviderClient {
 
   listPayments(request: PageRequest): Promise<Page<Payment>>;
   createPayment(input: NewPayment): Promise<Payment>;
+  /** Reconciliation: the payment created with this key, or null if there is none. */
+  findPaymentByIdempotencyKey(idempotencyKey: string): Promise<Payment | null>;
   listPendingApprovals(): Promise<PendingApproval[]>;
-  approvePayment(paymentId: string): Promise<void>;
+  /**
+   * Record this person's approval. Safe to repeat: a payment that is no longer
+   * waiting for approval is rejected with a `validation` error, never paid twice.
+   */
+  approvePayment(paymentId: string): Promise<ApprovalResult>;
   rejectPayment(paymentId: string): Promise<void>;
 }

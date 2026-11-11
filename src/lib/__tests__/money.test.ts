@@ -7,9 +7,10 @@ import {
   formatRate,
   isDecimalString,
   multiplyByRate,
+  amountInputMessage,
   parseAmountInput,
+  readAmountInput,
   roundToCurrency,
-  sanitizeAmountInput,
   subtractAmounts,
   totalInBaseCurrency,
 } from '../money';
@@ -112,26 +113,77 @@ describe('totalInBaseCurrency', () => {
 });
 
 describe('amount input', () => {
-  it('sanitises typing', () => {
-    expect(sanitizeAmountInput('25,000.509', 'GBP')).toBe('25000.50');
-    expect(sanitizeAmountInput('abc12.3.4', 'GBP')).toBe('12.34');
-    expect(sanitizeAmountInput('.5', 'GBP')).toBe('0.5');
-    expect(sanitizeAmountInput('007', 'GBP')).toBe('7');
-    expect(sanitizeAmountInput('12.', 'GBP')).toBe('12.');
-    expect(sanitizeAmountInput('1500.75', 'JPY')).toBe('1500');
-    expect(sanitizeAmountInput('1.23456', 'KWD')).toBe('1.234');
-    expect(sanitizeAmountInput('-5', 'GBP')).toBe('5');
-    expect(sanitizeAmountInput('1'.repeat(30), 'GBP')).toHaveLength(12);
+  const ok = (amount: string) => ({ ok: true, amount });
+  const bad = (problem: string) => ({ ok: false, problem });
+
+  it('reads plain amounts and pads to the currency', () => {
+    expect(readAmountInput('25000', 'GBP')).toEqual(ok('25000.00'));
+    expect(readAmountInput(' 12.5 ', 'GBP')).toEqual(ok('12.50'));
+    expect(readAmountInput('12.', 'GBP')).toEqual(ok('12.00'));
+    expect(readAmountInput('.5', 'GBP')).toEqual(ok('0.50'));
+    expect(readAmountInput('007', 'GBP')).toEqual(ok('7.00'));
+    expect(readAmountInput('1500', 'JPY')).toEqual(ok('1500'));
+    expect(readAmountInput('1.234', 'KWD')).toEqual(ok('1.234'));
   });
 
-  it('parses to a positive decimal string or null', () => {
+  it('treats a lone comma as the decimal separator', () => {
+    expect(readAmountInput('1234,56', 'EUR')).toEqual(ok('1234.56'));
+    expect(readAmountInput('1,5', 'EUR')).toEqual(ok('1.50'));
+    expect(readAmountInput('0,234', 'KWD')).toEqual(ok('0.234'));
+    expect(readAmountInput('12,', 'EUR')).toEqual(ok('12.00'));
+  });
+
+  it('reads clearly grouped forms', () => {
+    expect(readAmountInput('1,234.56', 'GBP')).toEqual(ok('1234.56'));
+    expect(readAmountInput('1.234,56', 'EUR')).toEqual(ok('1234.56'));
+    expect(readAmountInput('1,234,567', 'GBP')).toEqual(ok('1234567.00'));
+    expect(readAmountInput('1.234.567', 'EUR')).toEqual(ok('1234567.00'));
+    expect(readAmountInput('12,345,678.9', 'USD')).toEqual(ok('12345678.90'));
+  });
+
+  it('rejects ambiguous input instead of guessing', () => {
+    // One thousand two hundred and thirty-four, or 1.234?
+    expect(readAmountInput('1,234', 'GBP')).toEqual(bad('ambiguous'));
+    expect(readAmountInput('1,234', 'KWD')).toEqual(bad('ambiguous'));
+    expect(readAmountInput('999,000', 'EUR')).toEqual(bad('ambiguous'));
+  });
+
+  it('rejects malformed input instead of reshaping it', () => {
+    for (const text of ['1e3', '-50', '+5', 'abc', '12abc', '1 000', '£10', '1..2', '1,,2', '1,23,456', '12,34.5', '1.2,3.4', '.', ',', '1.234.56', '١٢٣']) {
+      expect(readAmountInput(text, 'GBP')).toEqual(bad('invalid'));
+    }
+  });
+
+  it('rejects extra decimals rather than truncating them', () => {
+    expect(readAmountInput('25000.509', 'GBP')).toEqual(bad('too_many_decimals'));
+    expect(readAmountInput('1.234', 'GBP')).toEqual(bad('too_many_decimals'));
+    expect(readAmountInput('100.55', 'JPY')).toEqual(bad('too_many_decimals'));
+    expect(readAmountInput('1500,5', 'JPY')).toEqual(bad('too_many_decimals'));
+    expect(readAmountInput('1.2345', 'KWD')).toEqual(bad('too_many_decimals'));
+  });
+
+  it('rejects empty, zero and absurdly large input', () => {
+    expect(readAmountInput('', 'GBP')).toEqual(bad('empty'));
+    expect(readAmountInput('   ', 'GBP')).toEqual(bad('empty'));
+    expect(readAmountInput('0', 'GBP')).toEqual(bad('zero'));
+    expect(readAmountInput('0.00', 'GBP')).toEqual(bad('zero'));
+    expect(readAmountInput('1'.repeat(13), 'GBP')).toEqual(bad('too_large'));
+    expect(readAmountInput('1'.repeat(12), 'GBP').ok).toBe(true);
+  });
+
+  it('parseAmountInput is null for anything rejected', () => {
     expect(parseAmountInput('25000', 'GBP')).toBe('25000.00');
-    expect(parseAmountInput('12.', 'GBP')).toBe('12.00');
-    expect(parseAmountInput('1500', 'JPY')).toBe('1500');
+    expect(parseAmountInput('1e3', 'GBP')).toBeNull();
+    expect(parseAmountInput('1,234', 'GBP')).toBeNull();
     expect(parseAmountInput('', 'GBP')).toBeNull();
-    expect(parseAmountInput('0', 'GBP')).toBeNull();
-    expect(parseAmountInput('0.00', 'GBP')).toBeNull();
-    expect(parseAmountInput('.', 'GBP')).toBeNull();
+  });
+
+  it('explains each problem, and says nothing for an empty field', () => {
+    expect(amountInputMessage('empty', 'GBP')).toBeNull();
+    expect(amountInputMessage('too_many_decimals', 'JPY')).toMatch(/no decimal places/);
+    expect(amountInputMessage('too_many_decimals', 'GBP')).toMatch(/at most 2/);
+    expect(amountInputMessage('ambiguous', 'GBP')).toMatch(/comma/);
+    expect(amountInputMessage('invalid', 'GBP')).toMatch(/digits/);
   });
 
   it('recognises decimal strings', () => {

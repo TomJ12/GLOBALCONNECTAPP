@@ -23,10 +23,11 @@ export interface OptionPickerProps {
   /** Text on the closed button. Defaults to the selected option's label. */
   buttonText?: string;
   wide?: boolean;
+  disabled?: boolean;
 }
 
 /** A button that opens a short list to choose from. */
-export function OptionPicker({ label, value, options, onChange, buttonText, wide = false }: OptionPickerProps) {
+export function OptionPicker({ label, value, options, onChange, buttonText, wide = false, disabled = false }: OptionPickerProps) {
   const [open, setOpen] = useState(false);
   const selected = options.find((option) => option.value === value);
   return (
@@ -34,15 +35,17 @@ export function OptionPicker({ label, value, options, onChange, buttonText, wide
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`${label}: ${selected?.label ?? value}. Change`}
+        accessibilityState={{ disabled }}
+        disabled={disabled}
         onPress={() => setOpen(true)}
-        style={({ pressed }) => [styles.button, wide ? styles.buttonWide : null, pressed ? styles.pressed : null]}
+        style={({ pressed }) => [styles.button, wide ? styles.buttonWide : null, pressed || disabled ? styles.pressed : null]}
       >
         <AppText variant="bodyStrong" maxFontSizeMultiplier={1.3} style={wide ? styles.grow : null} numberOfLines={1}>
           {buttonText ?? selected?.label ?? value}
         </AppText>
         <ChevronDown color={colors.text} size={18} />
       </Pressable>
-      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
+      <Modal visible={open && !disabled} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
         <Pressable style={styles.backdrop} onPress={() => setOpen(false)} accessibilityLabel="Close list" accessibilityRole="button">
           <Pressable style={styles.sheet} onPress={() => undefined} accessible={false}>
             <AppText variant="title" accessibilityRole="header" style={styles.sheetTitle}>
@@ -85,12 +88,25 @@ export function OptionPicker({ label, value, options, onChange, buttonText, wide
   );
 }
 
-export function CurrencyPicker({ label, value, options, onChange }: { label: string; value: string; options: readonly string[]; onChange: (currency: string) => void }) {
+export function CurrencyPicker({
+  label,
+  value,
+  options,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  value: string;
+  options: readonly string[];
+  onChange: (currency: string) => void;
+  disabled?: boolean;
+}) {
   return (
     <OptionPicker
       label={label}
       value={value}
       onChange={onChange}
+      disabled={disabled}
       options={options.map((currency) => ({ value: currency, label: currency, detail: currencyName(currency) }))}
     />
   );

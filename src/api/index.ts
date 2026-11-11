@@ -48,8 +48,11 @@ export function resetSampleData(): void {
 }
 
 /** Tests only: install a specific client, or pass null to rebuild the default. */
-export function setProviderBackendForTests(client: ProviderClient | null, resetSample?: () => void): void {
-  backend = client ? { client, resetSampleData: resetSample, isMock: true } : null;
+export function setProviderBackendForTests(
+  client: ProviderClient | null,
+  options: { resetSampleData?: () => void; isMock?: boolean } = {},
+): void {
+  backend = client ? { client, resetSampleData: options.resetSampleData, isMock: options.isMock ?? true } : null;
 }
 
 export * from './errors';

@@ -186,26 +186,101 @@ export function totalInBaseCurrency(
 
 const MAX_INTEGER_DIGITS = 12;
 
-/**
- * Clean up what a person types into an amount field: digits and one decimal
- * point only, no more decimals than the currency allows.
- */
-export function sanitizeAmountInput(text: string, currency: CurrencyCode): string {
-  const decimals = currencyDecimals(currency);
-  const cleaned = text.replace(/,/g, '').replace(/[^\d.]/g, '');
-  const firstDot = cleaned.indexOf('.');
-  let integerPart = firstDot === -1 ? cleaned : cleaned.slice(0, firstDot);
-  const fractionPart = firstDot === -1 ? '' : cleaned.slice(firstDot + 1).replace(/\./g, '');
-  integerPart = integerPart.replace(/^0+(?=\d)/, '').slice(0, MAX_INTEGER_DIGITS);
-  if (firstDot === -1 || decimals === 0) return integerPart;
-  return `${integerPart === '' ? '0' : integerPart}.${fractionPart.slice(0, decimals)}`;
+export type AmountInputProblem = 'empty' | 'invalid' | 'ambiguous' | 'too_many_decimals' | 'too_large' | 'zero';
+export type AmountInputResult = { ok: true; amount: DecimalString } | { ok: false; problem: AmountInputProblem };
+
+function countOf(text: string, char: string): number {
+  return text.split(char).length - 1;
 }
 
-/** Turn field text into a positive decimal string, or null if it is empty, zero or invalid. */
+function isGrouped(text: string, separator: '.' | ','): boolean {
+  return (separator === ',' ? /^\d{1,3}(,\d{3})+$/ : /^\d{1,3}(\.\d{3})+$/).test(text);
+}
+
+/**
+ * Read what a person typed as a positive decimal number.
+ *
+ * Money input is never "cleaned up" into something the person did not type:
+ * anything that is not clearly a number is REJECTED with a reason, so the
+ * screen can say what is wrong. Accepted forms:
+ *   1234      1234.56     1234,56 (comma as decimal point)
+ *   1,234.56  1.234,56    1,234,567 / 1.234.567 (two or more groups)
+ * Rejected: letters, signs, exponents ("1e3", "-50"), more decimals than
+ * allowed, and "1,234", which could mean 1234 or 1.234.
+ */
+export function parseDecimalInput(text: string, maxDecimals: number): AmountInputResult {
+  const input = text.trim();
+  if (input === '') return { ok: false, problem: 'empty' };
+  if (!/^[\d.,]+$/.test(input) || !/\d/.test(input)) return { ok: false, problem: 'invalid' };
+
+  const dots = countOf(input, '.');
+  const commas = countOf(input, ',');
+  let integerPart = input;
+  let fractionPart = '';
+
+  if (dots > 0 && commas > 0) {
+    // The last separator is the decimal point; the other must be proper thousands grouping.
+    const decimal = input.lastIndexOf('.') > input.lastIndexOf(',') ? '.' : ',';
+    const grouping = decimal === '.' ? ',' : '.';
+    if (countOf(input, decimal) !== 1) return { ok: false, problem: 'invalid' };
+    const [whole = '', fraction = ''] = input.split(decimal);
+    if (!isGrouped(whole, grouping)) return { ok: false, problem: 'invalid' };
+    integerPart = whole.split(grouping).join('');
+    fractionPart = fraction;
+  } else if (dots + commas === 1) {
+    const separator = dots === 1 ? '.' : ',';
+    const [whole = '', fraction = ''] = input.split(separator);
+    // "1,234" could be one thousand two hundred and thirty-four, or 1.234.
+    if (separator === ',' && /^[1-9]\d{0,2}$/.test(whole) && fraction.length === 3) {
+      return { ok: false, problem: 'ambiguous' };
+    }
+    integerPart = whole === '' ? '0' : whole;
+    fractionPart = fraction;
+  } else if (dots + commas > 1) {
+    const separator = dots > 0 ? '.' : ',';
+    if (!isGrouped(input, separator)) return { ok: false, problem: 'invalid' };
+    integerPart = input.split(separator).join('');
+  }
+
+  if (!/^\d+$/.test(integerPart) || !/^\d*$/.test(fractionPart)) return { ok: false, problem: 'invalid' };
+  if (fractionPart.length > maxDecimals) return { ok: false, problem: 'too_many_decimals' };
+  integerPart = integerPart.replace(/^0+(?=\d)/, '');
+  if (integerPart.length > MAX_INTEGER_DIGITS) return { ok: false, problem: 'too_large' };
+  const value = new Big(fractionPart === '' ? integerPart : `${integerPart}.${fractionPart}`);
+  if (value.lte(0)) return { ok: false, problem: 'zero' };
+  return { ok: true, amount: value.toFixed() };
+}
+
+/** Read an amount field for a currency. The amount comes back with the currency's decimals. */
+export function readAmountInput(text: string, currency: CurrencyCode): AmountInputResult {
+  const decimals = currencyDecimals(currency);
+  const result = parseDecimalInput(text, decimals);
+  return result.ok ? { ok: true, amount: new Big(result.amount).toFixed(decimals) } : result;
+}
+
+/** The amount as a decimal string, or null when the text is empty or not acceptable. */
 export function parseAmountInput(text: string, currency: CurrencyCode): DecimalString | null {
-  const cleaned = sanitizeAmountInput(text, currency).replace(/\.$/, '');
-  if (!isDecimalString(cleaned)) return null;
-  const value = new Big(cleaned);
-  if (value.lte(0)) return null;
-  return value.toFixed(currencyDecimals(currency));
+  const result = readAmountInput(text, currency);
+  return result.ok ? result.amount : null;
+}
+
+/** What to tell the person about a rejected amount. Null for an empty field. */
+export function amountInputMessage(problem: AmountInputProblem, currency: CurrencyCode): string | null {
+  const decimals = currencyDecimals(currency);
+  switch (problem) {
+    case 'empty':
+      return null;
+    case 'zero':
+      return 'Enter an amount greater than zero.';
+    case 'ambiguous':
+      return 'We cannot tell what the comma means. Type the amount like 1234.00.';
+    case 'too_many_decimals':
+      return decimals === 0
+        ? `${currency.toUpperCase()} has no decimal places. Enter a whole number.`
+        : `${currency.toUpperCase()} amounts can have at most ${decimals} decimal places.`;
+    case 'too_large':
+      return 'That amount is too large.';
+    default:
+      return 'Enter the amount in digits, like 1250.50.';
+  }
 }

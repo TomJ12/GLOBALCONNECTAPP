@@ -1,5 +1,7 @@
 import { act, renderHook } from '@testing-library/react-native';
 
+import { useToastStore } from '@/state/toast';
+
 import { useSingleFlight } from '../useSingleFlight';
 
 describe('useSingleFlight', () => {
@@ -23,11 +25,16 @@ describe('useSingleFlight', () => {
     await act(async () => release());
   });
 
-  it('unlocks after a failure', async () => {
-    const action = jest.fn().mockRejectedValueOnce(new Error('boom')).mockResolvedValue(undefined);
+  it('unlocks after a failure and reports it instead of swallowing it', async () => {
+    const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const failure = new Error('boom');
+    const action = jest.fn().mockRejectedValueOnce(failure).mockResolvedValue(undefined);
     const { result } = await renderHook(() => useSingleFlight(action));
     await act(async () => result.current.run());
     expect(result.current.busy).toBe(false);
+    expect(logged).toHaveBeenCalledWith(expect.any(String), failure);
+    expect(useToastStore.getState().message).toMatch(/unexpected/i);
+
     await act(async () => result.current.run());
     expect(action).toHaveBeenCalledTimes(2);
   });

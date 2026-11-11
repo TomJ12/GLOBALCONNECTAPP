@@ -16,7 +16,11 @@ import { MOCK_MAGIC_LINK_CODE, MockCurrencycloudServer } from './currencycloud/m
 export interface CurrencycloudMockOptions {
   getControls: () => MockControls;
   planName: string | null;
+  /** Server clock. */
   now?: () => number;
+  /** Device clock, when a test wants it to differ from the server's. Defaults to `now`. */
+  clientNow?: () => number;
+  requestTimeoutMs?: number;
   random?: () => number;
 }
 
@@ -35,7 +39,8 @@ export function createCurrencycloudMock(options: CurrencycloudMockOptions): Curr
   const client = new CurrencycloudClient(server, {
     planName: options.planName,
     devMagicLinkCode: MOCK_MAGIC_LINK_CODE,
-    now: options.now,
+    now: options.clientNow ?? options.now,
+    requestTimeoutMs: options.requestTimeoutMs,
   });
   return { client, reset: () => server.reset() };
 }

@@ -6,6 +6,7 @@ import {
   isValidBic,
   isValidEmail,
   isValidIban,
+  isValidPayeeName,
   isValidSortCode,
   isValidUkAccountNumber,
   payeeFieldRules,
@@ -44,6 +45,9 @@ describe('UK details', () => {
     expect(isValidSortCode('12-3456')).toBe(false);
     expect(isValidSortCode('12345a')).toBe(false);
     expect(formatSortCode('123456')).toBe('12-34-56');
+    // Placeholder values are not real bank details.
+    expect(isValidSortCode('000000')).toBe(false);
+    expect(isValidSortCode('00-00-00')).toBe(false);
   });
 
   it('validates account numbers', () => {
@@ -51,6 +55,7 @@ describe('UK details', () => {
     expect(isValidUkAccountNumber('1234567')).toBe(false);
     expect(isValidUkAccountNumber('123456789')).toBe(false);
     expect(isValidUkAccountNumber('1234567a')).toBe(false);
+    expect(isValidUkAccountNumber('00000000')).toBe(false);
   });
 });
 
@@ -99,6 +104,20 @@ describe('payee form', () => {
   it('passes a valid UK payee and ignores fields that do not apply', () => {
     expect(validatePayeeDraft(base)).toEqual({});
     expect(validatePayeeDraft({ ...base, iban: 'garbage' })).toEqual({});
+  });
+
+  it('accepts real-looking names and rejects markup, control characters and symbols', () => {
+    for (const name of ['Harbour Print Ltd', "O'Brien & Sons (UK) Ltd.", 'Müller GmbH', '株式会社サンプル', 'A1 Trading 24/7', 'Smith-Jones + Co']) {
+      expect(isValidPayeeName(name)).toBe(true);
+    }
+    for (const name of ['<script>\n', '<b>Acme</b>', 'Acme\nLtd', 'Acme\tLtd', 'A', '....', 'Acme; DROP', 'Acme "Ltd"', 'x'.repeat(101)]) {
+      expect(isValidPayeeName(name)).toBe(false);
+    }
+    expect(validatePayeeDraft({ ...base, name: '<script>\n' }).name).toMatch(/letters/);
+    expect(validatePayeeDraft({ ...base, sortCode: '000000', accountNumber: '00000000' })).toEqual({
+      sortCode: expect.any(String),
+      accountNumber: expect.any(String),
+    });
   });
 
   it('reports required and malformed fields', () => {

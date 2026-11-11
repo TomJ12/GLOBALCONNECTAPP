@@ -1,10 +1,10 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Check, CircleCheck, Clock, Fingerprint, ScanFace } from 'lucide-react-native';
+import { Check, CircleAlert, CircleCheck, Clock } from 'lucide-react-native';
 import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
-import type { ApprovalStep, PendingApproval } from '@/api/types';
+import type { ApprovalResult, ApprovalStep, PendingApproval } from '@/api/types';
 import { AppText } from '@/components/AppText';
 import { Avatar, DetailRow } from '@/components/Bits';
 import { Button } from '@/components/Button';
@@ -16,16 +16,38 @@ import { SkeletonCard, SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { disclosures } from '@/config/disclosures';
 import { useApprovePayment, useBalances, usePendingApprovals, useRejectPayment } from '@/hooks/queries';
-import { useBiometricKind } from '@/hooks/useBiometricKind';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { biometricName, confirmWithBiometrics } from '@/lib/biometrics';
+import { confirmAction } from '@/lib/confirmAction';
 import { formatDate, formatRelativeDay } from '@/lib/dates';
 import { compareAmounts, formatMoney } from '@/lib/money';
 import { useIsOnline } from '@/lib/online';
-import { requestConfirmation } from '@/state/confirm';
+import { formatSortCode } from '@/lib/validation';
 import { colors, spacing } from '@/theme';
 
-type Outcome = { kind: 'approved' | 'rejected'; amount: string; payee: string } | null;
+import { describeBeneficiaryAccount, maskAccountIdentifier } from './shared';
+
+export type ReviewOutcome =
+  | { kind: 'approved'; amount: string; payee: string; result: ApprovalResult }
+  | { kind: 'rejected'; amount: string; payee: string };
+
+/** What to say after an approval, from what the backend reported. "Approved" alone is not enough. */
+export function approvalOutcomeCopy(result: ApprovalResult): { title: string; body: string; tone: 'positive' | 'warning' | 'danger' } {
+  if (result.approvalsRemaining > 0 || result.status === 'awaiting_approval') {
+    const count = Math.max(1, result.approvalsRemaining);
+    return {
+      title: 'Approval recorded',
+      body: `Your approval is saved. ${count} more ${count === 1 ? 'approval is' : 'approvals are'} needed before this payment is sent.`,
+      tone: 'warning',
+    };
+  }
+  if (result.status === 'failed' || result.status === 'cancelled') {
+    return { title: 'Payment not sent', body: 'Your approval was recorded but the payment was not sent. Check Payments for its status.', tone: 'danger' };
+  }
+  if (result.status === 'unknown') {
+    return { title: 'Approval recorded', body: 'We could not confirm what happens next. Check Payments for the status of this payment.', tone: 'warning' };
+  }
+  return { title: 'Approved', body: 'The payment is released and is now being processed.', tone: 'positive' };
+}
 
 function routeLabel(route: PendingApproval['payment']['route']): string {
   if (route === 'local') return 'Local transfer';
@@ -50,48 +72,81 @@ function StepRow({ step }: { step: ApprovalStep }) {
   );
 }
 
-function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome: (outcome: Outcome) => void }) {
-  const { payment } = approval;
+function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome: (outcome: ReviewOutcome) => void }) {
+  const { payment, beneficiary } = approval;
   const balances = useBalances();
+  const approvals = usePendingApprovals();
   const approve = useApprovePayment();
   const reject = useRejectPayment();
   const online = useIsOnline();
-  const biometric = biometricName(useBiometricKind());
   const [error, setError] = useState<string | null>(null);
+  /** True after an action whose outcome we could not establish. Nothing more is allowed until a check succeeds. */
+  const [unresolved, setUnresolved] = useState<'approve' | 'reject' | null>(null);
 
   const amount = formatMoney(payment.amount, payment.currency);
   const payee = payment.beneficiaryName ?? 'Unknown payee';
   const balance = balances.data?.find((item) => item.currency === payment.currency);
   const available = balances.data ? (balance?.amount ?? '0') : null;
   const insufficient = available !== null && compareAmounts(payment.amount, available) > 0;
+  const accountLine = beneficiary ? describeBeneficiaryAccount(beneficiary) : null;
+
+  /**
+   * After a failure that may have been applied, ask the backend what is true.
+   * Approve and reject take no idempotency key (the provider's endpoints do not
+   * accept one); they are safe to repeat because a payment that is no longer
+   * waiting cannot be approved again. This check tells the person which it was.
+   */
+  const reconcile = async (kind: 'approve' | 'reject') => {
+    const fresh = await approvals.refetch();
+    if (!fresh.isSuccess) {
+      setUnresolved(kind);
+      setError('We could not confirm whether that went through. Do not try again yet. Check again in a moment.');
+      return;
+    }
+    setUnresolved(null);
+    const current = fresh.data.find((item) => item.payment.id === payment.id);
+    if (!current) {
+      onOutcome(
+        kind === 'approve'
+          ? { kind: 'approved', amount, payee, result: { status: 'unknown', approvalsRemaining: 0 } }
+          : { kind: 'rejected', amount, payee },
+      );
+    } else if (kind === 'approve' && current.approvalsRemaining < approval.approvalsRemaining) {
+      onOutcome({ kind: 'approved', amount, payee, result: { status: 'awaiting_approval', approvalsRemaining: current.approvalsRemaining } });
+    } else {
+      setError(kind === 'approve' ? 'Your approval did not go through. You can try again.' : 'The payment was not rejected. You can try again.');
+    }
+  };
 
   // One lock for both buttons: approving and rejecting can never overlap.
   const action = useSingleFlight(async (kind: 'approve' | 'reject') => {
+    if (unresolved) return;
     setError(null);
-    if (kind === 'approve') {
-      const confirmed = await confirmWithBiometrics({
-        reason: `Approve ${amount} to ${payee}`,
-        fallbackTitle: 'Approve this payment?',
-        fallbackMessage: `${amount} to ${payee}, reference ${payment.reference}.`,
-        fallbackConfirmLabel: 'Approve payment',
-      });
-      if (!confirmed) return;
-    } else {
-      const confirmed = await requestConfirmation({
-        title: 'Reject this payment?',
-        message: `${amount} to ${payee} will be cancelled. This cannot be undone.`,
-        confirmLabel: 'Reject payment',
-        cancelLabel: 'Keep payment',
-        tone: 'danger',
-      });
-      if (!confirmed) return;
-    }
+    const details = `${amount} to ${payee}${accountLine ? `, ${accountLine}` : ''}. Reference ${payment.reference}.`;
+    const confirmed =
+      kind === 'approve'
+        ? await confirmAction({ title: 'Approve this payment?', message: details, confirmLabel: 'Approve payment' })
+        : await confirmAction({
+            title: 'Reject this payment?',
+            message: `${details} It will be cancelled. This cannot be undone.`,
+            confirmLabel: 'Reject payment',
+            cancelLabel: 'Keep payment',
+            tone: 'danger',
+          });
+    if (!confirmed) return;
     try {
-      if (kind === 'approve') await approve.mutateAsync(payment.id);
-      else await reject.mutateAsync(payment.id);
-      onOutcome({ kind: kind === 'approve' ? 'approved' : 'rejected', amount, payee });
+      if (kind === 'approve') {
+        onOutcome({ kind: 'approved', amount, payee, result: await approve.mutateAsync(payment.id) });
+      } else {
+        await reject.mutateAsync(payment.id);
+        onOutcome({ kind: 'rejected', amount, payee });
+      }
     } catch (caught) {
       const providerError = toProviderError(caught);
+      if (providerError.outcomeUnknown) {
+        await reconcile(kind);
+        return;
+      }
       setError(
         providerError.kind === 'insufficient_funds'
           ? `There is not enough ${payment.currency} to send this payment.`
@@ -102,8 +157,12 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
     }
   });
 
-  const BiometricIcon = biometric === 'Face ID' || biometric === 'face unlock' ? ScanFace : biometric ? Fingerprint : Check;
+  const recheck = useSingleFlight(async () => {
+    if (unresolved) await reconcile(unresolved);
+  });
+
   const remaining = approval.approvalsRemaining;
+  const canApprove = beneficiary !== null && !insufficient && online && !unresolved;
 
   return (
     <>
@@ -129,6 +188,43 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
             <AppText variant="bodyStrong">{payee}</AppText>
           </View>
         </View>
+        {/* The approver must be able to see WHERE the money is going, not just a name. */}
+        {beneficiary ? (
+          <>
+            <Divider />
+            <DetailRow label="Bank country" value={beneficiary.bankCountry} />
+            {beneficiary.iban ? (
+              <>
+                <Divider />
+                <DetailRow label="IBAN" value={maskAccountIdentifier(beneficiary.iban) ?? ''} />
+              </>
+            ) : null}
+            {beneficiary.accountNumber ? (
+              <>
+                <Divider />
+                <DetailRow label="Account number" value={maskAccountIdentifier(beneficiary.accountNumber) ?? ''} />
+              </>
+            ) : null}
+            {beneficiary.sortCode ? (
+              <>
+                <Divider />
+                <DetailRow label="Sort code" value={formatSortCode(beneficiary.sortCode)} />
+              </>
+            ) : null}
+            {beneficiary.routingNumber ? (
+              <>
+                <Divider />
+                <DetailRow label="Routing number" value={beneficiary.routingNumber} />
+              </>
+            ) : null}
+            {beneficiary.bic ? (
+              <>
+                <Divider />
+                <DetailRow label="BIC" value={beneficiary.bic} />
+              </>
+            ) : null}
+          </>
+        ) : null}
         <Divider />
         <DetailRow label="Reference" value={payment.reference} />
         <Divider />
@@ -148,22 +244,31 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
         ))}
       </Card>
 
+      {beneficiary === null ? (
+        <InlineMessage tone="danger">
+          We could not load this payee&apos;s bank details, so this payment cannot be approved here. You can still reject it.
+        </InlineMessage>
+      ) : null}
       {insufficient ? (
         <InlineMessage tone="warning">{`There is not enough ${payment.currency} to send this payment. Add or convert funds first.`}</InlineMessage>
       ) : null}
       {error ? <InlineMessage tone="danger">{error}</InlineMessage> : null}
 
-      <View style={{ gap: spacing.sm }}>
-        <Button
-          label={biometric ? `Approve with ${biometric}` : 'Approve payment'}
-          icon={<BiometricIcon color={insufficient || !online ? colors.disabledText : colors.textOnDark} size={22} />}
-          onPress={() => action.run('approve')}
-          loading={action.busy}
-          disabled={insufficient || !online}
-          testID="approve-button"
-        />
-        <Button label="Reject payment" variant="danger" onPress={() => action.run('reject')} disabled={action.busy || !online} testID="reject-button" />
-      </View>
+      {unresolved ? (
+        <Button label="Check again" onPress={recheck.run} loading={recheck.busy} disabled={!online} testID="review-recheck" />
+      ) : (
+        <View style={{ gap: spacing.sm }}>
+          <Button
+            label="Approve payment"
+            icon={<Check color={canApprove ? colors.textOnDark : colors.disabledText} size={22} />}
+            onPress={() => action.run('approve')}
+            loading={action.busy}
+            disabled={!canApprove}
+            testID="approve-button"
+          />
+          <Button label="Reject payment" variant="danger" onPress={() => action.run('reject')} disabled={action.busy || !online} testID="reject-button" />
+        </View>
+      )}
     </>
   );
 }
@@ -172,7 +277,7 @@ export function PaymentReviewScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
   const approvals = usePendingApprovals();
-  const [outcome, setOutcome] = useState<Outcome>(null);
+  const [outcome, setOutcome] = useState<ReviewOutcome | null>(null);
 
   const done = () => {
     if (router.canGoBack()) router.back();
@@ -180,18 +285,21 @@ export function PaymentReviewScreen() {
   };
 
   if (outcome) {
+    const copy =
+      outcome.kind === 'approved'
+        ? approvalOutcomeCopy(outcome.result)
+        : { title: 'Rejected', body: 'The payment was cancelled. No money has left your account.', tone: 'positive' as const };
+    const Icon = copy.tone === 'positive' ? CircleCheck : copy.tone === 'warning' ? Clock : CircleAlert;
+    const iconColor = outcome.kind === 'rejected' ? colors.textMuted : copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
     return (
-      <Screen header={<Header title={outcome.kind === 'approved' ? 'Payment approved' : 'Payment rejected'} leading="close" onLeadingPress={done} />} footer={<Button label="Done" onPress={done} />}>
+      <Screen header={<Header title={copy.title} leading="close" onLeadingPress={done} />} footer={<Button label="Done" onPress={done} />}>
         <Card style={styles.outcome}>
-          <CircleCheck color={outcome.kind === 'approved' ? colors.positive : colors.textMuted} size={48} />
-          <AppText variant="heading" align="center" accessibilityRole="header" accessibilityLiveRegion="polite">
-            {outcome.kind === 'approved' ? 'Approved' : 'Rejected'}
+          <Icon color={iconColor} size={48} />
+          <AppText variant="heading" align="center" accessibilityRole="header" accessibilityLiveRegion="polite" testID="review-outcome-title">
+            {copy.title}
           </AppText>
-          <AppText tone="muted" align="center">
-            {outcome.kind === 'approved'
-              ? `${outcome.amount} to ${outcome.payee} is on its way to being sent.`
-              : `${outcome.amount} to ${outcome.payee} was cancelled. No money has left your account.`}
-          </AppText>
+          <AppText tone="muted" align="center">{`${outcome.amount} to ${outcome.payee}`}</AppText>
+          <AppText align="center">{copy.body}</AppText>
         </Card>
       </Screen>
     );

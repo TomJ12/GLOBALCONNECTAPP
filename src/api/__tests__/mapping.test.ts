@@ -3,6 +3,7 @@ import {
   conversionKind,
   isOpenForward,
   mapAccountDetails,
+  mapApprovalResult,
   mapBalance,
   mapBeneficiary,
   mapConversion,
@@ -200,6 +201,9 @@ describe('mapHttpError', () => {
     expect(mapHttpError(400, body('quote_expired')).kind).toBe('quote_expired');
     expect(mapHttpError(400, body('insufficient_funds')).kind).toBe('insufficient_funds');
     expect(mapHttpError(418, '').kind).toBe('server');
+    // 403 is "not allowed", not "not signed in": it must not end the session.
+    expect(mapHttpError(403, '{}').kind).toBe('forbidden');
+    expect(mapHttpError(403, '{}').userMessage).toMatch(/permission/);
   });
 
   it('keeps rejected field names and never leaks provider text to the user message', () => {
@@ -208,6 +212,14 @@ describe('mapHttpError', () => {
     expect(error.userMessage).not.toMatch(/currencycloud/i);
     expect(error.retryable).toBe(false);
     expect(mapHttpError(500, '').retryable).toBe(true);
+    // Which failures leave the outcome of a money movement unknown.
+    expect(mapHttpError(500, '').outcomeUnknown).toBe(true);
+    expect(mapHttpError(400, '{}').outcomeUnknown).toBe(false);
+    expect(mapHttpError(401, '{}').outcomeUnknown).toBe(false);
+    expect(mapHttpError(429, '{}').outcomeUnknown).toBe(false);
+    expect(new ProviderError('timeout').outcomeUnknown).toBe(true);
+    expect(new ProviderError('network').outcomeUnknown).toBe(true);
+    expect(new ProviderError('malformed_response').outcomeUnknown).toBe(true);
   });
 });
 
@@ -308,6 +320,18 @@ describe('rates and conversions', () => {
     const request = { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '100' } as const;
     expectProviderError(() => mapQuote(raw, request), 'malformed_response');
     expectProviderError(() => mapQuote({ ...raw, expires_at: 'soon' }, { ...request, sellCurrency: 'EUR' }), 'malformed_response');
+  });
+
+  it('rejects a quote for a different amount or fixed side than was asked for', () => {
+    const raw = rawHeldRateQuote.parse(SPEC_QUOTE);
+    const request = { kind: 'spot', sellCurrency: 'EUR', buyCurrency: 'USD', fixedSide: 'sell', amount: '100' } as const;
+    expect(mapQuote(raw, { ...request, amount: '100.00' }).sellAmount).toBe('100.0');
+    expectProviderError(() => mapQuote(raw, { ...request, amount: '1000' }), 'malformed_response');
+    expectProviderError(() => mapQuote(raw, { ...request, amount: '100.01' }), 'malformed_response');
+    expectProviderError(() => mapQuote(raw, { ...request, fixedSide: 'buy', amount: '118.56' }), 'malformed_response');
+    expectProviderError(() => mapQuote({ ...raw, fixed_side: 'buy' }, request), 'malformed_response');
+    expectProviderError(() => mapQuote({ ...raw, client_buy_amount: '0' }, request), 'malformed_response');
+    expectProviderError(() => mapQuote({ ...raw, client_rate: '0' }, request), 'malformed_response');
   });
 
   it('keeps the settlement date for a forward quote', () => {
@@ -471,7 +495,8 @@ describe('payees and payments', () => {
       completed: 'sent',
       failed: 'failed',
       deleted: 'cancelled',
-      some_future_status: 'processing',
+      // Not guessed as "processing": an unrecognised status is shown as unknown.
+      some_future_status: 'unknown',
     };
     for (const [status, mapped] of Object.entries(expected)) {
       expect(mapPayment({ ...raw, status }, names).status).toBe(mapped);
@@ -490,5 +515,19 @@ describe('payees and payments', () => {
     ]);
     expect(mapPendingApproval({ ...pending, authorisation_steps_required: 1 }, names, null).steps.map((step) => step.label)).toEqual(['Created', 'Waiting for you']);
     expect(mapPendingApproval({ ...pending, authorisation_steps_required: 'lots' }, names, null).approvalsRemaining).toBe(1);
+  });
+
+  it('carries the payee details for the approver, or null when they cannot be found', () => {
+    const pending = { ...raw, status: 'awaiting_authorisation', authorisation_steps_required: '1' };
+    const payee = mapBeneficiary(rawPayee);
+    expect(mapPendingApproval(pending, names, null, payee).beneficiary).toEqual(payee);
+    expect(mapPendingApproval(pending, names, null).beneficiary).toBeNull();
+  });
+
+  it('reads the result of an approval', () => {
+    const base = { payment_id: 'p', updated: true, error: null, auth_steps_taken: 1, short_reference: 'r' };
+    expect(mapApprovalResult({ ...base, payment_status: 'ready_to_send', auth_steps_required: 0 })).toEqual({ status: 'processing', approvalsRemaining: 0 });
+    expect(mapApprovalResult({ ...base, payment_status: 'awaiting_authorisation', auth_steps_required: '2' })).toEqual({ status: 'awaiting_approval', approvalsRemaining: 2 });
+    expect(mapApprovalResult({ ...base, payment_status: 'mystery', auth_steps_required: null })).toEqual({ status: 'unknown', approvalsRemaining: 0 });
   });
 });

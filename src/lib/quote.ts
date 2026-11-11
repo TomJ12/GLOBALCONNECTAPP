@@ -1,4 +1,5 @@
 /** Quote expiry logic, kept pure so it can be unit tested without timers. */
+import { compareAmounts } from './money';
 
 export interface Expiring {
   expiresAt: string;
@@ -30,4 +31,31 @@ export function formatCountdown(totalSeconds: number): string {
   const minutes = Math.floor(safe / 60);
   const seconds = safe % 60;
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+export interface QuotedAmounts {
+  sellCurrency: string;
+  buyCurrency: string;
+  sellAmount: string;
+  buyAmount: string;
+  rate: string;
+}
+
+/**
+ * True when a booked conversion is exactly what the confirmed quote promised.
+ * A mismatch must be shown to the customer, never hidden behind a success screen.
+ */
+export function conversionMatchesQuote(conversion: QuotedAmounts, quote: QuotedAmounts): boolean {
+  const same = (a: string, b: string) => compareAmounts(a, b) === 0;
+  try {
+    return (
+      conversion.sellCurrency === quote.sellCurrency &&
+      conversion.buyCurrency === quote.buyCurrency &&
+      same(conversion.sellAmount, quote.sellAmount) &&
+      same(conversion.buyAmount, quote.buyAmount) &&
+      same(conversion.rate, quote.rate)
+    );
+  } catch {
+    return false;
+  }
 }

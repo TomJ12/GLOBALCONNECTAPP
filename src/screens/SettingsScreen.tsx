@@ -8,7 +8,7 @@ import { FORCED_ERRORS, FORCED_ERROR_LABELS, type ForcedError } from '@/api/mock
 import { AppText } from '@/components/AppText';
 import { DetailRow } from '@/components/Bits';
 import { Button } from '@/components/Button';
-import { Card, Divider } from '@/components/Card';
+import { Card } from '@/components/Card';
 import { ChipGroup } from '@/components/Controls';
 import { Header } from '@/components/Header';
 import { Screen } from '@/components/Screen';
@@ -113,9 +113,7 @@ function DeveloperPanel() {
 export function SettingsScreen() {
   const router = useRouter();
   const session = useSession((state) => state.session);
-  const remembered = useSession((state) => state.remembered);
   const signOut = useSession((state) => state.signOut);
-  const forgetDevice = useSession((state) => state.forgetDevice);
 
   const close = () => {
     if (router.canGoBack()) router.back();
@@ -133,8 +131,6 @@ export function SettingsScreen() {
         <>
           <Card padded={false}>
             <DetailRow label="Signed in as" value={session.user.email || session.user.displayName} />
-            <Divider />
-            <DetailRow label="Quick unlock on this device" value={remembered?.biometricEnabled ? 'On' : 'Off'} />
           </Card>
           <Button
             variant="danger"
@@ -144,15 +140,9 @@ export function SettingsScreen() {
             loading={leave.busy}
             testID="sign-out"
           />
-          {remembered ? (
-            <Button
-              variant="ghost"
-              label="Turn off quick unlock on this device"
-              onPress={() => {
-                void forgetDevice().then(() => showToast('Quick unlock turned off'));
-              }}
-            />
-          ) : null}
+          <AppText variant="caption" tone="muted">
+            Signing out leaves nothing on this device that can sign you back in. You will need a new login link.
+          </AppText>
         </>
       ) : (
         <AppText tone="muted">You are signed out.</AppText>

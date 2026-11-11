@@ -222,7 +222,7 @@ export const rawErrorBody = z.object({
 });
 
 // --- NOT PART OF THE PROVIDER API -------------------------------------------
-// Magic-link sign-in, device credentials and rate history are not offered by
+// Magic-link sign-in and rate history are not offered by
 // the provider. A real build needs a Global Connect service for these.
 
 export const rawMagicLinkRequest = z.object({
@@ -233,7 +233,6 @@ export const rawMagicLinkRequest = z.object({
 
 export const rawAppSession = z.object({
   auth_token: z.string().min(1),
-  device_credential: z.string().min(1),
   contact: rawContact,
 });
 

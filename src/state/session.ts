@@ -1,71 +1,35 @@
 import { create } from 'zustand';
 
+import { resetAlertsStores } from '@/alerts';
 import { getProviderClient } from '@/api';
 import type { Session } from '@/api/types';
-import {
-  forgetRememberedDevice,
-  loadDeviceCredential,
-  loadRememberedDevice,
-  saveRememberedDevice,
-  type RememberedDevice,
-} from '@/lib/deviceStore';
 import { queryClient, setUnauthorizedHandler } from '@/lib/queryClient';
 
-type SignedOutReason = 'expired' | null;
+/** Why the app went back to the sign-in screen, when the person did not choose to. */
+export type SignedOutReason = 'expired' | 'inactive' | null;
 
 interface SessionState {
-  /** False until the remembered device has been read from storage. */
-  hydrated: boolean;
   session: Session | null;
-  remembered: RememberedDevice | null;
   signedOutReason: SignedOutReason;
-
-  hydrate: () => Promise<void>;
-  /** Enter the app with a session from the magic link or a biometric unlock. */
+  /** Enter the app with a session from the emailed link or code. */
   startSession: (session: Session) => void;
-  /** Remember this device so a biometric check can unlock it next time. */
-  enableBiometricUnlock: (session: Session) => Promise<void>;
-  /** Start a session from the stored device credential. Call only after a biometric check. */
-  unlockWithDevice: () => Promise<void>;
+  /**
+   * End the session and clear everything cached for it. Nothing that can start
+   * a session is ever stored on the device, so the next sign-in always needs a
+   * new emailed link or code.
+   */
   signOut: (reason?: SignedOutReason) => Promise<void>;
-  forgetDevice: () => Promise<void>;
 }
 
 export const useSession = create<SessionState>((set, get) => ({
-  hydrated: false,
   session: null,
-  remembered: null,
   signedOutReason: null,
-
-  hydrate: async () => {
-    const remembered = await loadRememberedDevice();
-    set({ hydrated: true, remembered });
-  },
 
   startSession: (session) => {
     // Nothing cached for a previous person may be shown to this one.
     queryClient.clear();
+    resetAlertsStores();
     set({ session, signedOutReason: null });
-  },
-
-  enableBiometricUnlock: async (session) => {
-    const remembered: RememberedDevice = {
-      email: session.user.email,
-      displayName: session.user.displayName,
-      biometricEnabled: true,
-    };
-    await saveRememberedDevice(remembered, session.deviceCredential);
-    set({ remembered });
-  },
-
-  unlockWithDevice: async () => {
-    const credential = await loadDeviceCredential();
-    if (!credential) {
-      await get().forgetDevice();
-      throw new Error('No device credential stored');
-    }
-    const session = await getProviderClient().resumeSession(credential);
-    get().startSession(session);
   },
 
   signOut: async (reason = null) => {
@@ -74,12 +38,8 @@ export const useSession = create<SessionState>((set, get) => ({
     set({ session: null, signedOutReason: reason });
     await queryClient.cancelQueries();
     queryClient.clear();
+    resetAlertsStores();
     await getProviderClient().signOut();
-  },
-
-  forgetDevice: async () => {
-    await forgetRememberedDevice();
-    set({ remembered: null });
   },
 }));
 

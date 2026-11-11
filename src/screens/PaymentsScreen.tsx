@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import { Plus } from 'lucide-react-native';
 import { View } from 'react-native';
 
+import { userMessageFor } from '@/api/errors';
 import { SectionHeader } from '@/components/Bits';
 import { Button } from '@/components/Button';
 import { Card, Divider } from '@/components/Card';
@@ -9,8 +10,9 @@ import { Header } from '@/components/Header';
 import { QueryState } from '@/components/QueryState';
 import { Screen } from '@/components/Screen';
 import { SkeletonList } from '@/components/Skeleton';
-import { EmptyState } from '@/components/StateViews';
-import { usePayments, usePendingApprovals } from '@/hooks/queries';
+import { EmptyState, InlineMessage } from '@/components/StateViews';
+import { uniqueById, usePayments, usePendingApprovals } from '@/hooks/queries';
+import { useIsOnline } from '@/lib/online';
 import { colors, spacing } from '@/theme';
 
 import { PaymentRow } from './shared';
@@ -19,6 +21,7 @@ export function PaymentsScreen() {
   const router = useRouter();
   const approvals = usePendingApprovals();
   const payments = usePayments();
+  const online = useIsOnline();
 
   return (
     <Screen
@@ -28,7 +31,7 @@ export function PaymentsScreen() {
         void approvals.refetch();
         void payments.refetch();
       }}
-      refreshing={approvals.isRefetching || payments.isRefetching}
+      refreshing={approvals.isRefetching || (payments.isRefetching && !payments.isFetchingNextPage)}
     >
       <Button
         label="New payment"
@@ -60,26 +63,41 @@ export function PaymentsScreen() {
         </QueryState>
       </View>
 
-      <View style={{ marginBottom: spacing.lg }}>
+      <View style={{ marginBottom: spacing.lg, gap: spacing.md }}>
         <SectionHeader title="Recent payments" />
-        <QueryState
-          query={payments}
-          skeleton={<SkeletonList rows={4} label="Loading payments" />}
-          isEmpty={(data) => data.every((payment) => payment.status === 'awaiting_approval')}
-          empty={<EmptyState title="No payments yet" body="Payments you send will appear here." />}
-        >
-          {(data) => (
-            <Card padded={false}>
-              {data
-                .filter((payment) => payment.status !== 'awaiting_approval')
-                .map((payment, index) => (
-                  <View key={payment.id}>
-                    {index > 0 ? <Divider /> : null}
-                    <PaymentRow payment={payment} />
-                  </View>
-                ))}
-            </Card>
-          )}
+        <QueryState query={payments} skeleton={<SkeletonList rows={4} label="Loading payments" />}>
+          {(data) => {
+            const rows = uniqueById(data.pages.flatMap((page) => page.items)).filter((payment) => payment.status !== 'awaiting_approval');
+            // "No payments yet" is only true when every page has been read.
+            if (rows.length === 0 && !payments.hasNextPage) {
+              return <EmptyState title="No payments yet" body="Payments you send will appear here." />;
+            }
+            return (
+              <View style={{ gap: spacing.md }}>
+                {rows.length > 0 ? (
+                  <Card padded={false}>
+                    {rows.map((payment, index) => (
+                      <View key={payment.id}>
+                        {index > 0 ? <Divider /> : null}
+                        <PaymentRow payment={payment} />
+                      </View>
+                    ))}
+                  </Card>
+                ) : null}
+                {payments.isFetchNextPageError ? <InlineMessage tone="danger">{userMessageFor(payments.error)}</InlineMessage> : null}
+                {payments.hasNextPage ? (
+                  <Button
+                    variant="secondary"
+                    label={payments.isFetchNextPageError ? 'Try again' : 'Show more payments'}
+                    onPress={() => void payments.fetchNextPage()}
+                    loading={payments.isFetchingNextPage}
+                    disabled={!online}
+                    testID="payments-more"
+                  />
+                ) : null}
+              </View>
+            );
+          }}
         </QueryState>
       </View>
     </Screen>

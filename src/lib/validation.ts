@@ -38,9 +38,10 @@ export function normalizeSortCode(input: string): string {
   return input.replace(/[\s-]/g, '');
 }
 
-/** Six digits, optionally written 12-34-56 or 12 34 56. */
+/** Six digits, optionally written 12-34-56 or 12 34 56. All zeros is not a real sort code. */
 export function isValidSortCode(input: string): boolean {
-  return /^(\d{6}|\d{2}-\d{2}-\d{2}|\d{2} \d{2} \d{2})$/.test(input.trim());
+  const value = input.trim();
+  return /^(\d{6}|\d{2}-\d{2}-\d{2}|\d{2} \d{2} \d{2})$/.test(value) && !/^0+$/.test(normalizeSortCode(value));
 }
 
 export function formatSortCode(input: string): string {
@@ -48,9 +49,20 @@ export function formatSortCode(input: string): string {
   return /^\d{6}$/.test(digits) ? `${digits.slice(0, 2)}-${digits.slice(2, 4)}-${digits.slice(4)}` : input;
 }
 
-/** UK account numbers are eight digits. */
+/** UK account numbers are eight digits. All zeros is not a real account. */
 export function isValidUkAccountNumber(input: string): boolean {
-  return /^\d{8}$/.test(input.trim());
+  const value = input.trim();
+  return /^\d{8}$/.test(value) && !/^0+$/.test(value);
+}
+
+/**
+ * Account holder names: letters (any alphabet), digits, spaces and the
+ * punctuation real company and personal names use. No control characters,
+ * line breaks or markup characters.
+ */
+export function isValidPayeeName(input: string): boolean {
+  const value = input.trim();
+  return value.length >= 2 && value.length <= 100 && /^[\p{L}\p{M}\p{N} .,'&()\/+-]+$/u.test(value) && /[\p{L}\p{N}]/u.test(value);
 }
 
 export function isValidBic(input: string): boolean {
@@ -69,7 +81,8 @@ export function isValidAbaRoutingNumber(input: string): boolean {
 }
 
 export function isValidGenericAccountNumber(input: string): boolean {
-  return /^[A-Z0-9]{4,34}$/i.test(input.trim());
+  const value = input.trim();
+  return /^[A-Z0-9]{4,34}$/i.test(value) && !/^0+$/.test(value);
 }
 
 export function isValidEmail(input: string): boolean {
@@ -162,6 +175,7 @@ export function validatePayeeDraft(draft: PayeeDraft): PayeeErrors {
   const name = draft.name.trim();
   if (name.length < 2) errors.name = 'Enter the account holder name.';
   else if (name.length > 100) errors.name = 'Name must be 100 characters or fewer.';
+  else if (!isValidPayeeName(draft.name)) errors.name = "Use letters, numbers, spaces and . , ' & ( ) / + - only.";
   if (!PAYEE_COUNTRIES.some((c) => c.code === draft.countryCode)) errors.countryCode = 'Choose a country.';
   if (!PAYEE_CURRENCIES.includes(draft.currency)) errors.currency = 'Choose a currency.';
 
@@ -173,13 +187,13 @@ export function validatePayeeDraft(draft: PayeeDraft): PayeeErrors {
     }
     switch (rule.field) {
       case 'sortCode':
-        if (!isValidSortCode(value)) errors.sortCode = 'Sort code must be 6 digits.';
+        if (!isValidSortCode(value)) errors.sortCode = 'Enter a valid 6-digit sort code.';
         break;
       case 'accountNumber':
         if (draft.countryCode === 'GB' && draft.currency === 'GBP') {
-          if (!isValidUkAccountNumber(value)) errors.accountNumber = 'Account number must be 8 digits.';
+          if (!isValidUkAccountNumber(value)) errors.accountNumber = 'Enter a valid 8-digit account number.';
         } else if (!isValidGenericAccountNumber(value)) {
-          errors.accountNumber = 'Account number must be 4 to 34 letters or digits.';
+          errors.accountNumber = 'Enter a valid account number of 4 to 34 letters or digits.';
         }
         break;
       case 'iban':

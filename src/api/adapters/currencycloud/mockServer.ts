@@ -15,7 +15,6 @@ import type { MockControls } from '../../mockControls';
 import type { Transport, TransportParams, TransportRequest, TransportResponse } from './transport';
 
 export const MOCK_MAGIC_LINK_CODE = 'SAMPLE-LINK-CODE';
-export const MOCK_DEVICE_CREDENTIAL_PREFIX = 'sample-device:';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
@@ -158,6 +157,10 @@ export class MockCurrencycloudServer implements Transport {
       await Promise.resolve();
     }
 
+    if (controls.hang) {
+      // Never answers. The client's own timeout has to end the wait.
+      return new Promise<TransportResponse>(() => undefined);
+    }
     if (controls.offline || controls.forcedError === 'network') {
       throw new TypeError('Network request failed');
     }
@@ -172,6 +175,10 @@ export class MockCurrencycloudServer implements Transport {
         return { status: 200, body: '{"balances": [{"id": "trunc' };
       case 'wrong_shape':
         return ok({ unexpected: true, amount: 12.5, balances: 'not-a-list' });
+      case 'lost_response':
+        // The request is applied, then the connection drops before the reply arrives.
+        this.route(request);
+        throw new TypeError('Network request failed');
       default:
         break;
     }
@@ -192,7 +199,6 @@ export class MockCurrencycloudServer implements Transport {
     // Sign-in endpoints. NOT PART OF THE PROVIDER API (see raw.ts).
     if (key === 'POST /v2/authenticate/magic_link/request') return this.requestMagicLink(params);
     if (key === 'POST /v2/authenticate/magic_link/verify') return this.verifyMagicLink(params);
-    if (key === 'POST /v2/authenticate/device') return this.resumeDevice(params);
 
     if (!request.token || !this.state.tokens.has(request.token)) {
       return fail(401, 'auth_failed', 'username', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
@@ -210,7 +216,11 @@ export class MockCurrencycloudServer implements Transport {
     if (key === 'GET /v2/rates/history') return this.rateHistory(params);
     if (key === 'POST /v2/quotes/create') return this.createQuote(params);
     if (key === 'POST /v2/conversions/create') return this.createConversion(params);
-    if (key === 'GET /v2/conversions/find') return this.paginate('conversions', this.state.conversions, params);
+    if (key === 'GET /v2/conversions/find') {
+      const wanted = one(params, 'unique_request_id');
+      const rows = wanted ? this.state.conversions.filter((row) => row.unique_request_id === wanted) : this.state.conversions;
+      return this.paginate('conversions', rows, params);
+    }
     if (key === 'POST /v2/beneficiaries/find') return this.paginate('beneficiaries', this.state.beneficiaries, params);
     if (key === 'POST /v2/beneficiaries/create') return this.createBeneficiary(params);
     if (key === 'GET /v2/payments/find') return this.findPayments(params);
@@ -352,7 +362,6 @@ export class MockCurrencycloudServer implements Transport {
     this.state.contacts.set(this.state.me.id, this.state.me);
     return ok({
       auth_token: token,
-      device_credential: `${MOCK_DEVICE_CREDENTIAL_PREFIX}${email}`,
       contact: this.contactBody(this.state.me),
     });
   }
@@ -364,17 +373,6 @@ export class MockCurrencycloudServer implements Transport {
     if (one(params, 'code') !== MOCK_MAGIC_LINK_CODE) return badLink();
     this.state.magicLinks.delete(one(params, 'request_id') ?? '');
     return this.sessionBody(link.email);
-  }
-
-  private resumeDevice(params: TransportParams | undefined): TransportResponse {
-    const credential = one(params, 'device_credential') ?? '';
-    const email = credential.startsWith(MOCK_DEVICE_CREDENTIAL_PREFIX)
-      ? credential.slice(MOCK_DEVICE_CREDENTIAL_PREFIX.length)
-      : '';
-    if (!email.includes('@')) {
-      return fail(401, 'auth_failed', 'device_credential', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
-    }
-    return this.sessionBody(email);
   }
 
   // --- Balances, accounts, rates ---------------------------------------------
@@ -640,8 +638,11 @@ export class MockCurrencycloudServer implements Transport {
 
   private findPayments(params: TransportParams | undefined): TransportResponse {
     const status = one(params, 'status');
-    const rows = this.state.payments.filter((payment) =>
-      status ? payment.status === status : payment.status !== 'deleted',
+    const wanted = one(params, 'unique_request_id');
+    const rows = this.state.payments.filter(
+      (payment) =>
+        (status ? payment.status === status : payment.status !== 'deleted') &&
+        (wanted ? payment.unique_request_id === wanted : true),
     );
     return this.paginate('payments', rows, params);
   }
@@ -709,7 +710,7 @@ export class MockCurrencycloudServer implements Transport {
         updated,
         error,
         auth_steps_taken: updated ? 1 : 0,
-        auth_steps_required: 0,
+        auth_steps_required: Number(payment?.authorisation_steps_required ?? 0),
         short_reference: (payment?.short_reference as string | undefined) ?? '',
       });
       if (!payment) return result(false, 'payment_not_found');
@@ -718,10 +719,13 @@ export class MockCurrencycloudServer implements Transport {
       const amount = new Big(payment.amount as string);
       if (this.balanceRow(currency).amount.lt(amount)) return result(false, 'insufficient_funds');
 
-      payment.status = 'ready_to_send';
-      payment.authorisation_steps_required = '0';
+      const stepsLeft = Math.max(0, Number(payment.authorisation_steps_required ?? 1) - 1);
+      payment.authorisation_steps_required = String(stepsLeft);
       payment.last_updater_contact_id = this.state.me.id;
       payment.updated_at = this.iso();
+      // More approvers to go: nothing is sent yet.
+      if (stepsLeft > 0) return result(true, null);
+      payment.status = 'ready_to_send';
       const beneficiary = this.state.beneficiaries.find((row) => row.id === payment.beneficiary_id);
       this.postTransaction({
         currency,

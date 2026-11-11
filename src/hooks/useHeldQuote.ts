@@ -1,3 +1,4 @@
+import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { getProviderClient } from '@/api';
@@ -6,6 +7,8 @@ import type { Quote, QuoteRequest } from '@/api/types';
 import { isQuoteExpired, secondsUntilExpiry } from '@/lib/quote';
 
 export const QUOTE_DEBOUNCE_MS = 400;
+/** After this many automatic re-quotes for one request, the person has to ask for a new rate. */
+export const MAX_AUTO_REQUOTES = 1;
 const TICK_MS = 250;
 
 export interface HeldQuote {
@@ -16,11 +19,18 @@ export interface HeldQuote {
   isExpired: boolean;
   isFetching: boolean;
   error: ProviderError | null;
-  /** Ask for a fresh quote now. */
+  /** Ask for a fresh quote now. Also allows automatic re-quoting again. */
   refresh: () => void;
 }
 
-function requestKey(request: QuoteRequest | null): string {
+export interface HeldQuoteOptions {
+  /** True while a booking is in flight, so the quote is not swapped underneath it. */
+  paused?: boolean;
+  /** False while the screen is not focused or the app is in the background. */
+  active?: boolean;
+}
+
+export function quoteRequestKey(request: QuoteRequest | null): string {
   if (!request) return '';
   return [request.kind, request.sellCurrency, request.buyCurrency, request.fixedSide, request.amount, request.settlementDate ?? ''].join('|');
 }
@@ -29,14 +39,17 @@ function requestKey(request: QuoteRequest | null): string {
  * Keeps a held-rate quote for `request`:
  *  - waits for typing to pause, then asks for a quote;
  *  - counts down to its expiry;
- *  - asks for a new one when it expires (once; if that fails it stops and
- *    reports the error rather than retrying in a loop);
+ *  - when it expires, asks for a new one automatically at most MAX_AUTO_REQUOTES
+ *    times, and never while paused, unfocused or in the background. After that it
+ *    stays expired until `refresh()` is called, so an idle screen stops quoting;
  *  - ignores answers to requests that are no longer current.
- * Pass `paused` while a booking is in flight so the quote is not swapped underneath it.
+ * Quotes are fetched through the query client so a 401 ends the session like any other call.
  */
-export function useHeldQuote(request: QuoteRequest | null, options: { paused?: boolean } = {}): HeldQuote {
+export function useHeldQuote(request: QuoteRequest | null, options: HeldQuoteOptions = {}): HeldQuote {
   const paused = options.paused ?? false;
-  const key = requestKey(request);
+  const active = options.active ?? true;
+  const key = quoteRequestKey(request);
+  const queryClient = useQueryClient();
   const [state, setState] = useState<{ key: string; quote: Quote | null; error: ProviderError | null; isFetching: boolean }>({
     key: '',
     quote: null,
@@ -48,6 +61,7 @@ export function useHeldQuote(request: QuoteRequest | null, options: { paused?: b
   const latestKey = useRef(key);
   const sequence = useRef(0);
   const mounted = useRef(true);
+  const autoRequotes = useRef({ key: '', count: 0 });
 
   useEffect(() => {
     latestRequest.current = request;
@@ -72,8 +86,15 @@ export function useHeldQuote(request: QuoteRequest | null, options: { paused?: b
       error: null,
       isFetching: true,
     }));
-    getProviderClient()
-      .createQuote(current)
+    queryClient
+      .fetchQuery({
+        // Unique per attempt: a held quote must never be served from cache.
+        queryKey: ['heldQuote', currentKey, mine],
+        queryFn: () => getProviderClient().createQuote(current),
+        staleTime: 0,
+        gcTime: 0,
+        retry: false,
+      })
       .then(
         (quote) => {
           if (!mounted.current || mine !== sequence.current) return;
@@ -90,7 +111,12 @@ export function useHeldQuote(request: QuoteRequest | null, options: { paused?: b
           }));
         },
       );
-  }, []);
+  }, [queryClient]);
+
+  const refresh = useCallback(() => {
+    autoRequotes.current = { key: latestKey.current, count: 0 };
+    fetchQuote();
+  }, [fetchQuote]);
 
   // New request: fetch after a short pause in typing. State for an older
   // request is never shown, because everything below is matched against `key`.
@@ -100,6 +126,13 @@ export function useHeldQuote(request: QuoteRequest | null, options: { paused?: b
     const timer = setTimeout(fetchQuote, QUOTE_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [key, fetchQuote]);
+
+  // A quote belongs to the request it was made for. As soon as the request changes
+  // (even to nothing, and even if it later changes back) the old quote is dropped,
+  // so a used or stale quote can never be offered again.
+  if (state.key !== key && (state.quote !== null || state.error !== null)) {
+    setState({ key: '', quote: null, error: null, isFetching: false });
+  }
 
   const quote = state.key === key ? state.quote : null;
   const error = state.key === key ? state.error : null;
@@ -114,14 +147,17 @@ export function useHeldQuote(request: QuoteRequest | null, options: { paused?: b
 
   const isExpired = quote ? isQuoteExpired(quote, nowMs) : false;
 
-  // Expired: get a new rate, once per quote.
+  // Expired: get a new rate, within the automatic budget for this request.
   const requotedFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!quote || !isExpired || paused || isFetching) return;
+    if (!quote || !isExpired || paused || !active || isFetching) return;
     if (requotedFor.current === quote.id) return;
+    if (autoRequotes.current.key !== key) autoRequotes.current = { key, count: 0 };
+    if (autoRequotes.current.count >= MAX_AUTO_REQUOTES) return;
+    autoRequotes.current.count += 1;
     requotedFor.current = quote.id;
     fetchQuote();
-  }, [quote, isExpired, paused, isFetching, fetchQuote]);
+  }, [quote, isExpired, paused, active, isFetching, key, fetchQuote]);
 
   return {
     quote,
@@ -129,6 +165,6 @@ export function useHeldQuote(request: QuoteRequest | null, options: { paused?: b
     isExpired,
     isFetching,
     error,
-    refresh: fetchQuote,
+    refresh,
   };
 }

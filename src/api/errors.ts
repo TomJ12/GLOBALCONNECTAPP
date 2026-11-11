@@ -6,7 +6,9 @@
  */
 export type ProviderErrorKind =
   | 'network'
+  | 'timeout'
   | 'unauthorized'
+  | 'forbidden'
   | 'rate_limited'
   | 'server'
   | 'malformed_response'
@@ -17,7 +19,9 @@ export type ProviderErrorKind =
 
 const USER_MESSAGES: Record<ProviderErrorKind, string> = {
   network: 'We could not reach the service. Check your connection and try again.',
+  timeout: 'This is taking too long. Check your connection and try again.',
   unauthorized: 'Your session has ended. Sign in again to continue.',
+  forbidden: 'You do not have permission to do this. Ask an administrator on your account.',
   rate_limited: 'Too many requests. Wait a moment and try again.',
   server: 'Something went wrong on our side. Try again in a moment.',
   malformed_response: 'We received a response we could not read. Try again.',
@@ -27,7 +31,12 @@ const USER_MESSAGES: Record<ProviderErrorKind, string> = {
   insufficient_funds: 'There is not enough money in this balance.',
 };
 
-const RETRYABLE: ReadonlySet<ProviderErrorKind> = new Set(['network', 'rate_limited', 'server', 'malformed_response']);
+const RETRYABLE: ReadonlySet<ProviderErrorKind> = new Set(['network', 'timeout', 'rate_limited', 'server', 'malformed_response']);
+/**
+ * Failures where a request that changes something may still have been applied:
+ * no answer arrived, or the answer could not be read.
+ */
+const OUTCOME_UNKNOWN: ReadonlySet<ProviderErrorKind> = new Set(['network', 'timeout', 'server', 'malformed_response']);
 
 export interface ProviderErrorOptions {
   /** Internal detail for logs and tests. Never shown to the customer. */
@@ -59,6 +68,14 @@ export class ProviderError extends Error {
   /** Safe to show to the customer. */
   get userMessage(): string {
     return USER_MESSAGES[this.kind];
+  }
+
+  /**
+   * For a request that changes something: true when we cannot tell whether it
+   * was applied. The caller must check before letting the person try again.
+   */
+  get outcomeUnknown(): boolean {
+    return OUTCOME_UNKNOWN.has(this.kind);
   }
 
   /** Whether trying the same request again could succeed. */

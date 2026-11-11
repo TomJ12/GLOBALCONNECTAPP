@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { showToast } from '@/state/toast';
+
+/**
+ * Actions are expected to handle their own failures. If one rejects anyway it is
+ * a bug or something unforeseen: say so rather than failing silently.
+ */
+function reportUnexpected(error: unknown): void {
+  console.error('Unexpected error in a guarded action', error);
+  showToast('Something unexpected went wrong. Check the result before trying again.');
+}
+
 /**
  * Wraps an async action so it cannot run twice at once. The lock is a ref, so
  * a second tap in the same frame (before React re-renders the disabled button)
@@ -29,7 +40,7 @@ export function useSingleFlight<Args extends unknown[]>(
     setBusy(true);
     void latest
       .current(...args)
-      .catch(() => undefined)
+      .catch(reportUnexpected)
       .finally(() => {
         locked.current = false;
         if (mounted.current) setBusy(false);

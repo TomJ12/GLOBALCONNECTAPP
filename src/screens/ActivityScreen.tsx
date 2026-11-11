@@ -9,7 +9,7 @@ import { SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { AppText } from '@/components/AppText';
 import { userMessageFor } from '@/api/errors';
-import { useAllTransactions } from '@/hooks/queries';
+import { uniqueById, useAllTransactions } from '@/hooks/queries';
 import { useIsOnline } from '@/lib/online';
 
 import { TransactionRow } from './shared';
@@ -26,7 +26,7 @@ export function ActivityScreen() {
         empty={<EmptyState title="No activity yet" body="Payments and conversions will appear here." />}
       >
         {(data) => {
-          const items = data.pages.flatMap((page) => page.items);
+          const items = uniqueById(data.pages.flatMap((page) => page.items));
           const total = data.pages[0]?.totalItems ?? items.length;
           return (
             <View style={{ gap: 16 }}>

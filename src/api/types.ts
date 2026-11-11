@@ -37,8 +37,6 @@ export interface SessionUser {
 
 export interface Session {
   user: SessionUser;
-  /** Opaque credential that lets this device start a new session after a biometric check. */
-  deviceCredential: string;
 }
 
 export interface CompanyProfile {
@@ -221,7 +219,8 @@ export interface NewBeneficiary {
   routingNumber?: string;
 }
 
-export type PaymentStatus = 'awaiting_approval' | 'processing' | 'sent' | 'failed' | 'cancelled';
+/** 'unknown' means the backend reported a status this app does not recognise. Never treat it as success. */
+export type PaymentStatus = 'awaiting_approval' | 'processing' | 'sent' | 'failed' | 'cancelled' | 'unknown';
 export type PaymentRoute = 'local' | 'swift';
 
 export interface Payment {
@@ -252,6 +251,13 @@ export interface NewPayment {
   idempotencyKey: string;
 }
 
+/** What the backend said after an approval was recorded. */
+export interface ApprovalResult {
+  status: PaymentStatus;
+  /** Approvals still needed after yours. 0 means the payment is released. */
+  approvalsRemaining: number;
+}
+
 export type ApprovalStepStatus = 'done' | 'waiting_for_you' | 'waiting';
 
 export interface ApprovalStep {
@@ -262,6 +268,8 @@ export interface ApprovalStep {
 
 export interface PendingApproval {
   payment: Payment;
+  /** The payee's saved details. Null if they could not be found: such a payment must not be approved. */
+  beneficiary: Beneficiary | null;
   /** Approvals still needed before the payment is released, including yours. */
   approvalsRemaining: number;
   steps: ApprovalStep[];

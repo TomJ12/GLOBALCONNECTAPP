@@ -9,6 +9,7 @@ import { ProviderError } from '../../errors';
 import type { ProviderClient } from '../../provider';
 import type {
   AccountDetails,
+  ApprovalResult,
   Balance,
   Beneficiary,
   BookConversionRequest,
@@ -32,6 +33,7 @@ import type {
 import {
   isOpenForward,
   mapAccountDetails,
+  mapApprovalResult,
   mapBalance,
   mapBeneficiary,
   mapCompanyProfile,
@@ -79,10 +81,15 @@ export interface CurrencycloudClientOptions {
   quoteHoldSeconds?: number;
   /** Set only by the mock so the sign-in screen can offer a shortcut. */
   devMagicLinkCode?: string | null;
+  /** Give up waiting for a response after this long. */
+  requestTimeoutMs?: number;
   now?: () => number;
 }
 
 const MAX_PAGE_SIZE = 100;
+/** Safety stop for "read every page" loops: 50 pages of 100. */
+const MAX_PAGES = 50;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 
 export class CurrencycloudClient implements ProviderClient {
   private token: string | null = null;
@@ -102,13 +109,25 @@ export class CurrencycloudClient implements ProviderClient {
     params?: TransportParams,
   ): Promise<z.infer<S>> {
     let response;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     try {
-      response = await this.transport.request({ method, path, params, token: this.token });
+      // A request that never answers must not leave a spinner and a lock forever.
+      // The request may still have been applied, so `timeout` counts as outcome-unknown.
+      response = await Promise.race([
+        this.transport.request({ method, path, params, token: this.token }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new ProviderError('timeout', { detail: `No response after ${timeoutMs} ms` })), timeoutMs);
+        }),
+      ]);
     } catch (cause) {
+      if (cause instanceof ProviderError) throw cause;
       throw new ProviderError('network', {
         detail: cause instanceof Error ? cause.message : 'No response',
         cause,
       });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
     if (response.status < 200 || response.status >= 300) {
       throw mapHttpError(response.status, response.body);
@@ -135,15 +154,6 @@ export class CurrencycloudClient implements ProviderClient {
     return session;
   }
 
-  async resumeSession(deviceCredential: string): Promise<Session> {
-    const raw = await this.call(rawAppSession, 'POST', '/v2/authenticate/device', {
-      device_credential: deviceCredential,
-    });
-    const { session, token } = mapSession(raw);
-    this.token = token;
-    return session;
-  }
-
   async signOut(): Promise<void> {
     const token = this.token;
     // Drop the token first so the app is signed out even if the request fails.
@@ -156,6 +166,26 @@ export class CurrencycloudClient implements ProviderClient {
     }
   }
 
+  /** Read every page of a list endpoint, so nothing past the first page is silently dropped. */
+  private async allPages<S extends z.ZodType, T>(
+    schema: S,
+    method: 'GET' | 'POST',
+    path: string,
+    params: TransportParams,
+    pick: (page: z.infer<S>) => { items: T[]; nextPage: number },
+  ): Promise<T[]> {
+    const all: T[] = [];
+    let page = 1;
+    for (let count = 0; count < MAX_PAGES; count += 1) {
+      const raw = await this.call(schema, method, path, { ...params, page: String(page), per_page: String(MAX_PAGE_SIZE) });
+      const { items, nextPage } = pick(raw);
+      all.push(...items);
+      if (nextPage <= page) return all;
+      page = nextPage;
+    }
+    throw new ProviderError('malformed_response', { detail: `More than ${MAX_PAGES} pages from ${path}` });
+  }
+
   // --- Accounts ---------------------------------------------------------------
 
   async getCompanyProfile(): Promise<CompanyProfile> {
@@ -164,12 +194,11 @@ export class CurrencycloudClient implements ProviderClient {
   }
 
   async listBalances(): Promise<Balance[]> {
-    const raw = await this.call(rawFindBalances, 'GET', '/v2/balances/find', {
-      per_page: String(MAX_PAGE_SIZE),
-      order: 'created_at',
-      order_asc_desc: 'asc',
-    });
-    return raw.balances.map(mapBalance);
+    const rows = await this.allPages(rawFindBalances, 'GET', '/v2/balances/find', { order: 'created_at', order_asc_desc: 'asc' }, (page) => ({
+      items: page.balances,
+      nextPage: page.pagination.next_page,
+    }));
+    return rows.map(mapBalance);
   }
 
   async getAccountDetails(currency: string): Promise<AccountDetails> {
@@ -219,7 +248,15 @@ export class CurrencycloudClient implements ProviderClient {
       hold_period: String(this.options.quoteHoldSeconds ?? 30),
       conversion_date: request.kind === 'forward' ? request.settlementDate : undefined,
     });
-    return mapQuote(raw, request);
+    const quote = mapQuote(raw, request);
+    // The countdown runs on this device's clock, which may differ from the server's.
+    // Keep the server's hold LENGTH and start it when the answer arrived here.
+    const holdMs = Date.parse(raw.expires_at) - Date.parse(raw.created_at);
+    if (Number.isNaN(holdMs) || holdMs <= 0) {
+      throw new ProviderError('malformed_response', { detail: 'Quote hold period is not positive' });
+    }
+    const receivedAt = this.now();
+    return { ...quote, createdAt: new Date(receivedAt).toISOString(), expiresAt: new Date(receivedAt + holdMs).toISOString() };
   }
 
   async bookConversion(request: BookConversionRequest): Promise<Conversion> {
@@ -238,21 +275,28 @@ export class CurrencycloudClient implements ProviderClient {
   }
 
   async listForwardContracts(): Promise<ForwardContract[]> {
-    const raw = await this.call(rawFindConversions, 'GET', '/v2/conversions/find', {
-      per_page: String(MAX_PAGE_SIZE),
-      order: 'created_at',
-      order_asc_desc: 'desc',
-    });
-    return raw.conversions.filter(isOpenForward).map(mapForwardContract);
+    const rows = await this.allPages(rawFindConversions, 'GET', '/v2/conversions/find', { order: 'created_at', order_asc_desc: 'desc' }, (page) => ({
+      items: page.conversions,
+      nextPage: page.pagination.next_page,
+    }));
+    return rows.filter(isOpenForward).map(mapForwardContract);
+  }
+
+  async findConversionByIdempotencyKey(idempotencyKey: string): Promise<Conversion | null> {
+    const raw = await this.call(rawFindConversions, 'GET', '/v2/conversions/find', { unique_request_id: idempotencyKey });
+    // Filter again here: never trust that the server applied the filter.
+    const match = raw.conversions.find((conversion) => conversion.unique_request_id === idempotencyKey);
+    return match ? mapConversion(match) : null;
   }
 
   // --- Payees -----------------------------------------------------------------
 
   async listBeneficiaries(): Promise<Beneficiary[]> {
-    const raw = await this.call(rawFindBeneficiaries, 'POST', '/v2/beneficiaries/find', {
-      per_page: String(MAX_PAGE_SIZE),
-    });
-    return raw.beneficiaries.map(mapBeneficiary);
+    const rows = await this.allPages(rawFindBeneficiaries, 'POST', '/v2/beneficiaries/find', {}, (page) => ({
+      items: page.beneficiaries,
+      nextPage: page.pagination.next_page,
+    }));
+    return rows.map(mapBeneficiary);
   }
 
   async createBeneficiary(input: NewBeneficiary): Promise<Beneficiary> {
@@ -297,16 +341,28 @@ export class CurrencycloudClient implements ProviderClient {
     return mapPayment(raw, names);
   }
 
+  async findPaymentByIdempotencyKey(idempotencyKey: string): Promise<Payment | null> {
+    const raw = await this.call(rawFindPayments, 'GET', '/v2/payments/find', { unique_request_id: idempotencyKey });
+    const match = raw.payments.find((payment) => payment.unique_request_id === idempotencyKey);
+    if (!match) return null;
+    const names = await this.beneficiaryNames().catch(() => new Map<string, string>());
+    return mapPayment(match, names);
+  }
+
   async listPendingApprovals(): Promise<PendingApproval[]> {
-    const [raw, names] = await Promise.all([
-      this.call(rawFindPayments, 'GET', '/v2/payments/find', {
-        status: 'awaiting_authorisation',
-        per_page: String(MAX_PAGE_SIZE),
-        order: 'created_at',
-        order_asc_desc: 'desc',
-      }),
-      this.beneficiaryNames(),
+    const [payments, beneficiaries] = await Promise.all([
+      this.allPages(
+        rawFindPayments,
+        'GET',
+        '/v2/payments/find',
+        { status: 'awaiting_authorisation', order: 'created_at', order_asc_desc: 'desc' },
+        (page) => ({ items: page.payments, nextPage: page.pagination.next_page }),
+      ),
+      this.listBeneficiaries(),
     ]);
+    const raw = { payments };
+    const byId = new Map(beneficiaries.map((beneficiary) => [beneficiary.id, beneficiary]));
+    const names = new Map(beneficiaries.map((beneficiary) => [beneficiary.id, beneficiary.name]));
     const creatorIds = [...new Set(raw.payments.map((payment) => payment.creator_contact_id).filter(Boolean))] as string[];
     const creators = new Map<string, RawContact>();
     await Promise.all(
@@ -320,11 +376,11 @@ export class CurrencycloudClient implements ProviderClient {
       }),
     );
     return raw.payments.map((payment) =>
-      mapPendingApproval(payment, names, creators.get(payment.creator_contact_id ?? '') ?? null),
+      mapPendingApproval(payment, names, creators.get(payment.creator_contact_id ?? '') ?? null, byId.get(payment.beneficiary_id) ?? null),
     );
   }
 
-  async approvePayment(paymentId: string): Promise<void> {
+  async approvePayment(paymentId: string): Promise<ApprovalResult> {
     const raw = await this.call(rawPaymentAuthorisations, 'POST', '/v2/payments/authorise', {
       'payment_ids[]': [paymentId],
     });
@@ -342,6 +398,7 @@ export class CurrencycloudClient implements ProviderClient {
             : 'validation';
       throw new ProviderError(kind, { detail: result.error ?? 'Payment was not authorised' });
     }
+    return mapApprovalResult(result);
   }
 
   async rejectPayment(paymentId: string): Promise<void> {

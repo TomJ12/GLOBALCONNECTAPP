@@ -1,10 +1,10 @@
 import { useRouter } from 'expo-router';
-import { CircleCheck, Plus } from 'lucide-react-native';
+import { CircleAlert, CircleCheck, Clock, Plus } from 'lucide-react-native';
 import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
-import type { Beneficiary, Payment } from '@/api/types';
+import type { Beneficiary, Payment, PaymentStatus } from '@/api/types';
 import { AmountField } from '@/components/AmountField';
 import { AppText } from '@/components/AppText';
 import { Avatar, DetailRow, ListRow } from '@/components/Bits';
@@ -17,11 +17,12 @@ import { SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { TextField } from '@/components/TextField';
 import { disclosures } from '@/config/disclosures';
-import { useBalances, useBeneficiaries, useCreatePayment } from '@/hooks/queries';
+import { useBalances, useBeneficiaries, useCreatePayment, useFindPaymentByKey } from '@/hooks/queries';
+import { useOutcomeCheck, type OutcomeCheckResult } from '@/hooks/useOutcomeCheck';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { confirmWithBiometrics } from '@/lib/biometrics';
+import { confirmAction } from '@/lib/confirmAction';
 import { newIdempotencyKey } from '@/lib/ids';
-import { compareAmounts, formatMoney, parseAmountInput } from '@/lib/money';
+import { amountInputMessage, compareAmounts, formatMoney, readAmountInput } from '@/lib/money';
 import { useIsOnline } from '@/lib/online';
 import { colors, spacing } from '@/theme';
 
@@ -30,11 +31,40 @@ import { describeBeneficiaryAccount } from './shared';
 type Step = 'payee' | 'amount' | 'review' | 'done';
 export const MAX_REFERENCE_LENGTH = 35;
 
+/** What to tell the person once a payment exists, by the status the backend reported. Never assume "sent". */
+export function paymentOutcomeCopy(status: PaymentStatus): { header: string; title: string; body: string; tone: 'positive' | 'warning' | 'danger' } {
+  switch (status) {
+    case 'sent':
+      return { header: 'Payment sent', title: 'Payment sent', body: 'The payment has been sent.', tone: 'positive' };
+    case 'processing':
+      return { header: 'Payment submitted', title: 'Payment on its way', body: 'The payment is being processed.', tone: 'positive' };
+    case 'awaiting_approval':
+      return {
+        header: 'Waiting for approval',
+        title: 'Not sent yet',
+        body: 'This payment needs approval before it is sent. No money has left your account.',
+        tone: 'warning',
+      };
+    case 'failed':
+      return { header: 'Payment failed', title: 'Payment failed', body: 'This payment was not sent. Check Payments before trying again.', tone: 'danger' };
+    case 'cancelled':
+      return { header: 'Payment cancelled', title: 'Payment cancelled', body: 'This payment was cancelled and has not been sent.', tone: 'danger' };
+    default:
+      return {
+        header: 'Check this payment',
+        title: 'Status not confirmed',
+        body: 'The payment was created but we could not confirm its status. Check Payments before sending it again.',
+        tone: 'warning',
+      };
+  }
+}
+
 export function NewPaymentScreen() {
   const router = useRouter();
   const beneficiaries = useBeneficiaries();
   const balances = useBalances();
   const createPayment = useCreatePayment();
+  const findByKey = useFindPaymentByKey();
   const online = useIsOnline();
 
   const [step, setStep] = useState<Step>('payee');
@@ -42,23 +72,44 @@ export function NewPaymentScreen() {
   const [amountText, setAmountText] = useState('');
   const [reference, setReference] = useState('');
   const [showErrors, setShowErrors] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ tone: 'danger' | 'warning' | 'info'; text: string } | null>(null);
   const [result, setResult] = useState<Payment | null>(null);
-  // One key per payment attempt. It survives retries so a retry can never pay twice.
-  const [idempotencyKey, setIdempotencyKey] = useState(() => newIdempotencyKey('payment'));
+  /**
+   * The idempotency key belongs to exactly one payment: this payee, amount,
+   * currency and reference. Change any of them and it is a different payment
+   * with a new key; retry the same one and the key is reused.
+   */
+  const [attempt, setAttempt] = useState<{ signature: string; key: string } | null>(null);
+
+  const finish = (payment: Payment) => {
+    setResult(payment);
+    setAttempt(null);
+    setNotice(null);
+    setStep('done');
+  };
+  const applyCheck = (check: OutcomeCheckResult<Payment>) => {
+    if (check.status === 'found') finish(check.value);
+    else if (check.status === 'not_found') {
+      setNotice({ tone: 'warning', text: 'That payment did not go through. No money has left your account. You can try again.' });
+    } else {
+      setNotice({ tone: 'danger', text: 'We still cannot confirm whether your payment went through. Do not send it again yet. Check again in a moment.' });
+    }
+  };
+  const outcome = useOutcomeCheck<Payment>('payment', (key) => findByKey.mutateAsync(key), applyCheck);
+  const outcomeUnknown = outcome.pendingKey !== null;
 
   const currency = payee?.currency ?? 'GBP';
-  const amount = parseAmountInput(amountText, currency);
+  const read = readAmountInput(amountText, currency);
+  const amount = read.ok ? read.amount : null;
   const balance = balances.data?.find((item) => item.currency === currency);
   const available = balances.data ? (balance?.amount ?? '0') : null;
   const trimmedReference = reference.trim();
 
-  const amountError =
-    amount === null
-      ? 'Enter an amount greater than zero.'
-      : available !== null && compareAmounts(amount, available) > 0
-        ? `You have ${formatMoney(available, currency)} available in ${currency}.`
-        : null;
+  const amountError = !read.ok
+    ? (amountInputMessage(read.problem, currency) ?? 'Enter an amount greater than zero.')
+    : available !== null && compareAmounts(read.amount, available) > 0
+      ? `You have ${formatMoney(available, currency)} available in ${currency}.`
+      : null;
   const referenceError =
     trimmedReference === ''
       ? 'Enter a reference the payee will recognise.'
@@ -72,7 +123,8 @@ export function NewPaymentScreen() {
   };
 
   const back = () => {
-    setSubmitError(null);
+    if (outcomeUnknown) return;
+    setNotice(null);
     if (step === 'amount') setStep('payee');
     else if (step === 'review') setStep('amount');
     else close();
@@ -82,7 +134,6 @@ export function NewPaymentScreen() {
     if (beneficiary.id !== payee?.id) {
       setAmountText('');
       setShowErrors(false);
-      setIdempotencyKey(newIdempotencyKey('payment'));
     }
     setPayee(beneficiary);
     setStep('amount');
@@ -95,57 +146,93 @@ export function NewPaymentScreen() {
   };
 
   const send = useSingleFlight(async () => {
-    if (!payee || amount === null || amountError || referenceError) return;
-    setSubmitError(null);
-    const confirmed = await confirmWithBiometrics({
-      reason: `Send ${formatMoney(amount, currency)} to ${payee.name}`,
-      fallbackTitle: 'Send this payment?',
-      fallbackMessage: `${formatMoney(amount, currency)} to ${payee.name}, reference ${trimmedReference}.`,
-      fallbackConfirmLabel: 'Send payment',
+    if (!payee || amount === null || amountError || referenceError || outcomeUnknown) return;
+    setNotice(null);
+    const confirmed = await confirmAction({
+      title: 'Send this payment?',
+      message: `${formatMoney(amount, currency)} to ${payee.name}, ${describeBeneficiaryAccount(payee)}. Reference ${trimmedReference}.`,
+      confirmLabel: 'Send payment',
     });
     if (!confirmed) return;
+    const signature = [payee.id, amount, currency, trimmedReference].join('|');
+    const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('payment');
+    setAttempt({ signature, key });
     try {
-      const payment = await createPayment.mutateAsync({
-        beneficiaryId: payee.id,
-        amount,
-        currency,
-        reference: trimmedReference,
-        // The provider requires a reason. Until the product decides what to ask, the reference is reused.
-        reason: trimmedReference,
-        idempotencyKey,
-      });
-      setResult(payment);
-      setStep('done');
+      finish(
+        await createPayment.mutateAsync({
+          beneficiaryId: payee.id,
+          amount,
+          currency,
+          reference: trimmedReference,
+          // The provider requires a reason. Until the product decides what to ask, the reference is reused.
+          reason: trimmedReference,
+          idempotencyKey: key,
+        }),
+      );
     } catch (caught) {
       const providerError = toProviderError(caught);
-      setSubmitError(
-        providerError.kind === 'insufficient_funds'
-          ? `There is not enough ${currency} to send this payment.`
-          : providerError.kind === 'validation'
-            ? 'The payment details were not accepted. Go back and check them.'
-            : `${providerError.userMessage} If you try again, the payment will only be sent once.`,
-      );
+      if (providerError.outcomeUnknown) {
+        // It may have been created. Find out before anything else is allowed.
+        setNotice({ tone: 'info', text: 'We did not get an answer. Checking whether your payment went through…' });
+        applyCheck(await outcome.markUnknown(key));
+      } else {
+        setNotice({
+          tone: 'danger',
+          text:
+            providerError.kind === 'insufficient_funds'
+              ? `There is not enough ${currency} to send this payment.`
+              : providerError.kind === 'validation'
+                ? 'The payment details were not accepted. Go back and check them.'
+                : providerError.userMessage,
+        });
+      }
     }
   });
 
+  const recheck = useSingleFlight(async () => {
+    applyCheck(await outcome.recheck());
+  });
+
   if (step === 'done' && result) {
+    const copy = paymentOutcomeCopy(result.status);
+    const Icon = copy.tone === 'positive' ? CircleCheck : copy.tone === 'warning' ? Clock : CircleAlert;
+    const iconColor = copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
     return (
-      <Screen header={<Header title="Payment sent" leading="close" onLeadingPress={close} />} footer={<Button label="Done" onPress={close} />}>
+      <Screen header={<Header title={copy.header} leading="close" onLeadingPress={close} />} footer={<Button label="Done" onPress={close} />}>
         <Card style={styles.outcome}>
-          <CircleCheck color={colors.positive} size={48} />
-          <AppText variant="heading" align="center" accessibilityRole="header" accessibilityLiveRegion="polite">
-            Payment on its way
+          <Icon color={iconColor} size={48} />
+          <AppText variant="heading" align="center" accessibilityRole="header" accessibilityLiveRegion="polite" testID="payment-outcome-title">
+            {copy.title}
           </AppText>
-          <AppText variant="amount" align="center" adjustsFontSizeToFit numberOfLines={1}>
+          <AppText variant="amount" align="center" adjustsFontSizeToFit numberOfLines={1} testID="payment-outcome-amount">
             {formatMoney(result.amount, result.currency)}
           </AppText>
           <AppText tone="muted" align="center">{`To ${result.beneficiaryName ?? payee?.name ?? 'your payee'}, reference ${result.reference}`}</AppText>
+          <AppText align="center">{copy.body}</AppText>
         </Card>
         <Card padded={false}>
           <DetailRow label="Payment ID" value={result.shortReference} />
-          <Divider />
-          <DetailRow label="Arrives" value={disclosures.deliveryEstimate} />
+          {copy.tone === 'positive' ? (
+            <>
+              <Divider />
+              <DetailRow label="Arrives" value={disclosures.deliveryEstimate} />
+            </>
+          ) : null}
         </Card>
+      </Screen>
+    );
+  }
+
+  // An unknown outcome (from this visit or an earlier one) blocks everything until it is resolved.
+  if (outcomeUnknown) {
+    return (
+      <Screen
+        header={<Header title="Checking your payment" leading="close" onLeadingPress={close} />}
+        footer={<Button label="Check again" onPress={recheck.run} loading={recheck.busy || outcome.isChecking} disabled={!online} testID="payment-recheck" />}
+      >
+        <InlineMessage tone={notice?.tone ?? 'info'}>
+          {notice?.text ?? 'We are checking whether your last payment went through. Do not send it again yet.'}
+        </InlineMessage>
       </Screen>
     );
   }
@@ -156,6 +243,7 @@ export function NewPaymentScreen() {
         <AppText variant="heading" accessibilityRole="header">
           Who are you paying?
         </AppText>
+        {notice ? <InlineMessage tone={notice.tone}>{notice.text}</InlineMessage> : null}
         <QueryState
           query={beneficiaries}
           skeleton={<SkeletonList rows={3} label="Loading payees" />}
@@ -206,7 +294,7 @@ export function NewPaymentScreen() {
             value={amountText}
             onChangeText={setAmountText}
             caption={available !== null ? `From ${currency} balance, ${formatMoney(available, currency)} available` : undefined}
-            error={showErrors || (amount !== null && amountError) ? amountError : null}
+            error={showErrors || amountText.trim() !== '' ? amountError : null}
             testID="payment-amount"
           />
         </Card>
@@ -231,7 +319,7 @@ export function NewPaymentScreen() {
       header={<Header title="Review payment" onLeadingPress={send.busy ? () => undefined : back} />}
       footer={
         <Button
-          label="Confirm and send"
+          label="Send payment"
           onPress={send.run}
           loading={send.busy}
           disabled={!online || amount === null || amountError !== null}
@@ -265,7 +353,7 @@ export function NewPaymentScreen() {
         <DetailRow label="Arrives" value={disclosures.deliveryEstimate} />
       </Card>
       {amountError ? <InlineMessage tone="warning">{amountError}</InlineMessage> : null}
-      {submitError ? <InlineMessage tone="danger">{submitError}</InlineMessage> : null}
+      {notice ? <InlineMessage tone={notice.tone}>{notice.text}</InlineMessage> : null}
     </Screen>
   );
 }

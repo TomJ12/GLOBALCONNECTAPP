@@ -8,10 +8,7 @@
     "scheme": "globalconnect",
     "userInterfaceStyle": "light",
     "ios": {
-      "icon": "./assets/expo.icon",
-      "infoPlist": {
-        "NSFaceIDUsageDescription": "Use Face ID to unlock Global Connect and approve payments."
-      }
+      "icon": "./assets/expo.icon"
     },
     "android": {
       "adaptiveIcon": {
@@ -34,13 +31,6 @@
           "backgroundColor": "#0F172A",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
-        }
-      ],
-      "expo-secure-store",
-      [
-        "expo-local-authentication",
-        {
-          "faceIDPermission": "Use Face ID to unlock Global Connect and approve payments."
         }
       ]
     ]

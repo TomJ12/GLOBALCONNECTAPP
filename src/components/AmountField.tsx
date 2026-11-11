@@ -1,6 +1,6 @@
 import { StyleSheet, TextInput, View } from 'react-native';
 
-import { currencyDecimals, currencyPrefix, sanitizeAmountInput } from '@/lib/money';
+import { currencyDecimals, currencyPrefix } from '@/lib/money';
 import { colors, fonts, fontSizes, spacing } from '@/theme';
 
 import { AppText } from './AppText';
@@ -9,7 +9,10 @@ import { CurrencyPicker } from './CurrencyPicker';
 export interface AmountFieldProps {
   label: string;
   currency: string;
-  /** Raw field text, already sanitised. */
+  /**
+   * Exactly what the person typed. It is NOT cleaned up here: the screen reads it
+   * with readAmountInput() and shows a message if it is not a clear amount.
+   */
   value: string;
   onChangeText: (text: string) => void;
   /** When given, the currency can be changed. */
@@ -17,6 +20,7 @@ export interface AmountFieldProps {
   onChangeCurrency?: (currency: string) => void;
   caption?: string;
   error?: string | null;
+  /** False locks both the amount and the currency picker, for example while a booking is in flight. */
   editable?: boolean;
   placeholder?: string;
   testID?: string;
@@ -53,7 +57,8 @@ export function AmountField({
           aria-invalid={error ? true : undefined}
           value={value}
           editable={editable}
-          onChangeText={(text) => onChangeText(sanitizeAmountInput(text, currency))}
+          onChangeText={onChangeText}
+          maxLength={24}
           keyboardType={currencyDecimals(currency) === 0 ? 'number-pad' : 'decimal-pad'}
           inputMode={currencyDecimals(currency) === 0 ? 'numeric' : 'decimal'}
           placeholder={placeholder ?? zero}
@@ -62,7 +67,7 @@ export function AmountField({
           style={styles.input}
         />
         {currencies && onChangeCurrency ? (
-          <CurrencyPicker label={`${label} currency`} value={currency} options={currencies} onChange={onChangeCurrency} />
+          <CurrencyPicker label={`${label} currency`} value={currency} options={currencies} onChange={onChangeCurrency} disabled={!editable} />
         ) : (
           <View style={styles.staticCurrency}>
             <AppText variant="bodyStrong">{currency}</AppText>

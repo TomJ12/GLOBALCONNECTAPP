@@ -20,6 +20,7 @@ import {
   useRatesFromBase,
   useRecentTransactions,
 } from '@/hooks/queries';
+import { formatTimeOfDay } from '@/lib/dates';
 import { currencyName, currencyPrefix, formatMoney, totalInBaseCurrency } from '@/lib/money';
 import { colors, radii, sizes, spacing } from '@/theme';
 
@@ -60,7 +61,9 @@ function TotalBalance({ balances }: { balances: Balance[] }) {
       </AppText>
       {missing.length === 0 ? (
         <AppText variant="caption" tone="muted">
-          {`Across ${count} ${count === 1 ? 'currency' : 'currencies'} at live rates`}
+          {needsRates
+            ? `Across ${count} currencies. Estimated at indicative rates${rates.asOf ? ` as of ${formatTimeOfDay(rates.asOf)}` : ''}.`
+            : `Across ${count} ${count === 1 ? 'currency' : 'currencies'}.`}
         </AppText>
       ) : (
         <View style={styles.gapSm}>

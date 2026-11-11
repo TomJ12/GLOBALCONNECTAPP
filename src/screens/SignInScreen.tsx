@@ -1,11 +1,11 @@
 import { useRouter } from 'expo-router';
-import { Fingerprint, Mail, ScanFace } from 'lucide-react-native';
+import { Mail } from 'lucide-react-native';
 import { useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
-import { getProviderClient, isMockBackend } from '@/api';
+import { isMockBackend } from '@/api';
 import { toProviderError } from '@/api/errors';
-import type { MagicLinkRequest, Session } from '@/api/types';
+import type { MagicLinkRequest } from '@/api/types';
 import { AppText } from '@/components/AppText';
 import { Button } from '@/components/Button';
 import { Screen } from '@/components/Screen';
@@ -13,39 +13,37 @@ import { InlineMessage } from '@/components/StateViews';
 import { TextField } from '@/components/TextField';
 import { APP_NAME } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
-import { useBiometricKind } from '@/hooks/useBiometricKind';
+import { useRequestMagicLink, useVerifyMagicLink } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { biometricName, confirmWithBiometrics } from '@/lib/biometrics';
 import { isValidEmail } from '@/lib/validation';
-import { useSession } from '@/state/session';
+import { useSession, type SignedOutReason } from '@/state/session';
 import { colors, radii, sizes, spacing } from '@/theme';
 
-type Step = 'email' | 'sent' | 'offer';
-
-function signInMessage(error: unknown): string {
+export function signInErrorMessage(error: unknown): string {
   const providerError = toProviderError(error);
-  if (providerError.kind === 'unauthorized') return 'That link is not valid or has expired. Request a new one.';
+  if (providerError.kind === 'unauthorized') return 'That link or code is not valid or has expired. Request a new one.';
   if (providerError.kind === 'validation') return 'Enter the email address registered on your account.';
   return providerError.userMessage;
 }
 
+const SIGNED_OUT_MESSAGES: Record<Exclude<SignedOutReason, null>, string> = {
+  expired: 'Your session ended. Sign in again to continue.',
+  inactive: 'You were signed out because the app was in the background for a while.',
+};
+
+/** Sign-in is by emailed link or code, every time. Nothing is kept on the device between sessions. */
 export function SignInScreen() {
   const router = useRouter();
-  const remembered = useSession((state) => state.remembered);
   const signedOutReason = useSession((state) => state.signedOutReason);
   const startSession = useSession((state) => state.startSession);
-  const enableBiometricUnlock = useSession((state) => state.enableBiometricUnlock);
-  const unlockWithDevice = useSession((state) => state.unlockWithDevice);
-  const forgetDevice = useSession((state) => state.forgetDevice);
-  const biometric = biometricName(useBiometricKind());
+  const requestLink = useRequestMagicLink();
+  const verifyLink = useVerifyMagicLink();
 
-  const canUnlock = remembered?.biometricEnabled === true;
-  const [useEmailInstead, setUseEmailInstead] = useState(false);
-  const [step, setStep] = useState<Step>('email');
   const [email, setEmail] = useState('');
   const [emailError, setEmailError] = useState<string | null>(null);
   const [link, setLink] = useState<MagicLinkRequest | null>(null);
-  const [pendingSession, setPendingSession] = useState<Session | null>(null);
+  const [code, setCode] = useState('');
+  const [codeError, setCodeError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const sendLink = useSingleFlight(async () => {
@@ -57,65 +55,31 @@ export function SignInScreen() {
     }
     setEmailError(null);
     try {
-      setLink(await getProviderClient().requestMagicLink(trimmed));
-      setStep('sent');
+      setLink(await requestLink.mutateAsync(trimmed));
+      setCode('');
     } catch (caught) {
-      setError(signInMessage(caught));
+      setError(signInErrorMessage(caught));
     }
   });
 
-  const completeLink = useSingleFlight(async () => {
-    if (!link?.devCode) return;
+  const verify = useSingleFlight(async (value: string) => {
+    if (!link) return;
     setError(null);
+    const trimmed = value.trim();
+    if (trimmed === '') {
+      setCodeError('Enter the code from the email.');
+      return;
+    }
+    setCodeError(null);
     try {
-      setPendingSession(await getProviderClient().verifyMagicLink(link.requestId, link.devCode));
-      setStep('offer');
+      startSession(await verifyLink.mutateAsync({ requestId: link.requestId, code: trimmed }));
     } catch (caught) {
-      setError(signInMessage(caught));
+      setError(signInErrorMessage(caught));
     }
   });
-
-  const unlock = useSingleFlight(async () => {
-    setError(null);
-    const confirmed = await confirmWithBiometrics({
-      reason: `Unlock ${APP_NAME}`,
-      fallbackTitle: `Unlock ${APP_NAME}?`,
-      fallbackMessage: 'This device has no biometric check set up, so this step is a simple confirmation.',
-      fallbackConfirmLabel: 'Unlock',
-    });
-    if (!confirmed) return;
-    try {
-      await unlockWithDevice();
-    } catch (caught) {
-      setError(signInMessage(caught));
-    }
-  });
-
-  const finish = useSingleFlight(async (enable: boolean) => {
-    if (!pendingSession) return;
-    if (enable) {
-      const confirmed = await confirmWithBiometrics({
-        reason: `Turn on quick unlock for ${APP_NAME}`,
-        fallbackTitle: 'Turn on quick unlock?',
-        fallbackMessage: 'Next time you can unlock on this device without a login link.',
-        fallbackConfirmLabel: 'Turn on',
-      });
-      if (confirmed) {
-        try {
-          await enableBiometricUnlock(pendingSession);
-        } catch {
-          // Quick unlock is optional. Carry on signed in without it.
-        }
-      }
-    }
-    startSession(pendingSession);
-  });
-
-  const BiometricIcon = biometric === 'Face ID' || biometric === 'face unlock' ? ScanFace : Fingerprint;
-  const showUnlock = canUnlock && !useEmailInstead && step === 'email';
 
   return (
-    <Screen tone="navy" showOfflineBanner>
+    <Screen tone="navy">
       <View style={styles.brand}>
         <AppText variant="label" tone="onDarkMuted" style={styles.wordmark} accessibilityRole="header">
           {APP_NAME.toUpperCase()}
@@ -125,33 +89,10 @@ export function SignInScreen() {
         </AppText>
       </View>
 
-      {signedOutReason === 'expired' ? <InlineMessage tone="warning">Your session ended. Sign in again to continue.</InlineMessage> : null}
+      {signedOutReason ? <InlineMessage tone="warning">{SIGNED_OUT_MESSAGES[signedOutReason]}</InlineMessage> : null}
       {error ? <InlineMessage tone="danger">{error}</InlineMessage> : null}
 
-      {showUnlock ? (
-        <View style={styles.block}>
-          <AppText tone="onDarkMuted">Already set up on this phone</AppText>
-          <AppText variant="title" tone="onDark">
-            {remembered?.email}
-          </AppText>
-          <Button
-            label={biometric ? `Unlock with ${biometric}` : 'Unlock'}
-            icon={<BiometricIcon color={colors.textOnDark} size={22} />}
-            onPress={unlock.run}
-            loading={unlock.busy}
-          />
-          <Button label="Use a different email" variant="onDark" onPress={() => setUseEmailInstead(true)} disabled={unlock.busy} />
-          <Button
-            label="Forget this device"
-            variant="onDark"
-            onPress={() => void forgetDevice()}
-            disabled={unlock.busy}
-            accessibilityHint="Removes quick unlock from this device"
-          />
-        </View>
-      ) : null}
-
-      {!showUnlock && step === 'email' ? (
+      {link === null ? (
         <View style={styles.block}>
           <AppText tone="onDarkMuted">Sign in with the email on your account. No password to remember.</AppText>
           <TextField
@@ -180,16 +121,34 @@ export function SignInScreen() {
             onPress={sendLink.run}
             loading={sendLink.busy}
           />
-          {canUnlock ? <Button label="Back to quick unlock" variant="onDark" onPress={() => setUseEmailInstead(false)} /> : null}
         </View>
-      ) : null}
-
-      {step === 'sent' && link ? (
+      ) : (
         <View style={styles.block}>
           <AppText variant="title" tone="onDark" accessibilityRole="header">
             Check your email
           </AppText>
-          <AppText tone="onDarkMuted">{`We sent a secure login link to ${link.email}. Open it on this phone to sign in.`}</AppText>
+          <AppText tone="onDarkMuted">
+            {`We sent a secure login link to ${link.email}. Open it on this phone, or type the code from the email here.`}
+          </AppText>
+          <TextField
+            tone="navy"
+            label="Code from the email"
+            value={code}
+            onChangeText={(text) => {
+              setCode(text);
+              if (codeError) setCodeError(null);
+            }}
+            error={codeError}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            autoComplete="one-time-code"
+            textContentType="oneTimeCode"
+            returnKeyType="go"
+            onSubmitEditing={() => verify.run(code)}
+            maxLength={64}
+            testID="magic-code"
+          />
+          <Button label="Sign in" onPress={() => verify.run(code)} loading={verify.busy} testID="verify-code" />
           {link.devCode ? (
             <View style={styles.devCard}>
               <AppText variant="label" tone="onDark">
@@ -198,41 +157,27 @@ export function SignInScreen() {
               <AppText variant="caption" tone="onDarkMuted">
                 This build uses sample data and sends no email. Use the button to act as if you opened the link.
               </AppText>
-              <Button label="Complete the link" onPress={completeLink.run} loading={completeLink.busy} testID="dev-complete-link" />
+              <Button
+                variant="onDark"
+                label="Complete the link"
+                onPress={() => verify.run(link.devCode ?? '')}
+                disabled={verify.busy}
+                testID="dev-complete-link"
+              />
             </View>
           ) : null}
           <Button
             label="Use a different email"
             variant="onDark"
-            disabled={completeLink.busy}
+            disabled={verify.busy}
             onPress={() => {
-              setStep('email');
               setLink(null);
               setError(null);
+              setCodeError(null);
             }}
           />
         </View>
-      ) : null}
-
-      {step === 'offer' ? (
-        <View style={styles.block}>
-          <AppText variant="title" tone="onDark" accessibilityRole="header">
-            Unlock faster next time?
-          </AppText>
-          <AppText tone="onDarkMuted">
-            {biometric
-              ? `Use ${biometric} on this phone instead of a login link.`
-              : 'Skip the login link on this device next time.'}
-          </AppText>
-          <Button
-            label={biometric ? `Turn on ${biometric}` : 'Turn on quick unlock'}
-            icon={<BiometricIcon color={colors.textOnDark} size={22} />}
-            onPress={() => finish.run(true)}
-            loading={finish.busy}
-          />
-          <Button label="Not now" variant="onDark" onPress={() => finish.run(false)} disabled={finish.busy} />
-        </View>
-      ) : null}
+      )}
 
       <View style={styles.footer}>
         <AppText variant="caption" tone="onDarkMuted">{`New to ${APP_NAME}? ${disclosures.openAccount}`}</AppText>

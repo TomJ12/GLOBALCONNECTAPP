@@ -1,4 +1,8 @@
-/** All server-state hooks. Screens never call the provider client directly. */
+/**
+ * All server-state hooks. Screens never call the provider client directly:
+ * every call goes through TanStack Query here (or in useHeldQuote), so errors
+ * reach the shared handler that ends the session on a 401.
+ */
 import {
   useInfiniteQuery,
   useMutation,
@@ -11,6 +15,7 @@ import {
 import { getAlertsStore, type NewRateAlert } from '@/alerts';
 import { getProviderClient } from '@/api';
 import type { BookConversionRequest, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
+import { useSession } from '@/state/session';
 
 export const queryKeys = {
   company: ['company'] as const,
@@ -25,7 +30,7 @@ export const queryKeys = {
   payments: ['payments'] as const,
   pendingApprovals: ['pendingApprovals'] as const,
   forwards: ['forwards'] as const,
-  alerts: ['alerts'] as const,
+  alerts: (userKey: string) => ['alerts', userKey] as const,
 };
 
 const RATE_REFRESH_MS = 30_000;
@@ -89,8 +94,12 @@ export function useRatesFromBase(base: CurrencyCode, currencies: readonly Curren
         const currency = wanted[index];
         if (currency) rates[currency] = result.data?.rate;
       });
+      // The oldest of the rates used, so the screen can say how fresh the total is.
+      const times = results.map((result) => result.data?.asOf).filter((value): value is string => Boolean(value));
+      const asOf = times.length > 0 ? times.reduce((oldest, value) => (value < oldest ? value : oldest)) : null;
       return {
         rates,
+        asOf,
         isPending: results.some((result) => result.isPending),
         isError: results.some((result) => result.isError),
         isPaused: results.some((result) => result.fetchStatus === 'paused' && result.isPending),
@@ -117,10 +126,45 @@ export function useBeneficiaries() {
 }
 
 export function usePayments() {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: queryKeys.payments,
-    queryFn: async () => (await getProviderClient().listPayments({ page: 1, perPage: 25 })).items,
+    queryFn: ({ pageParam }) => getProviderClient().listPayments({ page: pageParam, perPage: 25 }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.nextPage ?? undefined,
   });
+}
+
+/**
+ * Pages are fetched by page number, so a new item arriving between two fetches
+ * shifts the list and the same row can come back on the next page. Show each id once.
+ */
+export function uniqueById<T extends { id: string }>(items: readonly T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => (seen.has(item.id) ? false : (seen.add(item.id), true)));
+}
+
+// --- Sign-in ------------------------------------------------------------------
+
+export function useRequestMagicLink() {
+  return useMutation({ mutationFn: (email: string) => getProviderClient().requestMagicLink(email) });
+}
+
+export function useVerifyMagicLink() {
+  return useMutation({
+    mutationFn: (input: { requestId: string; code: string }) => getProviderClient().verifyMagicLink(input.requestId, input.code),
+  });
+}
+
+// --- Reconciliation after an unknown outcome ------------------------------------
+
+/** Did a conversion with this idempotency key get booked? Resolves null if not. */
+export function useFindConversionByKey() {
+  return useMutation({ mutationFn: (idempotencyKey: string) => getProviderClient().findConversionByIdempotencyKey(idempotencyKey) });
+}
+
+/** Did a payment with this idempotency key get created? Resolves null if not. */
+export function useFindPaymentByKey() {
+  return useMutation({ mutationFn: (idempotencyKey: string) => getProviderClient().findPaymentByIdempotencyKey(idempotencyKey) });
 }
 
 export function usePendingApprovals() {
@@ -198,30 +242,39 @@ export function useBookConversion() {
 
 // --- Rate alerts (local feature, not the provider) ----------------------------
 
+/** Alerts belong to the signed-in person, so the store and the cache are keyed by them. */
+function useAlertsUserKey(): string {
+  return useSession((state) => state.session?.user.email || state.session?.user.id || 'signed-out');
+}
+
 export function useAlerts() {
-  return useQuery({ queryKey: queryKeys.alerts, queryFn: () => getAlertsStore().list(), networkMode: 'always' });
+  const userKey = useAlertsUserKey();
+  return useQuery({ queryKey: queryKeys.alerts(userKey), queryFn: () => getAlertsStore(userKey).list(), networkMode: 'always' });
 }
 
 export function useCreateAlert() {
   const client = useQueryClient();
+  const userKey = useAlertsUserKey();
   return useMutation({
-    mutationFn: (input: NewRateAlert) => getAlertsStore().create(input),
-    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts }),
+    mutationFn: (input: NewRateAlert) => getAlertsStore(userKey).create(input),
+    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts(userKey) }),
   });
 }
 
 export function useSetAlertEnabled() {
   const client = useQueryClient();
+  const userKey = useAlertsUserKey();
   return useMutation({
-    mutationFn: (input: { id: string; enabled: boolean }) => getAlertsStore().setEnabled(input.id, input.enabled),
-    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts }),
+    mutationFn: (input: { id: string; enabled: boolean }) => getAlertsStore(userKey).setEnabled(input.id, input.enabled),
+    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts(userKey) }),
   });
 }
 
 export function useRemoveAlert() {
   const client = useQueryClient();
+  const userKey = useAlertsUserKey();
   return useMutation({
-    mutationFn: (id: string) => getAlertsStore().remove(id),
-    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts }),
+    mutationFn: (id: string) => getAlertsStore(userKey).remove(id),
+    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts(userKey) }),
   });
 }

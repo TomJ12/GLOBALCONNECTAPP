@@ -1,10 +1,10 @@
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useIsFocused, useLocalSearchParams, useRouter } from 'expo-router';
 import { ArrowUpDown, CircleCheck, Clock } from 'lucide-react-native';
 import { useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
-import type { Conversion, ConversionKind, FixedSide, QuoteRequest } from '@/api/types';
+import type { Conversion, ConversionKind, FixedSide, Quote, QuoteRequest } from '@/api/types';
 import { AmountField } from '@/components/AmountField';
 import { AppText } from '@/components/AppText';
 import { DetailRow } from '@/components/Bits';
@@ -16,18 +16,23 @@ import { Screen } from '@/components/Screen';
 import { InlineMessage } from '@/components/StateViews';
 import { FORWARD_TENORS_MONTHS, SUPPORTED_CURRENCIES } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
-import { useBalances, useBookConversion } from '@/hooks/queries';
-import { useHeldQuote } from '@/hooks/useHeldQuote';
+import { useBalances, useBookConversion, useFindConversionByKey } from '@/hooks/queries';
+import { useAppIsActive } from '@/hooks/useAppIsActive';
+import { quoteRequestKey, useHeldQuote } from '@/hooks/useHeldQuote';
+import { useOutcomeCheck, type OutcomeCheckResult } from '@/hooks/useOutcomeCheck';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { confirmWithBiometrics } from '@/lib/biometrics';
+import { confirmAction } from '@/lib/confirmAction';
 import { formatDate, settlementDateAfterMonths } from '@/lib/dates';
-import { compareAmounts, formatMoney, formatRate, parseAmountInput } from '@/lib/money';
+import { newIdempotencyKey } from '@/lib/ids';
+import { amountInputMessage, compareAmounts, formatMoney, formatRate, readAmountInput } from '@/lib/money';
 import { useIsOnline } from '@/lib/online';
-import { formatCountdown, isQuoteExpired } from '@/lib/quote';
+import { conversionMatchesQuote, formatCountdown, isQuoteExpired } from '@/lib/quote';
 import { colors, radii, sizes, spacing } from '@/theme';
 
 /** A booking request must reach the provider before the hold ends, so stop a little early. */
 const EXPIRY_SAFETY_MS = 1000;
+
+type Notice = { tone: 'danger' | 'warning' | 'info'; text: string } | null;
 
 function isSupported(value: unknown): value is string {
   return typeof value === 'string' && SUPPORTED_CURRENCIES.includes(value.toUpperCase());
@@ -38,7 +43,10 @@ export function ConvertScreen() {
   const params = useLocalSearchParams<{ sell?: string; buy?: string }>();
   const balances = useBalances();
   const book = useBookConversion();
+  const findByKey = useFindConversionByKey();
   const online = useIsOnline();
+  const focused = useIsFocused();
+  const appActive = useAppIsActive();
 
   const [kind, setKind] = useState<ConversionKind>('spot');
   const [sellCurrency, setSellCurrency] = useState('GBP');
@@ -46,8 +54,17 @@ export function ConvertScreen() {
   const [fixedSide, setFixedSide] = useState<FixedSide>('sell');
   const [amountText, setAmountText] = useState('');
   const [tenorMonths, setTenorMonths] = useState<number>(FORWARD_TENORS_MONTHS[1] ?? 3);
-  const [notice, setNotice] = useState<{ tone: 'danger' | 'warning'; text: string } | null>(null);
+  const [notice, setNotice] = useState<Notice>(null);
   const [result, setResult] = useState<Conversion | null>(null);
+  /** The quote the person confirmed, kept to compare with what was actually booked. */
+  const [confirmedQuote, setConfirmedQuote] = useState<Quote | null>(null);
+  /**
+   * One idempotency key per conversion INTENT (what is being converted), not per
+   * quote. A re-quote after a lost response reuses it, so the same intent can
+   * never be booked twice.
+   */
+  const [attempt, setAttempt] = useState<{ signature: string; key: string } | null>(null);
+  const [booking, setBooking] = useState(false);
 
   // Opened from a rate row: start with that pair. Applied once per distinct
   // pair of params, during render, so there is no extra effect pass.
@@ -61,26 +78,41 @@ export function ConvertScreen() {
     }
   }
 
+  const finish = (conversion: Conversion) => {
+    setResult(conversion);
+    setAttempt(null);
+    setNotice(null);
+  };
+  const applyCheck = (check: OutcomeCheckResult<Conversion>) => {
+    if (check.status === 'found') finish(check.value);
+    else if (check.status === 'not_found') {
+      setNotice({ tone: 'warning', text: 'That conversion did not go through. Nothing was converted. You can try again.' });
+    } else {
+      setNotice({ tone: 'danger', text: 'We still cannot confirm whether your conversion went through. Do not try again yet. Check again in a moment.' });
+    }
+  };
+  const outcome = useOutcomeCheck<Conversion>('conversion', (key) => findByKey.mutateAsync(key), applyCheck);
+  const outcomeUnknown = outcome.pendingKey !== null;
+
   const fixedCurrency = fixedSide === 'sell' ? sellCurrency : buyCurrency;
-  const amount = parseAmountInput(amountText, fixedCurrency);
-  // Recomputed only when the tenor changes, so the date is stable while typing.
-  const settlementDate = useMemo(() => settlementDateAfterMonths(tenorMonths), [tenorMonths]);
+  // The text is read against the CURRENT currency every render, so after a swap or
+  // currency change an amount the new currency cannot hold is rejected, not reshaped.
+  const read = readAmountInput(amountText, fixedCurrency);
+  const amount = read.ok ? read.amount : null;
+  const inputError = read.ok ? null : amountInputMessage(read.problem, fixedCurrency);
+  // Recomputed when the calendar day changes, so a screen left open overnight cannot keep yesterday's date.
+  const today = new Date().toISOString().slice(0, 10);
+  const settlementDate = useMemo(() => settlementDateAfterMonths(tenorMonths, Date.parse(`${today}T12:00:00Z`)), [tenorMonths, today]);
 
-  const request = useMemo<QuoteRequest | null>(() => {
-    if (amount === null || result !== null) return null;
-    return {
-      kind,
-      sellCurrency,
-      buyCurrency,
-      fixedSide,
-      amount,
-      settlementDate: kind === 'forward' ? settlementDate : undefined,
-    };
-  }, [amount, result, kind, sellCurrency, buyCurrency, fixedSide, settlementDate]);
+  // Rebuilt every render on purpose: useHeldQuote compares requests by content, not identity.
+  const request: QuoteRequest | null =
+    amount === null || result !== null
+      ? null
+      : { kind, sellCurrency, buyCurrency, fixedSide, amount, settlementDate: kind === 'forward' ? settlementDate : undefined };
 
-  const [booking, setBooking] = useState(false);
-  const held = useHeldQuote(request, { paused: booking });
+  const held = useHeldQuote(request, { paused: booking || outcomeUnknown, active: focused && appActive });
   const { quote } = held;
+  const locked = booking || outcomeUnknown;
 
   const sellBalance = balances.data?.find((item) => item.currency === sellCurrency);
   const available = balances.data ? (sellBalance?.amount ?? '0') : null;
@@ -97,6 +129,11 @@ export function ConvertScreen() {
     if (side === fixedSide) return amountText;
     if (!quote) return '';
     return side === 'sell' ? quote.sellAmount : quote.buyAmount;
+  };
+  const fieldError = (side: FixedSide): string | null => {
+    if (side === fixedSide && inputError) return inputError;
+    if (side === 'sell' && insufficient && available !== null) return `You have ${formatMoney(available, sellCurrency)} available in ${sellCurrency}.`;
+    return null;
   };
 
   const changeSell = (currency: string) => {
@@ -116,7 +153,7 @@ export function ConvertScreen() {
   };
 
   const confirm = useSingleFlight(async () => {
-    if (!quote || insufficient) return;
+    if (!quote || !request || insufficient || outcomeUnknown) return;
     setNotice(null);
     if (isQuoteExpired(quote, Date.now(), EXPIRY_SAFETY_MS)) {
       setNotice({ tone: 'warning', text: 'That rate expired. Check the new rate and confirm again.' });
@@ -126,38 +163,54 @@ export function ConvertScreen() {
     setBooking(true);
     try {
       const summary = `${formatMoney(quote.sellAmount, quote.sellCurrency)} to ${formatMoney(quote.buyAmount, quote.buyCurrency)}`;
-      const confirmed = await confirmWithBiometrics({
-        reason: kind === 'forward' ? `Book forward: ${summary}` : `Convert ${summary}`,
-        fallbackTitle: kind === 'forward' ? 'Book this forward?' : 'Convert now?',
-        fallbackMessage: `${summary} at ${formatRate(quote.rate)}.`,
-        fallbackConfirmLabel: kind === 'forward' ? 'Book forward' : 'Convert',
+      const confirmed = await confirmAction({
+        title: kind === 'forward' ? 'Book this forward?' : 'Convert now?',
+        message:
+          kind === 'forward'
+            ? `${summary} at ${formatRate(quote.rate)}, settling ${formatDate(settlementDate)}.`
+            : `${summary} at ${formatRate(quote.rate)}.`,
+        confirmLabel: kind === 'forward' ? 'Book forward' : `Convert ${formatMoney(quote.sellAmount, quote.sellCurrency)}`,
       });
       if (!confirmed) return;
       // The hold may have run out while the confirmation was on screen.
       if (isQuoteExpired(quote, Date.now(), EXPIRY_SAFETY_MS)) {
         setNotice({ tone: 'warning', text: 'That rate expired while you were confirming. Check the new rate and confirm again.' });
+        held.refresh();
         return;
       }
-      // Keyed by quote: a retry of the same quote can never book twice.
-      const conversion = await book.mutateAsync({ quote, idempotencyKey: `conversion-${quote.id}` });
-      setResult(conversion);
-    } catch (caught) {
-      const providerError = toProviderError(caught);
-      if (providerError.kind === 'quote_expired') {
-        setNotice({ tone: 'warning', text: 'That rate expired. Check the new rate and confirm again.' });
-        held.refresh();
-      } else if (providerError.kind === 'insufficient_funds') {
-        setNotice({ tone: 'danger', text: `There is not enough ${quote.sellCurrency} in your balance for this conversion.` });
-      } else {
-        setNotice({ tone: 'danger', text: `${providerError.userMessage} If you try again with this rate, it will only be converted once.` });
+      const signature = quoteRequestKey(request);
+      const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('conversion');
+      setAttempt({ signature, key });
+      setConfirmedQuote(quote);
+      try {
+        finish(await book.mutateAsync({ quote, idempotencyKey: key }));
+      } catch (caught) {
+        const providerError = toProviderError(caught);
+        if (providerError.kind === 'quote_expired') {
+          setNotice({ tone: 'warning', text: 'That rate expired. Check the new rate and confirm again.' });
+          held.refresh();
+        } else if (providerError.kind === 'insufficient_funds') {
+          setNotice({ tone: 'danger', text: `There is not enough ${quote.sellCurrency} in your balance for this conversion.` });
+        } else if (providerError.outcomeUnknown) {
+          // It may have been booked. Find out before anything else is allowed.
+          setNotice({ tone: 'info', text: 'We did not get an answer. Checking whether your conversion went through…' });
+          applyCheck(await outcome.markUnknown(key));
+        } else {
+          setNotice({ tone: 'danger', text: providerError.userMessage });
+        }
       }
     } finally {
       setBooking(false);
     }
   });
 
+  const recheck = useSingleFlight(async () => {
+    applyCheck(await outcome.recheck());
+  });
+
   const reset = () => {
     setResult(null);
+    setConfirmedQuote(null);
     setAmountText('');
     setNotice(null);
     setFixedSide('sell');
@@ -166,6 +219,7 @@ export function ConvertScreen() {
   if (result) {
     const isForward = result.kind === 'forward';
     const balanceAfter = balances.data?.find((item) => item.currency === result.buyCurrency);
+    const mismatch = confirmedQuote !== null && !conversionMatchesQuote(result, confirmedQuote);
     return (
       <Screen
         edges={['top', 'left', 'right']}
@@ -191,6 +245,11 @@ export function ConvertScreen() {
               : `Bought with ${formatMoney(result.sellAmount, result.sellCurrency)}.`}
           </AppText>
         </Card>
+        {mismatch ? (
+          <InlineMessage tone="danger">
+            These amounts are different from the rate you confirmed. The figures shown here are what was booked. Contact support before converting again.
+          </InlineMessage>
+        ) : null}
         <Card padded={false}>
           <DetailRow label="Rate" value={`1 ${result.rateBase} = ${formatRate(result.rate)} ${result.rateQuote}`} />
           <Divider />
@@ -212,7 +271,8 @@ export function ConvertScreen() {
   }
 
   const quoteUsable = quote !== null && !held.isExpired;
-  const canSubmit = quoteUsable && !insufficient && online && !held.isFetching;
+  const canSubmit = quoteUsable && !insufficient && online && !held.isFetching && !outcomeUnknown;
+  const needsNewRate = !outcomeUnknown && !held.isFetching && (held.error !== null || (quote !== null && held.isExpired));
   const buttonLabel =
     kind === 'forward'
       ? quote
@@ -223,7 +283,7 @@ export function ConvertScreen() {
         : 'Convert';
 
   let status: { text: string; busy: boolean } | null = null;
-  if (amount !== null) {
+  if (amount !== null && !outcomeUnknown) {
     if (quote && !held.isExpired && !held.isFetching) status = { text: `Rate held for ${formatCountdown(held.secondsLeft)}`, busy: false };
     else if (held.isFetching) status = { text: quote ? 'Rate expired. Getting a new rate…' : 'Getting your rate…', busy: true };
     else if (quote && held.isExpired) status = { text: 'Rate expired', busy: false };
@@ -234,23 +294,27 @@ export function ConvertScreen() {
       edges={['top', 'left', 'right']}
       header={<Header title="Convert" leading="none" />}
       footer={
-        <>
-          {status ? (
-            <View style={styles.status} accessible accessibilityRole="timer" accessibilityLabel={status.text} testID="quote-status">
-              {status.busy ? <ActivityIndicator color={colors.textMuted} size="small" /> : <Clock color={colors.textMuted} size={18} />}
-              <AppText variant="label" tone="muted">
-                {status.text}
-              </AppText>
-            </View>
-          ) : null}
-          <Button label={buttonLabel} onPress={confirm.run} loading={confirm.busy} disabled={!canSubmit} testID="convert-submit" />
-        </>
+        outcomeUnknown ? (
+          <Button label="Check again" onPress={recheck.run} loading={recheck.busy || outcome.isChecking} disabled={!online} testID="convert-recheck" />
+        ) : (
+          <>
+            {status ? (
+              <View style={styles.status} accessible accessibilityRole="timer" accessibilityLabel={status.text} testID="quote-status">
+                {status.busy ? <ActivityIndicator color={colors.textMuted} size="small" /> : <Clock color={colors.textMuted} size={18} />}
+                <AppText variant="label" tone="muted">
+                  {status.text}
+                </AppText>
+              </View>
+            ) : null}
+            <Button label={buttonLabel} onPress={confirm.run} loading={confirm.busy} disabled={!canSubmit} testID="convert-submit" />
+          </>
+        )
       }
     >
       <SegmentedControl
         accessibilityLabel="Conversion type"
         value={kind}
-        disabled={confirm.busy}
+        disabled={locked}
         onChange={(next) => {
           setKind(next);
           setNotice(null);
@@ -269,9 +333,9 @@ export function ConvertScreen() {
           onChangeText={edit('sell')}
           currencies={SUPPORTED_CURRENCIES}
           onChangeCurrency={changeSell}
-          editable={!confirm.busy}
+          editable={!locked}
           caption={available !== null ? `Balance ${formatMoney(available, sellCurrency)}` : undefined}
-          error={insufficient && available !== null ? `You have ${formatMoney(available, sellCurrency)} available in ${sellCurrency}.` : null}
+          error={fieldError('sell')}
           testID="sell-amount"
         />
         <View style={styles.swapRow}>
@@ -279,9 +343,10 @@ export function ConvertScreen() {
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={`Swap currencies. Currently selling ${sellCurrency} and buying ${buyCurrency}`}
+            accessibilityState={{ disabled: locked }}
             onPress={swap}
-            disabled={confirm.busy}
-            style={({ pressed }) => [styles.swap, pressed ? styles.pressed : null]}
+            disabled={locked}
+            style={({ pressed }) => [styles.swap, pressed || locked ? styles.pressed : null]}
             testID="swap-currencies"
           >
             <ArrowUpDown color={colors.tintText} size={20} />
@@ -295,7 +360,8 @@ export function ConvertScreen() {
           onChangeText={edit('buy')}
           currencies={SUPPORTED_CURRENCIES}
           onChangeCurrency={changeBuy}
-          editable={!confirm.busy}
+          editable={!locked}
+          error={fieldError('buy')}
           testID="buy-amount"
         />
       </Card>
@@ -309,7 +375,7 @@ export function ConvertScreen() {
             accessibilityLabel="Settlement date"
             value={tenorMonths}
             onChange={setTenorMonths}
-            disabled={confirm.busy}
+            disabled={locked}
             options={FORWARD_TENORS_MONTHS.map((months) => ({
               value: months,
               label: months === 12 ? '1 year' : `${months} ${months === 1 ? 'month' : 'months'}`,
@@ -334,14 +400,12 @@ export function ConvertScreen() {
       </Card>
 
       {notice ? <InlineMessage tone={notice.tone}>{notice.text}</InlineMessage> : null}
-      {held.error && !held.isFetching ? (
-        <View style={{ gap: spacing.sm }}>
-          <InlineMessage tone="danger">
-            {held.error.kind === 'validation' ? 'We cannot quote that amount. Try a different amount.' : `We could not get a rate. ${held.error.userMessage}`}
-          </InlineMessage>
-          <Button variant="secondary" label="Get a new rate" onPress={held.refresh} disabled={!online} testID="quote-retry" />
-        </View>
+      {held.error && !held.isFetching && !outcomeUnknown ? (
+        <InlineMessage tone="danger">
+          {held.error.kind === 'validation' ? 'We cannot quote that amount. Try a different amount.' : `We could not get a rate. ${held.error.userMessage}`}
+        </InlineMessage>
       ) : null}
+      {needsNewRate ? <Button variant="secondary" label="Get a new rate" onPress={held.refresh} disabled={!online} testID="quote-retry" /> : null}
       {balances.isError && !balances.data ? (
         <InlineMessage tone="warning">We could not load your balances, so we cannot check what is available.</InlineMessage>
       ) : null}

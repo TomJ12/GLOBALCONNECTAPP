@@ -8,6 +8,7 @@ import type { z } from 'zod';
 import { ProviderError } from '../../errors';
 import type {
   AccountDetails,
+  ApprovalResult,
   ApprovalStep,
   Balance,
   Beneficiary,
@@ -47,6 +48,7 @@ import {
   type RawMagicLinkRequest,
   type RawPagination,
   type RawPayment,
+  type RawPaymentAuthorisation,
   type RawRateHistory,
   type RawTransaction,
 } from './raw';
@@ -113,7 +115,8 @@ export function mapHttpError(status: number, body: string): ProviderError {
     if (codes.includes('insufficient_funds')) return new ProviderError('insufficient_funds', options);
     return new ProviderError('validation', options);
   }
-  if (status === 403) return new ProviderError('unauthorized', options);
+  // 403 means "signed in but not allowed". It must not end the session.
+  if (status === 403) return new ProviderError('forbidden', options);
   return new ProviderError('server', options);
 }
 
@@ -164,7 +167,6 @@ export function mapSession(raw: RawAppSession): { session: Session; token: strin
   return {
     token: raw.auth_token,
     session: {
-      deviceCredential: raw.device_credential,
       user: {
         id: raw.contact.id,
         email: raw.contact.email_address ?? '',
@@ -289,6 +291,14 @@ export function mapQuote(raw: RawHeldRateQuote, request: QuoteRequest): Quote {
   const buyCurrency = raw.buy_currency.toUpperCase();
   if (sellCurrency !== request.sellCurrency.toUpperCase() || buyCurrency !== request.buyCurrency.toUpperCase()) {
     throw new ProviderError('malformed_response', { detail: 'Quote currencies do not match the request' });
+  }
+  // The quote must be for what was asked: same fixed side and the same amount on it.
+  const fixedAmount = raw.fixed_side === 'sell' ? raw.client_sell_amount : raw.client_buy_amount;
+  if (raw.fixed_side !== request.fixedSide || !DECIMAL_RE.test(request.amount) || !new Big(fixedAmount).eq(new Big(request.amount))) {
+    throw new ProviderError('malformed_response', { detail: 'Quote amount or fixed side does not match the request' });
+  }
+  if (new Big(raw.client_sell_amount).lte(0) || new Big(raw.client_buy_amount).lte(0) || new Big(raw.client_rate).lte(0)) {
+    throw new ProviderError('malformed_response', { detail: 'Quote has a non-positive amount or rate' });
   }
   if (Number.isNaN(Date.parse(raw.expires_at))) {
     throw new ProviderError('malformed_response', { detail: 'Quote has no usable expiry time' });
@@ -451,8 +461,8 @@ export function mapPayment(raw: RawPayment, beneficiaryNames: ReadonlyMap<string
     beneficiaryId: raw.beneficiary_id,
     beneficiaryName: beneficiaryNames.get(raw.beneficiary_id) ?? null,
     reference: raw.reference,
-    // An unknown status is shown as "processing" rather than failing the whole list.
-    status: PAYMENT_STATUSES[raw.status] ?? 'processing',
+    // A status this app does not know is surfaced as 'unknown', never guessed.
+    status: PAYMENT_STATUSES[raw.status] ?? 'unknown',
     route: raw.payment_type ? (PAYMENT_ROUTES[raw.payment_type] ?? null) : null,
     fee: mapFee(raw),
     estimatedArrival: toDateOnly(raw.estimated_arrival),
@@ -474,6 +484,7 @@ export function mapPendingApproval(
   raw: RawPayment,
   beneficiaryNames: ReadonlyMap<string, string>,
   creator: RawContact | null,
+  beneficiary: Beneficiary | null = null,
 ): PendingApproval {
   const remaining = stepsRemaining(raw);
   const steps: ApprovalStep[] = [
@@ -487,5 +498,14 @@ export function mapPendingApproval(
   for (let i = 1; i < remaining; i += 1) {
     steps.push({ label: 'Another approver', status: 'waiting', at: null });
   }
-  return { payment: mapPayment(raw, beneficiaryNames), approvalsRemaining: remaining, steps };
+  return { payment: mapPayment(raw, beneficiaryNames), beneficiary, approvalsRemaining: remaining, steps };
+}
+
+/** Result of POST /v2/payments/authorise for one payment that was updated. */
+export function mapApprovalResult(raw: RawPaymentAuthorisation): ApprovalResult {
+  const remaining = Number(raw.auth_steps_required ?? 0);
+  return {
+    status: PAYMENT_STATUSES[raw.payment_status] ?? 'unknown',
+    approvalsRemaining: Number.isInteger(remaining) && remaining > 0 ? remaining : 0,
+  };
 }

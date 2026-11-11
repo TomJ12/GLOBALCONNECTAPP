@@ -16,12 +16,20 @@ export function describeBeneficiaryAccount(beneficiary: Beneficiary): string {
   return `${beneficiary.currency} account${ending}`;
 }
 
+/** "•••• 4471": never more than the last four characters of an account identifier. */
+export function maskAccountIdentifier(value: string | null): string | null {
+  if (!value) return null;
+  const compact = value.replace(/\s+/g, '');
+  return compact.length >= 4 ? `•••• ${compact.slice(-4)}` : '••••';
+}
+
 const STATUS_LABELS: Record<PaymentStatus, { label: string; tone: PillTone }> = {
   awaiting_approval: { label: 'Needs approval', tone: 'warning' },
   processing: { label: 'Processing', tone: 'tint' },
   sent: { label: 'Sent', tone: 'positive' },
   failed: { label: 'Failed', tone: 'danger' },
   cancelled: { label: 'Cancelled', tone: 'neutral' },
+  unknown: { label: 'Status unknown', tone: 'warning' },
 };
 
 export function PaymentStatusPill({ status }: { status: PaymentStatus }) {

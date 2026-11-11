@@ -15,17 +15,9 @@ import { WATCHLIST_PAIRS } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useCreateAlert, useRate } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { formatRate, isPositiveAmount } from '@/lib/money';
+import { formatRate, parseDecimalInput } from '@/lib/money';
 import { showToast } from '@/state/toast';
 import { spacing } from '@/theme';
-
-/** Digits and one decimal point, at most six decimal places. */
-function sanitizeRateInput(text: string): string {
-  const cleaned = text.replace(/[^\d.]/g, '');
-  const dot = cleaned.indexOf('.');
-  if (dot === -1) return cleaned.slice(0, 6);
-  return `${cleaned.slice(0, dot).slice(0, 6) || '0'}.${cleaned.slice(dot + 1).replace(/\./g, '').slice(0, 6)}`;
-}
 
 export function NewAlertScreen() {
   const router = useRouter();
@@ -44,11 +36,13 @@ export function NewAlertScreen() {
   };
 
   const save = useSingleFlight(async () => {
-    const target = targetText.replace(/\.$/, '');
-    if (!isPositiveAmount(target)) {
-      setError('Enter a target rate greater than zero.');
+    // Same strict reading as amounts: anything unclear is rejected, never reshaped.
+    const read = parseDecimalInput(targetText, 6);
+    if (!read.ok) {
+      setError(read.problem === 'too_many_decimals' ? 'Use at most 6 decimal places.' : 'Enter a target rate greater than zero, like 1.3200.');
       return;
     }
+    const target = read.amount;
     setError(null);
     try {
       await createAlert.mutateAsync({ base, quote, direction, targetRate: target });
@@ -101,11 +95,12 @@ export function NewAlertScreen() {
         label="Target rate"
         value={targetText}
         onChangeText={(text) => {
-          setTargetText(sanitizeRateInput(text));
+          setTargetText(text);
           if (error) setError(null);
         }}
         keyboardType="decimal-pad"
         inputMode="decimal"
+        maxLength={16}
         placeholder={rate.data ? formatRate(rate.data.rate) : '0.0000'}
         error={error}
         testID="alert-target"

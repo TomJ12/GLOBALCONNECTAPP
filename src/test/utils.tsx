@@ -29,7 +29,7 @@ export function installMockBackend(controls: Partial<MockControls> = {}): Curren
     getControls: () => useDevSettings.getState().controls,
     planName: 'Business Standard',
   });
-  setProviderBackendForTests(mock.client, mock.reset);
+  setProviderBackendForTests(mock.client, { resetSampleData: mock.reset });
   return mock;
 }
 

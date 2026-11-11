@@ -5,7 +5,11 @@
  * Defaults can be set with environment variables at build/start time:
  *   EXPO_PUBLIC_MOCK_LATENCY_MS      e.g. 1200
  *   EXPO_PUBLIC_MOCK_FAILURE_RATE    0 to 1, e.g. 0.25
- *   EXPO_PUBLIC_MOCK_FORCE_ERROR     none | network | unauthorized | rate_limited | server | malformed | wrong_shape
+ *   EXPO_PUBLIC_MOCK_FORCE_ERROR     none | network | unauthorized | rate_limited | server | malformed | wrong_shape | lost_response
+ *
+ * `lost_response` is different from the others: the server APPLIES the request and
+ * then the connection drops, so the caller sees a network error for something that
+ * happened. It is the mode that exercises idempotency keys and reconciliation.
  *   EXPO_PUBLIC_MOCK_QUOTE_TTL_S     e.g. 10
  *   EXPO_PUBLIC_MOCK_OFFLINE         1 to start "offline"
  */
@@ -17,6 +21,7 @@ export const FORCED_ERRORS = [
   'server',
   'malformed',
   'wrong_shape',
+  'lost_response',
 ] as const;
 export type ForcedError = (typeof FORCED_ERRORS)[number];
 
@@ -28,6 +33,7 @@ export const FORCED_ERROR_LABELS: Record<ForcedError, string> = {
   server: '500',
   malformed: 'Broken JSON',
   wrong_shape: 'Wrong shape',
+  lost_response: 'Applied, reply lost',
 };
 
 export interface MockControls {
@@ -41,6 +47,8 @@ export interface MockControls {
   quoteTtlSeconds: number;
   /** Simulate having no connection. */
   offline: boolean;
+  /** Never answer at all, to exercise the client's request timeout. Tests only; not in the panel. */
+  hang?: boolean;
 }
 
 export const DEFAULT_MOCK_CONTROLS: MockControls = {
@@ -74,6 +82,7 @@ export function sanitizeMockControls(input: Partial<MockControls>): MockControls
       3600,
     ),
     offline: Boolean(merged.offline),
+    ...(merged.hang ? { hang: true } : {}),
   };
 }
 

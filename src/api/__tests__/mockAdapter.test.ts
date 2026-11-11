@@ -5,7 +5,7 @@ import type { ProviderClient } from '../provider';
 
 const START = Date.parse('2026-11-10T12:00:00.000Z');
 
-function setup(overrides: Partial<MockControls> = {}) {
+function setup(overrides: Partial<MockControls> = {}, extra: { clientSkewMs?: number; requestTimeoutMs?: number } = {}) {
   const controls: MockControls = { ...DEFAULT_MOCK_CONTROLS, latencyMs: 0, ...overrides };
   const clock = { now: START };
   const randoms: number[] = [];
@@ -13,13 +13,15 @@ function setup(overrides: Partial<MockControls> = {}) {
     getControls: () => controls,
     planName: 'Business Standard',
     now: () => clock.now,
+    clientNow: () => clock.now + (extra.clientSkewMs ?? 0),
+    requestTimeoutMs: extra.requestTimeoutMs,
     random: () => randoms.shift() ?? 0.99,
   });
   return { ...mock, controls, clock, randoms };
 }
 
-async function signedIn(overrides: Partial<MockControls> = {}) {
-  const context = setup(overrides);
+async function signedIn(overrides: Partial<MockControls> = {}, extra: { clientSkewMs?: number; requestTimeoutMs?: number } = {}) {
+  const context = setup(overrides, extra);
   const link = await context.client.requestMagicLink('Finance@Example.com');
   await context.client.verifyMagicLink(link.requestId, link.devCode ?? '');
   return context;
@@ -63,16 +65,14 @@ describe('sign-in', () => {
     await expectKind(client.verifyMagicLink(link.requestId, link.devCode ?? ''), 'unauthorized');
   });
 
-  it('resumes from a device credential and signs out', async () => {
+  it('signs out, and nothing but a new link signs back in', async () => {
     const { client } = setup();
     const link = await client.requestMagicLink('a@b.co');
     const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '');
+    // A session carries who the user is and nothing that could start another session.
+    expect(Object.keys(session)).toEqual(['user']);
     await client.signOut();
     await expectKind(client.listBalances(), 'unauthorized');
-    await expectKind(client.resumeSession('made-up'), 'unauthorized');
-    const resumed = await client.resumeSession(session.deviceCredential);
-    expect(resumed.user.email).toBe('a@b.co');
-    expect(await client.listBalances()).toHaveLength(3);
   });
 });
 
@@ -247,13 +247,15 @@ describe('payees and payments', () => {
       estimatedArrival: null,
     });
     expect(approval?.steps.map((step) => step.label)).toEqual(['Created by Accounts team', 'Waiting for you']);
+    // The approver gets the payee's bank details, not just a name.
+    expect(approval?.beneficiary).toMatchObject({ name: 'Brightway Electronics Co.', bankCountry: 'HK', accountNumber: '000000004471', bic: 'SMPLHKHH' });
   });
 
   it('approving removes it from pending, debits the balance and adds a transaction', async () => {
     const { client } = await signedIn();
     const [approval] = await client.listPendingApprovals();
     const id = approval?.payment.id ?? '';
-    await client.approvePayment(id);
+    expect(await client.approvePayment(id)).toEqual({ status: 'processing', approvalsRemaining: 0 });
     expect(await client.listPendingApprovals()).toEqual([]);
     expect(await balanceOf(client, 'USD')).toBe('39491.00');
     expect((await client.listTransactions({ page: 1, perPage: 1 })).items[0]).toMatchObject({
@@ -323,6 +325,7 @@ describe('failure injection', () => {
     ['server', 'server'],
     ['malformed', 'malformed_response'],
     ['wrong_shape', 'malformed_response'],
+    ['lost_response', 'network'],
   ];
 
   it.each(forced)('forced %s becomes a typed %s error', async (forcedError, kind) => {
@@ -370,6 +373,126 @@ describe('failure injection', () => {
   });
 });
 
+describe('processed but response lost', () => {
+  it('applies the request and then reports a network error', async () => {
+    const { client, controls } = await signedIn();
+    const quote = await client.createQuote({ kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' });
+    controls.forcedError = 'lost_response';
+    await expectKind(client.bookConversion({ quote, idempotencyKey: 'lost-1' }), 'network');
+    controls.forcedError = 'none';
+    // It happened, even though the caller was told it failed.
+    expect(await balanceOf(client, 'GBP')).toBe('100964.00');
+  });
+
+  it('the server honours the conversion key: a retry with a NEW quote does not book again', async () => {
+    const { client, controls } = await signedIn();
+    const request = { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' } as const;
+    const first = await client.createQuote(request);
+    controls.forcedError = 'lost_response';
+    await expectKind(client.bookConversion({ quote: first, idempotencyKey: 'intent-1' }), 'network');
+    controls.forcedError = 'none';
+
+    const found = await client.findConversionByIdempotencyKey('intent-1');
+    expect(found).toMatchObject({ sellAmount: '1000.00', buyAmount: '1300.00', status: 'settled' });
+
+    const second = await client.createQuote(request);
+    expect(second.id).not.toBe(first.id);
+    const replay = await client.bookConversion({ quote: second, idempotencyKey: 'intent-1' });
+    expect(replay.id).toBe(found?.id);
+    expect(await balanceOf(client, 'GBP')).toBe('100964.00');
+    expect(await balanceOf(client, 'USD')).toBe('59191.00');
+
+    // Without the shared key the same sequence books twice. This is the bug the key prevents.
+    const third = await client.createQuote(request);
+    await client.bookConversion({ quote: third, idempotencyKey: 'intent-2' });
+    expect(await balanceOf(client, 'GBP')).toBe('99964.00');
+  });
+
+  it('the server honours the payment key: a retry after a lost response pays once', async () => {
+    const { client, controls } = await signedIn();
+    const input = { beneficiaryId: 'sample-beneficiary-harbour', amount: '250.00', currency: 'GBP', reference: 'HP-1', reason: 'HP-1', idempotencyKey: 'pay-lost' };
+    controls.forcedError = 'lost_response';
+    await expectKind(client.createPayment(input), 'network');
+    controls.forcedError = 'none';
+    const found = await client.findPaymentByIdempotencyKey('pay-lost');
+    expect(found).toMatchObject({ amount: '250.00', status: 'processing', beneficiaryName: 'Harbour Print Ltd' });
+    const retry = await client.createPayment(input);
+    expect(retry.id).toBe(found?.id);
+    expect(await balanceOf(client, 'GBP')).toBe('101714.00');
+  });
+
+  it('reconciliation finds nothing for a key that was never applied', async () => {
+    const { client } = await signedIn();
+    expect(await client.findConversionByIdempotencyKey('never')).toBeNull();
+    expect(await client.findPaymentByIdempotencyKey('never')).toBeNull();
+  });
+
+  it('a lost approval is not applied twice by a retry', async () => {
+    const { client, controls } = await signedIn();
+    const [approval] = await client.listPendingApprovals();
+    const id = approval?.payment.id ?? '';
+    controls.forcedError = 'lost_response';
+    await expectKind(client.approvePayment(id), 'network');
+    controls.forcedError = 'none';
+    expect(await client.listPendingApprovals()).toEqual([]);
+    await expectKind(client.approvePayment(id), 'validation');
+    expect(await balanceOf(client, 'USD')).toBe('39491.00');
+  });
+});
+
+describe('timeouts, paging and clocks', () => {
+  it('gives up on a request that never answers, as an outcome-unknown timeout', async () => {
+    const { client, controls } = await signedIn({}, { requestTimeoutMs: 40 });
+    controls.hang = true;
+    const started = Date.now();
+    const error = await client.listBalances().then(
+      () => null,
+      (caught: unknown) => caught as ProviderError,
+    );
+    expect(error?.kind).toBe('timeout');
+    expect(error?.outcomeUnknown).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2000);
+    controls.hang = false;
+    await expect(client.listBalances()).resolves.toHaveLength(3);
+  });
+
+  it('reads every page of payees, not just the first 100', async () => {
+    const { client } = await signedIn();
+    for (let index = 0; index < 120; index += 1) {
+      await client.createBeneficiary({ name: `Supplier ${index}`, entityType: 'company', currency: 'GBP', bankCountry: 'GB', sortCode: '123456', accountNumber: '12345678' });
+    }
+    const all = await client.listBeneficiaries();
+    expect(all).toHaveLength(123);
+    expect(new Set(all.map((payee) => payee.id)).size).toBe(123);
+    // A pending payment to a payee beyond the first page still resolves its details.
+    expect((await client.listPendingApprovals())[0]?.beneficiary?.name).toBe('Brightway Electronics Co.');
+  });
+
+  it('runs the quote countdown on the device clock, keeping the hold length from the server', async () => {
+    const skew = -5 * 60 * 1000; // this phone is five minutes slow
+    const { client } = await signedIn({ quoteTtlSeconds: 30 }, { clientSkewMs: skew });
+    const quote = await client.createQuote({ kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1.00' });
+    expect(Date.parse(quote.expiresAt) - (START + skew)).toBe(30_000);
+    expect(Date.parse(quote.expiresAt) - Date.parse(quote.createdAt)).toBe(30_000);
+  });
+
+  it('a payment needing two approvals stays pending after the first', async () => {
+    const { client } = await signedIn();
+    const [approval] = await client.listPendingApprovals();
+    const id = approval?.payment.id ?? '';
+    // Reach into the mock: make the sample payment need two approvals.
+    const spy = jest.spyOn(client, 'approvePayment');
+    spy.mockRestore();
+    const server = (client as unknown as { transport: { state: { payments: { id: string; authorisation_steps_required: string }[] } } }).transport;
+    const row = server.state.payments.find((payment) => payment.id === id);
+    if (row) row.authorisation_steps_required = '2';
+    expect(await client.approvePayment(id)).toEqual({ status: 'awaiting_approval', approvalsRemaining: 1 });
+    expect(await balanceOf(client, 'USD')).toBe('57891.00');
+    expect(await client.approvePayment(id)).toEqual({ status: 'processing', approvalsRemaining: 0 });
+    expect(await balanceOf(client, 'USD')).toBe('39491.00');
+  });
+});
+
 describe('mock controls', () => {
   it('reads and clamps environment values', () => {
     expect(mockControlsFromEnv({})).toEqual(DEFAULT_MOCK_CONTROLS);
@@ -382,6 +505,7 @@ describe('mock controls', () => {
         EXPO_PUBLIC_MOCK_OFFLINE: '1',
       }),
     ).toEqual({ latencyMs: 1200, failureRate: 0.25, forcedError: 'rate_limited', quoteTtlSeconds: 10, offline: true });
+    expect(mockControlsFromEnv({ EXPO_PUBLIC_MOCK_FORCE_ERROR: 'lost_response' }).forcedError).toBe('lost_response');
     expect(mockControlsFromEnv({ EXPO_PUBLIC_MOCK_LATENCY_MS: 'fast', EXPO_PUBLIC_MOCK_FAILURE_RATE: '7', EXPO_PUBLIC_MOCK_FORCE_ERROR: 'boom', EXPO_PUBLIC_MOCK_QUOTE_TTL_S: '0' })).toEqual({
       ...DEFAULT_MOCK_CONTROLS,
       failureRate: 1,

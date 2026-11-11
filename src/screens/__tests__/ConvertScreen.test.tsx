@@ -1,9 +1,14 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { act, fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { getProviderClient } from '@/api';
 import { ProviderError } from '@/api/errors';
 import { ConvertScreen } from '@/screens/ConvertScreen';
+import { useSession } from '@/state/session';
 import { installMockBackend, renderScreen, setControls, signIn } from '@/test/utils';
+
+const expoRouter = jest.requireMock<{ __setFocused: (focused: boolean) => void }>('expo-router');
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function gbpBalance(): Promise<string | undefined> {
   return (await getProviderClient().listBalances()).find((balance) => balance.currency === 'GBP')?.amount;
@@ -21,6 +26,8 @@ describe('ConvertScreen', () => {
   beforeEach(async () => {
     const mock = installMockBackend();
     await signIn(mock.client);
+    await AsyncStorage.clear();
+    expoRouter.__setFocused(true);
   });
 
   it('cannot submit before there is a quote', async () => {
@@ -150,9 +157,10 @@ describe('ConvertScreen', () => {
     await renderScreen(<ConvertScreen />);
     await typeSellAmount('500');
     await fireEvent.press(await screen.findByRole('button', { name: 'Convert £500.00' }));
-    setControls({ forcedError: 'server' });
+    // A definite refusal (not an unknown outcome): say so and allow another try.
+    setControls({ forcedError: 'rate_limited' });
     await confirmDialog();
-    expect(await screen.findByText(/Something went wrong on our side/)).toBeOnTheScreen();
+    expect(await screen.findByText(/Too many requests/)).toBeOnTheScreen();
     setControls({ forcedError: 'none' });
     expect(await gbpBalance()).toBe('101964.00');
     expect(screen.queryByText('Conversion complete')).not.toBeOnTheScreen();
@@ -171,5 +179,212 @@ describe('ConvertScreen', () => {
     expect(await screen.findByText('Rate locked')).toBeOnTheScreen();
     expect(await gbpBalance()).toBe('101964.00');
     expect(await getProviderClient().listForwardContracts()).toHaveLength(2);
+  });
+
+  // --- H1: one key per conversion intent, and reconciliation after a lost response ---
+
+  it('books once when the response is lost: it checks the outcome instead of quoting and booking again', async () => {
+    const client = getProviderClient();
+    const bookSpy = jest.spyOn(client, 'bookConversion');
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('1000');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £1,000.00' }));
+    // The server applies the booking, then the reply is lost. The check that follows is lost too.
+    setControls({ forcedError: 'lost_response', quoteTtlSeconds: 1 });
+    await confirmDialog();
+
+    expect(await screen.findByText(/We still cannot confirm whether your conversion went through/)).toBeOnTheScreen();
+    // Blocked: no convert button, inputs and pickers locked, and no new quote is fetched however long we wait.
+    expect(screen.queryByTestId('convert-submit')).not.toBeOnTheScreen();
+    expect(screen.getByTestId('sell-amount')).toHaveProp('editable', false);
+    expect(screen.getByRole('button', { name: /You sell currency/ })).toBeDisabled();
+    const quoteSpy = jest.spyOn(client, 'createQuote');
+    await sleep(1500);
+    expect(quoteSpy).not.toHaveBeenCalled();
+
+    setControls({ forcedError: 'none' });
+    expect(await gbpBalance()).toBe('100964.00');
+    await fireEvent.press(screen.getByTestId('convert-recheck'));
+    expect(await screen.findByText('Conversion complete')).toBeOnTheScreen();
+    expect(screen.getByTestId('convert-result-buy')).toHaveTextContent('$1,300.00');
+    expect(bookSpy).toHaveBeenCalledTimes(1);
+    expect(await gbpBalance()).toBe('100964.00');
+  });
+
+  it('reuses the same key across a re-quote of the same conversion, and a new key for a different amount', async () => {
+    const client = getProviderClient();
+    const bookSpy = jest.spyOn(client, 'bookConversion');
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('1000');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £1,000.00' }));
+    bookSpy.mockRejectedValueOnce(new ProviderError('quote_expired'));
+    await confirmDialog();
+    await screen.findByText(/That rate expired/);
+    // A new quote arrives for the same intent.
+    await waitFor(() => expect(screen.getByTestId('convert-submit')).toBeEnabled());
+    await fireEvent.press(screen.getByTestId('convert-submit'));
+    await confirmDialog();
+    expect(await screen.findByText('Conversion complete')).toBeOnTheScreen();
+
+    const [first, second] = bookSpy.mock.calls.map(([request]) => request);
+    expect(first?.quote.id).not.toBe(second?.quote.id);
+    expect(first?.idempotencyKey).toBe(second?.idempotencyKey);
+    expect(await gbpBalance()).toBe('100964.00');
+
+    // A different conversion gets a different key.
+    await fireEvent.press(screen.getByTestId('convert-done'));
+    await typeSellAmount('1000');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £1,000.00' }));
+    await confirmDialog();
+    await screen.findByText('Conversion complete');
+    expect(bookSpy.mock.calls[2]?.[0].idempotencyKey).not.toBe(second?.idempotencyKey);
+    expect(await gbpBalance()).toBe('99964.00');
+  });
+
+  it('after a failure that was never applied, says so and allows another attempt', async () => {
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('1000');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £1,000.00' }));
+    setControls({ forcedError: 'network' });
+    await confirmDialog();
+    await screen.findByText(/We still cannot confirm/);
+    setControls({ forcedError: 'none' });
+    await fireEvent.press(screen.getByTestId('convert-recheck'));
+    expect(await screen.findByText(/did not go through. Nothing was converted/)).toBeOnTheScreen();
+    expect(await gbpBalance()).toBe('101964.00');
+    await waitFor(() => expect(screen.getByTestId('convert-submit')).toBeOnTheScreen());
+  });
+
+  it('remembers an unknown outcome across a restart of the screen and resolves it', async () => {
+    const client = getProviderClient();
+    const first = await renderScreen(<ConvertScreen />);
+    await typeSellAmount('1000');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £1,000.00' }));
+    setControls({ forcedError: 'lost_response' });
+    await confirmDialog();
+    await screen.findByText(/We still cannot confirm/);
+    first.queryClient.clear();
+    await screen.unmount();
+
+    setControls({ forcedError: 'none' });
+    const bookSpy = jest.spyOn(client, 'bookConversion');
+    await renderScreen(<ConvertScreen />);
+    expect(await screen.findByText('Conversion complete')).toBeOnTheScreen();
+    expect(bookSpy).not.toHaveBeenCalled();
+  });
+
+  // --- M6: what was booked is compared with what was confirmed ---
+
+  it('warns when the booked conversion differs from the confirmed quote', async () => {
+    const client = getProviderClient();
+    const real = client.bookConversion.bind(client);
+    jest.spyOn(client, 'bookConversion').mockImplementationOnce(async (request) => ({ ...(await real(request)), buyAmount: '1250.00', rate: '1.2500' }));
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('1000');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £1,000.00' }));
+    await confirmDialog();
+    expect(await screen.findByText(/different from the rate you confirmed/)).toBeOnTheScreen();
+    expect(screen.getByTestId('convert-result-buy')).toHaveTextContent('$1,250.00');
+  });
+
+  // --- H2 / M2: input is rejected, never reshaped ---
+
+  it('accepts a decimal comma and rejects malformed or ambiguous amounts with a message', async () => {
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('1234,56');
+    await waitFor(() => expect(screen.getByTestId('buy-amount')).toHaveDisplayValue('1604.93'));
+    expect(screen.getByRole('button', { name: 'Convert £1,234.56' })).toBeEnabled();
+
+    const quoteSpy = jest.spyOn(getProviderClient(), 'createQuote');
+    for (const [text, message] of [
+      ['1e3', /digits/],
+      ['-50', /digits/],
+      ['1,234', /comma/],
+      ['10.999', /at most 2 decimal places/],
+    ] as const) {
+      await typeSellAmount(text);
+      expect(screen.getByText(message)).toBeOnTheScreen();
+      expect(screen.getByTestId('sell-amount')).toHaveDisplayValue(text);
+      expect(screen.getByTestId('convert-submit')).toBeDisabled();
+    }
+    await sleep(600);
+    expect(quoteSpy).not.toHaveBeenCalled();
+  });
+
+  it('after a currency change, an amount the new currency cannot hold is rejected rather than quoted', async () => {
+    const quoteSpy = jest.spyOn(getProviderClient(), 'createQuote');
+    await renderScreen(<ConvertScreen />);
+    await fireEvent.changeText(screen.getByTestId('buy-amount'), '100.55');
+    await waitFor(() => expect(screen.getByTestId('convert-submit')).toBeEnabled());
+    quoteSpy.mockClear();
+
+    // Buy JPY instead of USD: 100.55 is not a yen amount.
+    await fireEvent.press(screen.getByRole('button', { name: /You buy currency/ }));
+    await fireEvent.press(await screen.findByRole('radio', { name: /JPY/ }));
+    expect(await screen.findByText(/JPY has no decimal places/)).toBeOnTheScreen();
+    expect(screen.getByTestId('buy-amount')).toHaveDisplayValue('100.55');
+    expect(screen.getByTestId('convert-submit')).toBeDisabled();
+    await sleep(600);
+    expect(quoteSpy).not.toHaveBeenCalled();
+  });
+
+  // --- M3: an idle screen stops quoting ---
+
+  it('re-quotes automatically once, then waits for a tap', async () => {
+    setControls({ quoteTtlSeconds: 1 });
+    const quoteSpy = jest.spyOn(getProviderClient(), 'createQuote');
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('500');
+    await screen.findByText('1 GBP = 1.3000 USD');
+    await sleep(4200);
+    expect(quoteSpy).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('quote-status')).toHaveTextContent('Rate expired');
+    expect(screen.getByTestId('convert-submit')).toBeDisabled();
+
+    await fireEvent.press(screen.getByTestId('quote-retry'));
+    await waitFor(() => expect(screen.getByTestId('convert-submit')).toBeEnabled());
+    expect(quoteSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not re-quote while the tab is not focused', async () => {
+    setControls({ quoteTtlSeconds: 1 });
+    expoRouter.__setFocused(false);
+    const quoteSpy = jest.spyOn(getProviderClient(), 'createQuote');
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('500');
+    await screen.findByText('1 GBP = 1.3000 USD');
+    await sleep(2500);
+    expect(quoteSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('convert-submit')).toBeDisabled();
+  });
+
+  // --- M4: a 401 while quoting ends the session ---
+
+  it('signs the user out when quoting returns 401', async () => {
+    const client = getProviderClient();
+    const link = await client.requestMagicLink('finance@example.com');
+    useSession.getState().startSession(await client.verifyMagicLink(link.requestId, link.devCode ?? ''));
+    await renderScreen(<ConvertScreen />);
+    setControls({ forcedError: 'unauthorized' });
+    await typeSellAmount('500');
+    await waitFor(() => expect(useSession.getState().session).toBeNull());
+    expect(useSession.getState().signedOutReason).toBe('expired');
+    setControls({ forcedError: 'none' });
+  });
+
+  // --- Expiry while the confirmation is open ---
+
+  it('does not book if the rate expired while the confirmation was showing', async () => {
+    setControls({ quoteTtlSeconds: 2 });
+    const bookSpy = jest.spyOn(getProviderClient(), 'bookConversion');
+    await renderScreen(<ConvertScreen />);
+    await typeSellAmount('500');
+    await fireEvent.press(await screen.findByRole('button', { name: 'Convert £500.00' }));
+    await screen.findByTestId('confirm-dialog-confirm');
+    await sleep(2200);
+    await confirmDialog();
+    expect(await screen.findByText(/expired while you were confirming/)).toBeOnTheScreen();
+    expect(bookSpy).not.toHaveBeenCalled();
+    expect(await gbpBalance()).toBe('101964.00');
   });
 });
