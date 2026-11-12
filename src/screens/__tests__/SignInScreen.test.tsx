@@ -3,176 +3,143 @@ import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 import fs from 'fs';
 import path from 'path';
 
-import { getProviderClient } from '@/api';
-import { MOCK_MAGIC_LINK_CODE } from '@/api/adapters/currencycloud/mockServer';
+import { getAuthClient, getProviderClient, setProviderBackendForTests } from '@/api';
+import { DEMO_CODE, DEMO_RECOVERY_CODE } from '@/api/adapters/demoBackend';
+import { ProviderError } from '@/api/errors';
+import type { Session } from '@/api/types';
 import { disclosures } from '@/config/disclosures';
-import { loadSignInAttempt, saveSignInAttempt } from '@/lib/signInAttempt';
-import { MagicLinkScreen } from '@/screens/MagicLinkScreen';
 import { SignInScreen } from '@/screens/SignInScreen';
 import { useSession } from '@/state/session';
-import { installMockBackend, renderScreen, setControls, TEST_DEVICE_SECRET } from '@/test/utils';
+import { installMockBackend, renderScreen } from '@/test/utils';
 
-const expoRouter = jest.requireMock<{ __setParams: (params: Record<string, string>) => void; router: { replace: jest.Mock } }>('expo-router');
+async function enterCredentials(email = 'finance@example.com', password = 'a long enough password'): Promise<void> {
+  await fireEvent.changeText(screen.getByTestId('sign-in-email'), email);
+  await fireEvent.changeText(screen.getByTestId('sign-in-password'), password);
+  await fireEvent.press(screen.getByTestId('sign-in-continue'));
+}
 
-async function requestLink(): Promise<void> {
-  await fireEvent.changeText(screen.getByLabelText('Registered email address'), 'finance@example.com');
-  await fireEvent.press(screen.getByRole('button', { name: 'Send login link' }));
-  expect(await screen.findByText('Check your email')).toBeOnTheScreen();
+async function enterCode(code: string): Promise<void> {
+  await fireEvent.changeText(await screen.findByTestId('sign-in-code'), code);
+  await fireEvent.press(screen.getByTestId('sign-in-verify'));
 }
 
 beforeEach(async () => {
   installMockBackend();
   useSession.setState({ session: null, signedOutReason: null });
   await AsyncStorage.clear();
-  expoRouter.router.replace.mockClear();
 });
 
 describe('SignInScreen', () => {
-  it('validates the email before sending anything', async () => {
+  it('validates the email and password before sending anything', async () => {
+    const spy = jest.spyOn(getAuthClient(), 'signIn');
     await renderScreen(<SignInScreen />);
-    await fireEvent.press(screen.getByRole('button', { name: 'Send login link' }));
+    await fireEvent.press(screen.getByTestId('sign-in-continue'));
     expect(await screen.findByText(/Enter a valid email address/)).toBeOnTheScreen();
-    expect(screen.queryByText('Check your email')).not.toBeOnTheScreen();
+    expect(screen.getByText(/Enter your password\./)).toBeOnTheScreen();
+    expect(spy).not.toHaveBeenCalled();
   });
 
-  it('signs in with the code typed from the email, then forgets the sign-in secret', async () => {
-    const requestSpy = jest.spyOn(getProviderClient(), 'requestMagicLink');
+  it('signs in with email, password and a 6-digit code, and stores nothing on the device', async () => {
     await renderScreen(<SignInScreen />);
-    await requestLink();
-    // A fresh random secret is made for each request and kept on this device until sign-in completes.
-    const secret = requestSpy.mock.calls[0]?.[1] ?? '';
-    expect(secret).toMatch(/^[0-9a-f]{64}$/);
-    expect((await loadSignInAttempt())?.secret).toBe(secret);
-
-    await fireEvent.changeText(screen.getByTestId('magic-code'), MOCK_MAGIC_LINK_CODE);
-    await fireEvent.press(screen.getByTestId('verify-code'));
-    await waitFor(() => expect(useSession.getState().session?.user.email).toBe('finance@example.com'));
-    expect(await loadSignInAttempt()).toBeNull();
-  });
-
-  it('rejects a wrong or empty code with a clear message and stays signed out', async () => {
-    await renderScreen(<SignInScreen />);
-    await requestLink();
-    await fireEvent.press(screen.getByTestId('verify-code'));
-    expect(await screen.findByText('Error: Enter the code from the email.')).toBeOnTheScreen();
-    await fireEvent.changeText(screen.getByTestId('magic-code'), 'WRONG');
-    await fireEvent.press(screen.getByTestId('verify-code'));
-    expect(await screen.findByText(/not valid or has expired/)).toBeOnTheScreen();
+    await enterCredentials();
+    expect(await screen.findByText('Enter your code')).toBeOnTheScreen();
+    // No session until the code is accepted.
     expect(useSession.getState().session).toBeNull();
+    await enterCode('12345');
+    expect(await screen.findByText(/Enter the 6-digit code/)).toBeOnTheScreen();
+    await enterCode('111111');
+    expect(await screen.findByText(/That code is not right/)).toBeOnTheScreen();
+    await enterCode(DEMO_CODE);
+    await waitFor(() => expect(useSession.getState().session?.user.email).toBe('finance@example.com'));
+    expect(useSession.getState().session?.company.name).toBe('Northfield Trading Ltd');
+    expect(await AsyncStorage.getAllKeys()).toEqual([]);
+    await expect(getProviderClient().listBalances()).resolves.toHaveLength(3);
   });
 
-  it('the developer shortcut completes the link on the mock', async () => {
+  it('offers a recovery code in place of the authenticator code', async () => {
+    const spy = jest.spyOn(getAuthClient(), 'completeSignIn');
     await renderScreen(<SignInScreen />);
-    await requestLink();
-    await fireEvent.press(screen.getByTestId('dev-complete-link'));
+    await enterCredentials();
+    await fireEvent.press(await screen.findByTestId('sign-in-toggle-method'));
+    expect(await screen.findByText('Use a recovery code')).toBeOnTheScreen();
+    await enterCode(DEMO_RECOVERY_CODE);
     await waitFor(() => expect(useSession.getState().session).not.toBeNull());
+    expect(spy).toHaveBeenCalledWith(expect.any(String), DEMO_RECOVERY_CODE, 'recovery');
   });
 
-  it('offers no unlock and no route to settings or the developer panel while signed out', async () => {
-    useSession.setState({ signedOutReason: 'inactive' });
+  it('shows wrong details, lockout and an expired attempt in plain words', async () => {
+    const auth = getAuthClient();
     await renderScreen(<SignInScreen />);
-    expect(screen.getByText(/signed out because the app was in the background/)).toBeOnTheScreen();
-    expect(screen.queryByText(/unlock/i)).not.toBeOnTheScreen();
-    expect(screen.queryByText(/developer settings/i)).not.toBeOnTheScreen();
-    expect(screen.queryByRole('button', { name: /settings/i })).not.toBeOnTheScreen();
-    // The settings route lives inside the signed-in group, whose layout redirects to sign-in without a session.
-    const app = path.resolve(__dirname, '../../app');
-    expect(fs.existsSync(path.join(app, 'settings.tsx'))).toBe(false);
-    expect(fs.existsSync(path.join(app, '(app)', 'settings.tsx'))).toBe(true);
-    expect(fs.readFileSync(path.join(app, '(app)', '_layout.tsx'), 'utf8')).toMatch(/if \(!signedIn\) return <Redirect href="\/sign-in" \/>/);
+
+    jest.spyOn(auth, 'signIn').mockRejectedValueOnce(new ProviderError('validation', { reason: 'invalid_credentials' }));
+    await enterCredentials();
+    expect(await screen.findByText(/do not match an account/)).toBeOnTheScreen();
+
+    jest.spyOn(auth, 'signIn').mockRejectedValueOnce(new ProviderError('rate_limited', { reason: 'locked', retryAfterSeconds: 100 }));
+    await fireEvent.changeText(screen.getByTestId('sign-in-password'), 'another password');
+    await fireEvent.press(screen.getByTestId('sign-in-continue'));
+    expect(await screen.findByText(/Too many attempts\. Try again in about 2 minutes\./)).toBeOnTheScreen();
+
+    jest.restoreAllMocks();
+    await fireEvent.changeText(screen.getByTestId('sign-in-password'), 'another password');
+    await fireEvent.press(screen.getByTestId('sign-in-continue'));
+    jest.spyOn(auth, 'completeSignIn').mockRejectedValueOnce(new ProviderError('validation', { reason: 'code_reused' }));
+    await enterCode('222222');
+    expect(await screen.findByText(/already been used/)).toBeOnTheScreen();
+
+    jest.spyOn(auth, 'completeSignIn').mockRejectedValueOnce(new ProviderError('validation', { reason: 'challenge_expired' }));
+    await enterCode('333333');
+    expect(await screen.findByText(/That took too long\. Start again\./)).toBeOnTheScreen();
+    // Back to the first step, with the password field empty.
+    expect(screen.getByTestId('sign-in-password').props.value).toBe('');
   });
 
-  it('takes its claims-like wording from disclosures, not from the screen', async () => {
+  it('asks which company when the person has more than one', async () => {
+    const demo = installMockBackend();
+    const companies = [
+      { id: 'co-a', name: 'Alpha Ltd' },
+      { id: 'co-b', name: 'Beta Ltd' },
+    ];
+    const session: Session = {
+      user: { id: 'u1', email: 'finance@example.com', displayName: 'Finance' },
+      company: { id: 'co-b', name: 'Beta Ltd' },
+      role: 'admin',
+      capabilities: { forwardContracts: false, paymentApprovals: false },
+      stepUpActions: ['payment.create'],
+    };
+    const selectCompany = jest.fn(async () => session);
+    setProviderBackendForTests({
+      client: demo.client,
+      auth: { ...demo.auth, completeSignIn: async () => ({ user: session.user, companies, session: null }), selectCompany },
+    });
+    await renderScreen(<SignInScreen />);
+    await enterCredentials();
+    await enterCode(DEMO_CODE);
+    expect(await screen.findByText('Choose a company')).toBeOnTheScreen();
+    expect(useSession.getState().session).toBeNull();
+    await fireEvent.press(screen.getByTestId('company-co-b'));
+    await waitFor(() => expect(useSession.getState().session?.company.name).toBe('Beta Ltd'));
+    expect(selectCompany).toHaveBeenCalledWith('co-b');
+  });
+
+  it('shows only placeholder wording for tagline and assurances, and why the person was signed out', async () => {
+    useSession.setState({ signedOutReason: 'inactive' });
     await renderScreen(<SignInScreen />);
     expect(screen.getByText(disclosures.signInTagline)).toBeOnTheScreen();
     expect(screen.getByText(disclosures.signInAssurance)).toBeOnTheScreen();
-    expect(screen.queryByText(/secure/i)).not.toBeOnTheScreen();
-    expect(screen.queryByText(/in your pocket/i)).not.toBeOnTheScreen();
+    expect(screen.getByText(/in the background for a while/)).toBeOnTheScreen();
   });
 
-  it('shows a readable message when the service is down', async () => {
-    setControls({ forcedError: 'network' });
-    await renderScreen(<SignInScreen />);
-    await fireEvent.changeText(screen.getByLabelText('Registered email address'), 'finance@example.com');
-    await fireEvent.press(screen.getByRole('button', { name: 'Send login link' }));
-    expect(await screen.findByText(/We could not reach the service/)).toBeOnTheScreen();
-  });
-});
-
-describe('MagicLinkScreen (deep link)', () => {
-  async function linkRequestedHere(email = 'finance@example.com'): Promise<string> {
-    const link = await getProviderClient().requestMagicLink(email, TEST_DEVICE_SECRET);
-    await saveSignInAttempt({ requestId: link.requestId, secret: TEST_DEVICE_SECRET });
-    return link.requestId;
-  }
-
-  it('signs in when the link is opened on the device that requested it', async () => {
-    expoRouter.__setParams({ request: await linkRequestedHere(), code: MOCK_MAGIC_LINK_CODE });
-    await renderScreen(<MagicLinkScreen />);
-    await waitFor(() => expect(useSession.getState().session?.user.email).toBe('finance@example.com'));
-    expect(expoRouter.router.replace).toHaveBeenCalledWith('/');
-  });
-
-  it('does not sign in on a device that did not request the link, and sends nothing', async () => {
-    // Requested elsewhere: this device has no secret for it.
-    const link = await getProviderClient().requestMagicLink('finance@example.com', TEST_DEVICE_SECRET);
-    const verifySpy = jest.spyOn(getProviderClient(), 'verifyMagicLink');
-    expoRouter.__setParams({ request: link.requestId, code: MOCK_MAGIC_LINK_CODE });
-    await renderScreen(<MagicLinkScreen />);
-    expect(await screen.findByText(/was not requested on this device/)).toBeOnTheScreen();
-    expect(verifySpy).not.toHaveBeenCalled();
-    expect(useSession.getState().session).toBeNull();
-  });
-
-  it('does not sign in with a secret from a different attempt', async () => {
-    const link = await getProviderClient().requestMagicLink('finance@example.com', TEST_DEVICE_SECRET);
-    await saveSignInAttempt({ requestId: link.requestId, secret: 'b'.repeat(64) });
-    expoRouter.__setParams({ request: link.requestId, code: MOCK_MAGIC_LINK_CODE });
-    await renderScreen(<MagicLinkScreen />);
-    expect(await screen.findByText(/not valid or has expired/)).toBeOnTheScreen();
-    expect(useSession.getState().session).toBeNull();
-  });
-
-  it('never replaces an existing session without asking', async () => {
-    const client = getProviderClient();
-    const first = await client.requestMagicLink('first@example.com', TEST_DEVICE_SECRET);
-    useSession.getState().startSession(await client.verifyMagicLink(first.requestId, MOCK_MAGIC_LINK_CODE, TEST_DEVICE_SECRET));
-    const verifySpy = jest.spyOn(client, 'verifyMagicLink');
-
-    expoRouter.__setParams({ request: await linkRequestedHere('second@example.com'), code: MOCK_MAGIC_LINK_CODE });
-    await renderScreen(<MagicLinkScreen />);
-    expect(await screen.findByText('Switch account?')).toBeOnTheScreen();
-    expect(screen.getByText(/You are signed in as first@example.com/)).toBeOnTheScreen();
-    expect(verifySpy).not.toHaveBeenCalled();
-    expect(useSession.getState().session?.user.email).toBe('first@example.com');
-
-    await fireEvent.press(screen.getByTestId('magic-stay'));
-    expect(expoRouter.router.replace).toHaveBeenCalledWith('/');
-    expect(verifySpy).not.toHaveBeenCalled();
-    expect(useSession.getState().session?.user.email).toBe('first@example.com');
-  });
-
-  it('switches account only after the person chooses to', async () => {
-    const client = getProviderClient();
-    const first = await client.requestMagicLink('first@example.com', TEST_DEVICE_SECRET);
-    useSession.getState().startSession(await client.verifyMagicLink(first.requestId, MOCK_MAGIC_LINK_CODE, TEST_DEVICE_SECRET));
-    expoRouter.__setParams({ request: await linkRequestedHere('second@example.com'), code: MOCK_MAGIC_LINK_CODE });
-    await renderScreen(<MagicLinkScreen />);
-    await fireEvent.press(await screen.findByTestId('magic-switch'));
-    await waitFor(() => expect(useSession.getState().session?.user.email).toBe('second@example.com'));
-    expect(expoRouter.router.replace).toHaveBeenCalledWith('/');
-  });
-
-  it('explains a bad link and a link with missing parts', async () => {
-    await saveSignInAttempt({ requestId: 'nope', secret: TEST_DEVICE_SECRET });
-    expoRouter.__setParams({ request: 'nope', code: 'nope' });
-    await renderScreen(<MagicLinkScreen />);
-    expect(await screen.findByText(/not valid or has expired/)).toBeOnTheScreen();
-    expect(useSession.getState().session).toBeNull();
-    await screen.unmount();
-
-    expoRouter.__setParams({});
-    await renderScreen(<MagicLinkScreen />);
-    expect(screen.getByText(/incomplete/)).toBeOnTheScreen();
+  it('has no emailed-link sign-in left anywhere in the app source', () => {
+    const src = path.resolve(__dirname, '..', '..');
+    const walk = (dir: string): string[] =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) return entry.name === '__tests__' ? [] : walk(full);
+        return /\.(ts|tsx)$/.test(entry.name) ? [full] : [];
+      });
+    const offenders = walk(src).filter((file) => /magic[-_ ]?link|deviceSecret|device_secret|login link/i.test(fs.readFileSync(file, 'utf8')));
+    expect(offenders.map((file) => path.relative(src, file))).toEqual([]);
+    expect(fs.existsSync(path.join(src, 'app', 'magic-link.tsx'))).toBe(false);
   });
 });

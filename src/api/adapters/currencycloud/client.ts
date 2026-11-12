@@ -18,7 +18,6 @@ import type {
   Conversion,
   ForwardContract,
   ListResult,
-  MagicLinkRequest,
   NewBeneficiary,
   NewPayment,
   Page,
@@ -29,7 +28,6 @@ import type {
   QuoteRequest,
   RateHistory,
   RatePair,
-  Session,
   Transaction,
 } from '../../types';
 import {
@@ -42,21 +40,19 @@ import {
   mapConversion,
   mapForwardContract,
   mapHttpError,
-  mapMagicLinkRequest,
   mapPage,
   mapPayment,
   mapPendingApproval,
   mapQuote,
   mapRate,
   mapRateHistory,
-  mapSession,
   mapTransaction,
   parseBody,
   toCreateBeneficiaryParams,
 } from './mapping';
 import {
   rawAccount,
-  rawAppSession,
+  rawAuthToken,
   rawBasicRates,
   rawBeneficiary,
   rawContact,
@@ -68,7 +64,6 @@ import {
   rawFindPayments,
   rawFindTransactions,
   rawHeldRateQuote,
-  rawMagicLinkRequest,
   rawPayment,
   rawPaymentAuthorisations,
   rawRateHistory,
@@ -81,8 +76,6 @@ export interface CurrencycloudClientOptions {
   planName: string | null;
   /** How long to ask the provider to hold a quote, in seconds. */
   quoteHoldSeconds?: number;
-  /** Set only by the mock so the sign-in screen can offer a shortcut. */
-  devMagicLinkCode?: string | null;
   /** Give up waiting for a response after this long. */
   requestTimeoutMs?: number;
   /** Most pages a "read everything" loop will fetch (100 rows each). */
@@ -142,29 +135,20 @@ export class CurrencycloudClient implements ProviderClient {
     return parseBody(schema, response.body);
   }
 
-  // --- Sign-in ----------------------------------------------------------------
+  // --- Provider session ----------------------------------------------------------------
 
-  async requestMagicLink(email: string, deviceSecret: string): Promise<MagicLinkRequest> {
-    const raw = await this.call(rawMagicLinkRequest, 'POST', '/v2/authenticate/magic_link/request', {
-      email: email.trim().toLowerCase(),
-      device_secret: deviceSecret,
-    });
-    return mapMagicLinkRequest(raw, this.options.devMagicLinkCode ?? null);
-  }
-
-  async verifyMagicLink(requestId: string, code: string, deviceSecret: string): Promise<Session> {
-    const raw = await this.call(rawAppSession, 'POST', '/v2/authenticate/magic_link/verify', {
-      request_id: requestId,
-      code,
-      device_secret: deviceSecret,
-    });
+  /**
+   * Open a provider session with API credentials (the provider's documented
+   * login). These are Global Connect's credentials, held by the server; the
+   * customer's own sign-in is a separate Global Connect service.
+   */
+  async authenticate(loginId: string, apiKey: string): Promise<void> {
+    const raw = await this.call(rawAuthToken, 'POST', '/v2/authenticate/api', { login_id: loginId, api_key: apiKey });
     this.payeeCache.clear();
-    const { session, token } = mapSession(raw);
-    this.token = token;
-    return session;
+    this.token = raw.auth_token;
   }
 
-  async signOut(): Promise<void> {
+  async closeSession(): Promise<void> {
     const token = this.token;
     // Drop the token first so the app is signed out even if the request fails.
     this.token = null;

@@ -1,33 +1,103 @@
-# Global Connect — client app (front end, mock backend)
+# Global Connect — client app and server
 
-A mobile app for Global Connect business customers: multi-currency balances, account
-details, payments with approval, spot and forward conversion, rates and rate alerts.
+A mobile app for Global Connect business customers (multi-currency balances, account
+details, payments with approval, spot and forward conversion, rates and rate alerts) and
+the Global Connect server it signs in to.
 
-**Everything runs against an in-memory mock. No real API is connected and all data is
-sample data.** Fees, delivery times and regulatory wording are bracketed placeholders.
+**Nothing here is connected to a real provider or a real database. All data is sample
+data, the provider APIs are in-memory mocks and server storage is in memory.** Fees,
+delivery times and regulatory wording are bracketed placeholders.
 
-- Expo SDK 58, React Native 0.88, TypeScript strict, expo-router
-- Runs on iOS, Android and web
+- App: Expo SDK 58, React Native 0.88, TypeScript strict, expo-router; iOS, Android, web
 - TanStack Query for server state, zustand for session and developer settings
 - big.js for all money and rate arithmetic (amounts are decimal strings, never floats)
 - zod validation of every backend response
+- Server (`server/`): Node 22, Fastify, TypeScript strict, node:crypto only (scrypt, HMAC)
+
+The app has two backends, chosen at build time in `src/api/index.ts`:
+
+| `EXPO_PUBLIC_API_URL` | Backend | Sign-in |
+|---|---|---|
+| unset | in-app demo, no server | any email and password, code `000000` (checks nothing real) |
+| set | the Global Connect server | password + authenticator app, step-up on money actions |
 
 ## Run it
 
 ```bash
-npm install
+npm install        # also installs server/ (postinstall)
+```
+
+### Demo with the server: one command
+
+```bash
+npm run demo
+```
+
+This builds the web app with `EXPO_PUBLIC_API_URL=/` and starts the server, which serves
+the web app **and** the API on one port (3001). Open `http://localhost:3001`. Because the
+page and the API share an origin there are no cross-origin requests.
+
+**GitHub Codespaces:** run the same command. The script reads `CODESPACE_NAME` and prints
+the forwarded address (`https://<codespace>-3001.app.github.dev`); open it from the Ports
+tab. The port can stay private. Activation links printed by the server use that address.
+(Not run in a Codespace by us: see "Not production-ready and not verified".)
+
+The server prints activation codes for the three sample users at start-up, in development
+only (never when `NODE_ENV=production`):
+
+| User | Company | Held at |
+|---|---|---|
+| `amira@northfield.example` | Northfield Trading Ltd | provider A (forwards, approvals) |
+| `ben@castlebrook.example` | Castlebrook Imports Ltd | provider B (no forwards, no approvals) |
+| `dana@adviser.example` | both | chooses a company after signing in |
+
+To try it:
+
+1. Open the app, press **Activate a new account** and type the code printed for a user
+   (or open the printed activation link).
+2. Choose a password: at least 12 characters, not a common one.
+3. **Add the account to an authenticator app.** On your phone open Google Authenticator,
+   Microsoft Authenticator, 1Password, Authy or any other TOTP app, choose *add account* /
+   *scan a QR code* and scan the code on screen. If you cannot scan, choose *enter a setup
+   key*, type account name `Global Connect`, the key shown under the QR code, type
+   *time-based*. The app then shows a 6-digit code that changes every 30 seconds.
+4. Type the current 6-digit code to confirm, then save the recovery codes and tick
+   "I have saved these codes".
+5. Sign in with the email, the password and a **new** code (a code works once, so wait
+   for the next one if you just used it to activate).
+6. Send a payment: after the review step the app asks for a fresh 6-digit code.
+
+Everything is in memory: restarting the server forgets the accounts and prints new codes.
+
+To invite again by hand (stands in for an admin tool and for email delivery), set
+`ADMIN_TOKEN` in `server/.env` (see `server/.env.example`), restart the server and run
+`npm --prefix server run invite -- amira@northfield.example`.
+
+### Developing with live reload (two terminals)
+
+```bash
+npm run server                                         # API on :3001
+EXPO_PUBLIC_API_URL=http://localhost:3001 npm run web  # app on :8081
+```
+
+The server's CORS allows only the origins in `CORS_ORIGINS` (default
+`http://localhost:8081`). In Codespaces set `CORS_ORIGINS` and `APP_URL` to the forwarded
+8081 address, `EXPO_PUBLIC_API_URL` to the forwarded 3001 address, and make port 3001
+public (a private forwarded port answers cross-origin requests with a login redirect).
+`npm run demo` avoids all of this.
+
+### In-app demo, no server
+
+```bash
 npm run web        # browser
 npm run ios        # iOS simulator (macOS) or Expo Go
 npm run android    # Android emulator or Expo Go
 ```
 
-On a phone: `npx expo start`, then scan the QR code with Expo Go.
-
-Sign in with any email address, then either press **Complete the link** (a developer
-shortcut shown only on the mock, which sends no email) or type the code
-`SAMPLE-LINK-CODE`. The emailed link itself opens
-`globalconnect://magic-link?request=<id>&code=<code>` (`/magic-link?...` on web), handled
-by `src/app/magic-link.tsx`.
+With `EXPO_PUBLIC_API_URL` unset the app runs entirely on an in-app mock. Sign in with
+any email and any password, code `000000`. The activation screens can be walked through
+with activation code `SAMPLE-ACTIVATION`. **This sign-in checks nothing**; it exists so
+the screens can be shown offline.
 
 ### Checks
 
@@ -36,12 +106,18 @@ npx tsc --noEmit         # typecheck
 npx expo lint            # ESLint
 npx jest                 # unit and screen tests
 npx expo export -p web   # static web build in dist/
+
+cd server
+npm run typecheck
+npm test                 # node:test, 29 tests
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
 `npx serve -s dist`.
 
-## Driving the mock (for testing)
+## Driving the in-app mock (for testing)
+
+Applies only when `EXPO_PUBLIC_API_URL` is unset.
 
 Three ways, all changing the same settings, read on every mock request:
 
@@ -77,30 +153,48 @@ leaves the pending list and appears in activity. Reloading the page resets it.
 ## Architecture
 
 ```
-src/
-  app/            expo-router routes only (thin files that export a screen)
-  screens/        one component per screen
-  components/     UI kit (AppText, Button, Card, Screen, QueryState, ...)
-  hooks/          queries.ts (all server state), useHeldQuote, useOutcomeCheck, useSingleFlight
-  api/
-    types.ts      provider-NEUTRAL domain types
-    provider.ts   ProviderClient interface
-    errors.ts     ProviderError: the only error type that leaves the API layer
-    index.ts      THE one factory that picks the backend
-    mockControls.ts
+src/                app (Expo)
+  app/              expo-router routes only (thin files that export a screen)
+  screens/          one component per screen (SignInScreen, ActivateScreen, ...)
+  components/       UI kit, QrCode, Overlays (confirm dialog, authenticator-code dialog, toast)
+  hooks/            queries.ts (all server state), useHeldQuote, useOutcomeCheck, useSingleFlight
+  api/              SHARED WITH THE SERVER (imported by server/, never copied)
+    types.ts        provider-NEUTRAL domain types
+    provider.ts     ProviderClient: account data and money actions
+    auth.ts         AuthClient: sign-in, activation, step-up
+    schemas.ts      zod schemas of the neutral shapes (app validates responses, server validates requests)
+    canonical.ts    canonical JSON, so "the same payload" hashes the same on both sides
+    errors.ts       ProviderError: the only error type that leaves the API layer
+    index.ts        THE one factory that picks the backend
     adapters/
-      currencycloudMock.ts        wires the client to the in-memory server
-      currencycloud/
-        raw.ts         zod schemas of the wire shapes
-        mapping.ts     raw -> neutral (pure, tested)
-        client.ts      ProviderClient over a Transport (validates, maps)
-        transport.ts   the seam: request in, status + body text out
-        mockServer.ts  in-memory backend with sample data
-  alerts/         AlertsStore interface + local (on-device) implementation
-  config/         disclosures.ts (all placeholder wording), app.ts, env.ts
-  lib/            money, quote expiry, validation, dates, confirmAction, inactivity, online
-  state/          session, devSettings, confirm dialog, toast
-  theme/          brand tokens
+      globalConnectApi.ts   ProviderClient + AuthClient over HTTP to the server
+      demoBackend.ts        in-app demo: the client below + a stand-in sign-in
+      currencycloud/        provider A: raw.ts (wire schemas), mapping.ts, client.ts,
+                            transport.ts, mockServer.ts
+  lib/              money, quote expiry, validation, confirmAction, inactivity, online
+  state/            session, confirm dialog, step-up dialog, toast, devSettings
+  config/           disclosures.ts (all placeholder wording), app.ts, env.ts
+server/
+  src/
+    config.ts       environment -> settings (provider credentials, CORS, timeouts, flags)
+    crypto.ts       scrypt passwords, TOTP (RFC 6238), base32, tokens
+    auth/service.ts invitations, activation, login, lockout, sessions, step-up
+    store/          types.ts (repository interfaces), memory.ts, seed.ts  <- PLACEHOLDER storage
+    providers/
+      adapter.ts          ProviderAdapter (= the app's ProviderClient + capabilities), registry
+      currencycloud.ts    provider A: reuses src/api/adapters/currencycloud
+      equals/             provider B: raw.ts, mockServer.ts, adapter.ts
+    http/app.ts     the REST API
+    cli/invite.ts   npm run invite -- <email>
+  test/             node:test
+scripts/demo.mjs    npm run demo
+metro.config.js     leaves the in-app demo (and provider A's code) out of server builds
+```
+
+```
+app ──HTTPS──> Global Connect server ──> directory: user -> company -> provider + account id
+ (never sees      │  sign-in, 2FA, sessions, step-up        │
+  a provider)     └──> ProviderAdapter for that company ────┴──> provider A API | provider B API
 ```
 
 Rules the code follows:
@@ -159,56 +253,139 @@ Send payment, approve, reject and convert all follow the same rules:
    does not say "sent" for a payment that is waiting for approval, failed or of unknown
    status, and it says when further approvals are still needed.
 
-**Second-factor seam.** `confirmAction()` is the single place a real second factor plugs
-in. Today it is only an in-app confirm step, which is **not** strong customer
-authentication. Payments will need a real second factor, as the provider and regulation
-require; add it inside `confirmAction()` and every money action picks it up. It has not
-been built.
+**Second factor.** `confirmAction()` is still the single gate. After the review step it
+asks for a 6-digit authenticator code for every action the session lists in
+`stepUpActions` (see "Step-up" below). Single flight, idempotency keys, the pre-send
+record and the outcome check are unchanged: the code is asked for before anything is
+recorded or sent, and the idempotency key is chosen before the dialog so the code can be
+bound to it. Adding a payee now goes through `confirmAction()` too. Whether this meets
+the provider's and the regulator's definition of strong customer authentication has not
+been assessed.
 
-### Sign-in and sessions
+## Accounts, sign-in and step-up (server)
 
-- Sign-in is an emailed link or code every time. There is no device unlock of any kind.
-- **A link only works on the device that asked for it.** When a link is requested the
-  device makes up a random secret (`expo-crypto`), sends it with the request and keeps it
-  in device storage until sign-in completes; verification needs the same secret. A link
-  opened anywhere else is refused before anything is sent.
-- **A link never replaces a session silently.** If someone is already signed in, the
-  deep-link screen asks: stay signed in, or sign out and use the link.
-- Nothing that can start a session is stored on the device. The session token lives in
-  memory only, so closing the app or reloading the page signs you out.
-- Sign-out ends the provider session, clears cached data, deletes that user's saved rate
-  alerts and any unfinished sign-in secret. With no money movement in doubt, device
-  storage is empty afterwards. The one thing that can remain is the pending record of a
-  money movement whose outcome is still unknown (key and signature, per user).
-- After 2 minutes in the background (`INACTIVITY_LOCK_MS`) the app signs out and returns
-  to the email sign-in. Because sign-out deletes alerts, alerts do not survive this
-  either. That is the current default pending a product decision. On web, `AppState`
-  only fires when the tab is hidden and shown again.
+### Accounts are invite-only
 
-## Replacing the mock adapter with a real one
+There is no sign-up endpoint. Operations add the person to the directory (users,
+companies, memberships with a role: `creator`, `approver` or `admin`; the seed file
+stands in for an admin tool) and issue an activation code:
 
-1. Write a `Transport` (`src/api/adapters/currencycloud/transport.ts`) that calls the
-   provider over HTTPS: `params` as a query string for GET and form data for POST, the
-   token in `X-Auth-Token`. Resolve for any HTTP status; reject only when no response
-   arrives.
-2. In `src/api/index.ts`, change `createProviderBackend()` to return
-   `new CurrencycloudClient(yourTransport, { planName })` with `isMock: false`.
-   That is the only file in the app that names an adapter.
-3. Replace the parts marked **NOT PART OF THE PROVIDER API** (below) with real services.
-   This is real work, not a one-line change: sign-in needs a Global Connect auth service
-   that emails the link/code and answers the two `magic_link` endpoints, and the
-   sparklines need a rate-history source. The sign-in screen and the deep-link route
-   already work against any backend that implements `requestMagicLink` and
-   `verifyMagicLink`; only the "Complete the link" shortcut is mock-only, and it is
-   hidden when the backend does not supply a `devCode`.
+1. `POST /v1/activation/start {activationCode}` → email, name, password policy.
+2. `POST /v1/activation/password {activationCode, password}` → policy check (12+
+   characters, not on a short common-password list), scrypt hash held with the
+   invitation, a new TOTP key returned as `otpauth://` URI and base32 text.
+3. `POST /v1/activation/confirm {activationCode, code}` → needs a correct code from the
+   authenticator; only then are password and key written to the user, the invitation is
+   deleted and 10 one-time recovery codes are returned (stored as SHA-256 hashes).
 
-In practice a mobile app must not hold provider API keys, so the real transport should
-talk to a Global Connect backend that proxies the provider. The interface does not change.
+Activation codes are random (100 bits), stored hashed, expire after 72 hours and are
+replaced by a newer invitation. Unknown, expired and used codes get the same answer.
 
-For a different provider, implement `ProviderClient` directly and return it from the same
-factory.
+### Login
 
-## How closely the mock follows Currencycloud
+1. `POST /v1/auth/login {email, password}` → `{challengeId}`. Unknown email, wrong
+   password and not-yet-activated account return the same body and status and each cost
+   one scrypt verification (a dummy hash is checked when there is no account).
+2. `POST /v1/auth/login/verify {challengeId, code, method: totp|recovery}` → an opaque
+   session token (256 random bits; only its SHA-256 is stored), the user, their
+   companies and, if there is exactly one company, the session. Otherwise
+   `POST /v1/session/company {companyId}` selects one (only a company the person
+   belongs to; anything else is `not_found`).
+
+- **TOTP**: RFC 6238, SHA-1, 30 s, 6 digits (tested against the RFC vectors). The current
+  step ±1 is accepted. The newest accepted step is stored per user and any code at or
+  before it is refused, so a code cannot be replayed, including across login and step-up.
+- **Lockout**: failures are counted per email (password) and per user (codes), whether or
+  not the account exists. After 5 failures the check is refused for 1 minute, doubling
+  with each further failure up to 1 hour; success clears the count. A challenge is spent
+  after 5 wrong codes or 5 minutes. On top of that, each address gets 30 requests a
+  minute on the sign-in, activation and step-up routes.
+- **Sessions**: 15 minutes idle, 12 hours absolute, revoked by `POST /v1/auth/logout`.
+  Membership is re-read on every request.
+- **Logging**: method, URL and status only. Bodies and headers are never logged; no
+  secret appears in a URL.
+
+### Step-up on money actions
+
+Creating a payment, approving, rejecting and adding a payee need a fresh code. Booking a
+conversion between the client's own balances does not, unless `STEP_UP_CONVERSIONS=1`.
+
+1. `POST /v1/step-up {action, payload, code}` → a one-time token valid for 2 minutes,
+   stored hashed with the user, the session, the action and SHA-256 of the canonical
+   JSON of the payload.
+2. The action request carries it in `X-Step-Up-Token`. The server recomputes the hash
+   from what was actually sent (body plus idempotency key, or the payment id) and
+   refuses a missing (`step_up_required`), expired, reused, other-session, other-action
+   or other-payload token (`step_up_invalid`). A token is destroyed the first time it is
+   presented, whether or not it fits.
+
+In the app, `confirmAction()` shows the review, then the code dialog; wrong, reused and
+locked-out codes keep the dialog open with a plain message, and the API client attaches
+the token only to the request whose payload matches exactly.
+
+With `STEP_UP_CONVERSIONS=1` the code has to be typed while the quote is still held
+(30 s on provider A's mock, 12 s on provider B's), which is tight. That is why it is off.
+
+### Provider routing and isolation
+
+- The session holds a company id. Every data route resolves the adapter from **that**
+  company's directory entry (`ProviderRegistry.forCompany`). No route reads a company,
+  account or provider id from the request; a test passes them and shows they do nothing.
+- Each adapter instance is built for one company and puts that company's provider
+  account id on its calls itself.
+- `capabilities` (`forwardContracts`, `paymentApprovals`) come from the adapter and are
+  returned in the session. The app hides the Forward option, the forward list and the
+  approvals list when unsupported, and the server refuses them as well.
+- Responses contain only neutral shapes. Errors are `{error: {kind, reason?, fields?}}`
+  with the app's existing kinds; upstream error text is never forwarded and a provider
+  refusing the server's credentials is reported as `server`, not as the customer's
+  session ending. A test scans every response for provider names and account ids.
+- Provider credentials come from environment variables only (`server/.env.example`).
+- Idempotency keys travel in `Idempotency-Key` and are passed to the provider.
+
+### In the app
+
+- Sign-in screen: email and password, then the 6-digit code (or "Use a recovery code"),
+  then a company picker when there are several. Activation: `/activate` (or
+  `/activate?code=...` from the link).
+- The session token lives in memory inside the API client. Nothing that can start a
+  session is stored on the device; closing the app or reloading the page signs you out.
+- Sign-out revokes the session on the server, clears cached data and deletes that user's
+  saved rate alerts. The one thing that can remain on the device is the pending record of
+  a money movement whose outcome is still unknown (key and signature, per user).
+- After 2 minutes in the background (`INACTIVITY_LOCK_MS`) the app signs out. There is no
+  device unlock of any kind.
+
+## Replacing the placeholders
+
+### A real provider adapter
+
+- **Provider A**: write a `Transport` (`src/api/adapters/currencycloud/transport.ts`)
+  that calls the provider over HTTPS (`params` as a query string for GET and form data
+  for POST, the token in `X-Auth-Token`; resolve for any HTTP status, reject only when no
+  response arrives) and pass it as `transportFor` to `currencycloudFactory` in
+  `server/src/index.ts`. The client must also send `on_behalf_of` with the company's
+  contact id on every call so one set of API credentials acts for the right client; it
+  does not do that yet. The rate-history endpoint is not part of the provider API.
+- **Provider B**: write an `EqualsTransport` (`server/src/providers/equals/raw.ts`) and
+  pass it as `transportFor` to `equalsFactory`. Then go through `raw.ts` and replace
+  every shape marked INVENTED with the documented one.
+- **Another provider**: implement `ProviderAdapter`, add its key to `ProviderKey` and a
+  factory to the registry in `server/src/index.ts`.
+
+### A real database
+
+Implement `Directory` and `AuthStore` from `server/src/store/types.ts` and pass them to
+`buildApp`. Things the in-memory version gets away with that a database must do properly:
+encrypt TOTP keys at rest; make "accept this TOTP step" and "spend this step-up token"
+atomic (compare-and-set), since two simultaneous requests could both pass today; expire
+rows; move the issued-quote map (`http/app.ts`) and provider B's key→order map
+(`equals/adapter.ts`) into it; share the rate-limit and lockout counters between server
+instances.
+
+## How closely the mocks follow the real APIs
+
+### Provider A (Currencycloud-shaped)
 
 Checked on 2026-11-10 against the public OpenAPI spec
 (`github.com/currencycloud/currencycloud-swagger`, `src/reference.yaml`) and the public
@@ -226,7 +403,7 @@ Nothing was tested against a live or sandbox API. Known approximations:
 
 | Area | Status |
 |---|---|
-| Magic-link sign-in (`/v2/authenticate/magic_link/request`, `/verify`, with a `device_secret`) | **Not part of the provider API.** The provider logs in with `login_id` + `api_key`. Global Connect needs its own auth service, which must also enforce the device secret. |
+| Sign-in | The client logs in with `login_id` + `api_key` at `/v2/authenticate/api`, as the provider documents. The customer's own sign-in is the Global Connect server. |
 | Rate history for sparklines (`/v2/rates/history`) | **Not part of the provider API.** Invented endpoint, synthetic points. Needs a market-data source. |
 | Error codes `quote_expired` and `insufficient_funds` | Invented by the mock. The public spec does not list the real codes. |
 | Reconciliation by key | `unique_request_id` is a documented filter on `/v2/payments/find` and `/v2/conversions/find`. Whether a real conversion booked with `quote_id` replays on a repeated `unique_request_id` is unconfirmed. |
@@ -241,6 +418,24 @@ Nothing was tested against a live or sandbox API. Known approximations:
 | Payment `reason` | Required by the provider; the app sends the reference until the product decides what to ask. |
 | Mock pricing | Sample mid rate, no spread, bid = offer. |
 | `bank_name` on funding accounts | Deliberately not mapped, because it would show the provider's name. |
+
+### Provider B (Equals-shaped)
+
+Modelled on the public Equals Money documentation (`docs.equalsmoney.com`), read on
+2026-11-11 through page summaries, not the raw OpenAPI file. **Partly real, partly
+invented**, and marked line by line in `server/src/providers/equals/raw.ts`:
+
+| Taken from the public docs | Invented by this mock (pages not read) |
+|---|---|
+| `GET /v2/budgets?accountId=&include=balance` with `limit/offset/count/rows` and the `balance[]` fields | the inner fields of `settlementDetails` |
+| `POST /v2/orders/quote` request and response (`quoteRequestId`, `orderId`, `settlement`, `quote`), 12-second validity | listing recipients (`GET /v2/recipients`) |
+| `POST /v2/orders/trade` `{orderId, quoteRequestId}` | single-currency payment orders, listing and looking up orders |
+| `POST /v2/recipients/validate`, then `/v2/recipients/{id}/confirm` → `AUTHORISED` | account activity, indicative rates, the error body |
+| `Authorization: ApiKey …`, amounts as JSON numbers, `YYYYMMDD` dates | idempotency (the docs read did not mention any; the mock treats a repeated order id / client reference as the same order) |
+
+Nothing was tested against a live or sandbox API. Provider B's capabilities here (no
+forwards, no payment approvals) are a choice made for the demo, not a statement about
+the real product. No rate history is offered, so no trend line is drawn.
 
 ## What is placeholder
 
@@ -258,7 +453,9 @@ Nothing was tested against a live or sandbox API. Known approximations:
   is ever sent.
 - **App icon and splash**: the Expo template images.
 - **Developer panel**: shown whenever the mock backend is active. Hide it before release.
-- **Confirmation of money movements**: an in-app confirm step only. See "Second-factor seam".
+- **Server storage**: in memory, with a seed directory of made-up people and companies.
+- **Both provider APIs**: in-memory mocks.
+- **The in-app demo sign-in**: accepts anything; code `000000`.
 
 ## Compliance guards
 
@@ -272,15 +469,51 @@ Nothing was tested against a live or sandbox API. Known approximations:
   `src/config/disclosures.ts`, and every value there must stay a bracketed placeholder;
 - any leftover device-unlock code, copy or dependency (the feature was removed).
 
+`secureTextEntry` (the platform's name for a password field) is the one allowed use of
+that word. The sign-in is not described with any assurance wording in the app; that slot
+is the placeholder `disclosures.signInAssurance`.
+
 Also: no analytics and no third-party network calls (Inter is bundled, so there is no
 runtime font request), and no secrets in the repo (the `EXPO_PUBLIC_*` variables are
 developer switches).
 
+## Not production-ready and not verified
+
+Not built:
+
+- **Email delivery** of activation links. Codes are printed to the console in development
+  and returned by the `invite` command.
+- **Account recovery** when a phone and the recovery codes are both lost; password
+  change and reset; re-enrolling an authenticator; regenerating recovery codes. An
+  activated account cannot be re-invited.
+- **Admin tool**: users, companies, memberships and roles exist only as seed data. The
+  `/admin/invites` endpoint guarded by one shared token is a stand-in, not a design.
+- **Audit log**: no record of sign-ins, step-ups or money actions is kept.
+- **Secrets management**: credentials are plain environment variables; TOTP keys are
+  held unencrypted in memory.
+- **Database**: see "A real database". Everything is lost on restart.
+- **Hosting**: no TLS termination, deployment, monitoring, backups or multi-instance
+  support. Rate limits and lockouts are per process. Behind a proxy set `TRUST_PROXY=1`
+  or every client shares one address for rate limiting.
+- **Penetration testing and security review**: none. The login design follows common
+  practice but nobody independent has attacked it. Response *content* is uniform across
+  known and unknown emails and both paths do one scrypt verification, but timing was not
+  measured. Lockout by email lets someone who knows an address lock its owner out.
+- **Provider approval**: no provider has reviewed or approved this flow, the step-up as
+  their required customer authentication, or the use of their API in this way.
+- The common-password list is about twenty entries.
+
+Not verified by us:
+
+- GitHub Codespaces: `npm run demo` was run locally only.
+- The web app driven in a browser against the server: the server flow was exercised
+  with a script over HTTP and the screens with Jest against the in-app demo.
+- A real authenticator app scanning the QR code. The URI is the standard `otpauth://`
+  form and the codes match the RFC 6238 test vectors.
+- Any physical or simulated iOS or Android device.
+
 ## Known limits
 
-- **No second factor.** Money movements are confirmed by a tap in an in-app dialog.
-- **Not run on a physical or simulated iOS or Android device.** Verified with Jest and by
-  driving the exported web build in headless Chrome.
 - **The processing window is a guess.** `outcomeCheckTiming` (90 s) must be set from what
   the provider says about how late a timed-out request can still be applied. If a request
   lands after the window, the app will have released the form. Retrying the *same*
@@ -288,9 +521,6 @@ developer switches).
   after that could produce two movements.
 - **Approve and reject are not recorded before sending**, only payments and conversions.
   They are safe to repeat, and the review screen re-reads the payment before acting.
-- **Sign-in wording.** The button now reads "Send login link". The brief's "Send secure
-  login link" was removed because "secure" is a claim; the tagline and any assurance
-  wording are placeholders in `disclosures.ts`.
 - **Device clock.** The quote countdown uses the hold length from the server, started
   when the answer arrives on the device, so a wrong device clock does not shift it.
   Network delay still makes the app's countdown end slightly after the server's; the app

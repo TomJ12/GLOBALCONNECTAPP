@@ -30,6 +30,7 @@ import { formatDate } from '@/lib/dates';
 import { formatMoney, formatRate } from '@/lib/money';
 import { requestConfirmation } from '@/state/confirm';
 import { colors, sizes, spacing } from '@/theme';
+import { useCapabilities } from '@/state/session';
 
 function RateRow({ base, quote }: { base: string; quote: string }) {
   const router = useRouter();
@@ -164,6 +165,7 @@ function ForwardCard({ forward }: { forward: ForwardContract }) {
 export function RatesScreen() {
   const router = useRouter();
   const alerts = useAlerts();
+  const capabilities = useCapabilities();
   const forwards = useForwardContracts();
 
   return (
@@ -172,7 +174,7 @@ export function RatesScreen() {
       header={<Header title="Rates" leading="none" trailing={isMockBackend() ? <SampleDataPill /> : undefined} />}
       onRefresh={() => {
         void alerts.refetch();
-        void forwards.refetch();
+        if (capabilities.forwardContracts) void forwards.refetch();
       }}
       refreshing={forwards.isRefetching}
     >
@@ -222,23 +224,25 @@ export function RatesScreen() {
         </QueryState>
       </View>
 
-      <View style={{ marginBottom: spacing.lg }}>
-        <SectionHeader title="Forward contracts" />
-        <QueryState
-          query={forwards}
-          skeleton={<SkeletonList rows={1} label="Loading forward contracts" />}
-          isEmpty={(data) => data.length === 0}
-          empty={<EmptyState title="No forward contracts" body="Forwards you book in Convert will appear here." />}
-        >
-          {(data) => (
-            <View style={{ gap: spacing.md }}>
-              {data.map((forward) => (
-                <ForwardCard key={forward.id} forward={forward} />
-              ))}
-            </View>
-          )}
-        </QueryState>
-      </View>
+      {capabilities.forwardContracts ? (
+        <View style={{ marginBottom: spacing.lg }}>
+          <SectionHeader title="Forward contracts" />
+          <QueryState
+            query={forwards}
+            skeleton={<SkeletonList rows={1} label="Loading forward contracts" />}
+            isEmpty={(data) => data.length === 0}
+            empty={<EmptyState title="No forward contracts" body="Forwards you book in Convert will appear here." />}
+          >
+            {(data) => (
+              <View style={{ gap: spacing.md }}>
+                {data.map((forward) => (
+                  <ForwardCard key={forward.id} forward={forward} />
+                ))}
+              </View>
+            )}
+          </QueryState>
+        </View>
+      ) : null}
     </Screen>
   );
 }

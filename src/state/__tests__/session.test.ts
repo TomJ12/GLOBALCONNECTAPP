@@ -1,17 +1,15 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { alertsStorageKey, getAlertsStore } from '@/alerts';
-import { getProviderClient } from '@/api';
+import { getAuthClient, getProviderClient } from '@/api';
 import { ProviderError } from '@/api/errors';
 import { createInactivityHandler } from '@/lib/inactivity';
 import { queryClient } from '@/lib/queryClient';
 import { useSession } from '@/state/session';
-import { installMockBackend, TEST_DEVICE_SECRET } from '@/test/utils';
+import { installMockBackend, startTestSession } from '@/test/utils';
 
 async function signInThroughStore(email = 'finance@example.com'): Promise<void> {
-  const client = getProviderClient();
-  const link = await client.requestMagicLink(email, TEST_DEVICE_SECRET);
-  useSession.getState().startSession(await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET));
+  await startTestSession(email);
 }
 
 describe('session', () => {
@@ -36,8 +34,9 @@ describe('session', () => {
     await signInThroughStore();
     await getAlertsStore('finance@example.com').create({ base: 'EUR', quote: 'USD', direction: 'above', targetRate: '1.2' });
     const session = useSession.getState().session;
-    // The session holds who the user is and no credential of any kind.
-    expect(Object.keys(session ?? {})).toEqual(['user']);
+    // The session holds who the user is and what they may do, and no credential of any kind.
+    expect(Object.keys(session ?? {}).sort()).toEqual(['capabilities', 'company', 'role', 'stepUpActions', 'user']);
+    expect(JSON.stringify(session)).not.toMatch(/token|password|secret/i);
     await useSession.getState().signOut();
 
     const keys = await AsyncStorage.getAllKeys();
@@ -46,11 +45,10 @@ describe('session', () => {
     expect(everything).not.toMatch(/token|credential|device|secret|finance@example\.com/);
     // With no money movement in doubt, sign-out leaves the device storage empty.
     expect(keys).toEqual([]);
-    // The only way back in is a new emailed link.
-    const client = getProviderClient() as unknown as Record<string, unknown>;
-    const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(client));
-    expect(methods).toContain('verifyMagicLink');
-    expect(methods.filter((name) => /resume|unlock|device/i.test(name))).toEqual([]);
+    // The only way back in is the password and a new code: nothing resumes or unlocks a session.
+    const methods = Object.keys(getAuthClient()).concat(Object.getOwnPropertyNames(Object.getPrototypeOf(getProviderClient())));
+    expect(methods).toContain('completeSignIn');
+    expect(methods.filter((name) => /resume|unlock|device|magic/i.test(name))).toEqual([]);
     await expect(getProviderClient().listBalances()).rejects.toMatchObject({ kind: 'unauthorized' });
   });
 

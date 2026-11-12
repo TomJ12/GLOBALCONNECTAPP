@@ -7,7 +7,7 @@ import { ConvertScreen } from '@/screens/ConvertScreen';
 import { useSession } from '@/state/session';
 import * as confirmModule from '@/lib/confirmAction';
 import { pendingStorageKey } from '@/lib/pendingOutcome';
-import { installMockBackend, renderScreen, setControls, setOutcomeTiming, signIn, sleep, TEST_DEVICE_SECRET } from '@/test/utils';
+import { installMockBackend, renderScreen, setControls, setOutcomeTiming, signIn, sleep, startTestSession } from '@/test/utils';
 
 const expoRouter = jest.requireMock<{ __setFocused: (focused: boolean) => void }>('expo-router');
 
@@ -292,9 +292,7 @@ describe('ConvertScreen', () => {
   it('records the attempt on the device BEFORE sending, so closing the app mid-request cannot lose it', async () => {
     const client = getProviderClient();
     const real = client.bookConversion.bind(client);
-    const link = await client.requestMagicLink('finance@example.com', TEST_DEVICE_SECRET);
-    const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET);
-    useSession.getState().startSession(session);
+    const session = await startTestSession();
     const storageKey = pendingStorageKey('conversion', session.user.id);
 
     // The server books it, but this app never hears back (as if it were closed mid-request).
@@ -413,9 +411,7 @@ describe('ConvertScreen', () => {
   // --- M4: a 401 while quoting ends the session ---
 
   it('signs the user out when quoting returns 401', async () => {
-    const client = getProviderClient();
-    const link = await client.requestMagicLink('finance@example.com', TEST_DEVICE_SECRET);
-    useSession.getState().startSession(await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET));
+    await startTestSession();
     await renderScreen(<ConvertScreen />);
     setControls({ forcedError: 'unauthorized' });
     await typeSellAmount('500');

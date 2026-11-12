@@ -184,13 +184,19 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
     const details = `${amount} to ${payee}${accountLine ? `, ${accountLine}` : ''}. Reference ${payment.reference}.`;
     const confirmed =
       kind === 'approve'
-        ? await confirmAction({ title: 'Approve this payment?', message: details, confirmLabel: 'Approve payment' })
+        ? await confirmAction({
+            title: 'Approve this payment?',
+            message: details,
+            confirmLabel: 'Approve payment',
+            stepUp: { action: 'payment.approve', payload: { paymentId: payment.id } },
+          })
         : await confirmAction({
             title: 'Reject this payment?',
             message: `${details} It will be cancelled. This cannot be undone.`,
             confirmLabel: 'Reject payment',
             cancelLabel: 'Keep payment',
             tone: 'danger',
+            stepUp: { action: 'payment.reject', payload: { paymentId: payment.id } },
           });
     if (!confirmed) return;
     const startedAt = Date.now();

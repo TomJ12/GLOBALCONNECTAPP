@@ -48,7 +48,8 @@ describe('compliance guards', () => {
           .split('\n')
           .forEach((line, index) => {
             // Only text a customer could see: skip comment lines.
-            if (!/^\s*(\/\/|\*|\/\*)/.test(line) && claims.test(line)) offenders.push(`${path.relative(SRC, file)}:${index + 1}`);
+            // `secureTextEntry` is the platform's name for a password field, not wording a customer sees.
+            if (!/^\s*(\/\/|\*|\/\*)/.test(line) && claims.test(line.replace(/secureTextEntry/g, ''))) offenders.push(`${path.relative(SRC, file)}:${index + 1}`);
           });
       }
     }

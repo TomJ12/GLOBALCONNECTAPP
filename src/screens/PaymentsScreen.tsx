@@ -13,12 +13,14 @@ import { SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { uniqueById, usePayments, usePendingApprovals } from '@/hooks/queries';
 import { useIsOnline } from '@/lib/online';
+import { useCapabilities } from '@/state/session';
 import { colors, spacing } from '@/theme';
 
 import { PaymentRow } from './shared';
 
 export function PaymentsScreen() {
   const router = useRouter();
+  const capabilities = useCapabilities();
   const approvals = usePendingApprovals();
   const payments = usePayments();
   const online = useIsOnline();
@@ -28,7 +30,7 @@ export function PaymentsScreen() {
       edges={['top', 'left', 'right']}
       header={<Header title="Payments" leading="none" />}
       onRefresh={() => {
-        void approvals.refetch();
+        if (capabilities.paymentApprovals) void approvals.refetch();
         void payments.refetch();
       }}
       refreshing={approvals.isRefetching || (payments.isRefetching && !payments.isFetchingNextPage)}
@@ -39,29 +41,31 @@ export function PaymentsScreen() {
         onPress={() => router.push('/payments/new')}
       />
 
-      <View>
-        <SectionHeader title="Needs your approval" />
-        <QueryState
-          query={approvals}
-          skeleton={<SkeletonList rows={1} label="Loading payments waiting for approval" />}
-          isEmpty={(data) => data.length === 0}
-          empty={<EmptyState title="Nothing to approve" body="Payments that need your approval will appear here." />}
-        >
-          {(data) => (
-            <Card padded={false}>
-              {data.map((approval, index) => (
-                <View key={approval.payment.id}>
-                  {index > 0 ? <Divider /> : null}
-                  <PaymentRow
-                    payment={approval.payment}
-                    onPress={() => router.push({ pathname: '/payments/[id]', params: { id: approval.payment.id } })}
-                  />
-                </View>
-              ))}
-            </Card>
-          )}
-        </QueryState>
-      </View>
+      {capabilities.paymentApprovals ? (
+        <View>
+          <SectionHeader title="Needs your approval" />
+          <QueryState
+            query={approvals}
+            skeleton={<SkeletonList rows={1} label="Loading payments waiting for approval" />}
+            isEmpty={(data) => data.length === 0}
+            empty={<EmptyState title="Nothing to approve" body="Payments that need your approval will appear here." />}
+          >
+            {(data) => (
+              <Card padded={false}>
+                {data.map((approval, index) => (
+                  <View key={approval.payment.id}>
+                    {index > 0 ? <Divider /> : null}
+                    <PaymentRow
+                      payment={approval.payment}
+                      onPress={() => router.push({ pathname: '/payments/[id]', params: { id: approval.payment.id } })}
+                    />
+                  </View>
+                ))}
+              </Card>
+            )}
+          </QueryState>
+        </View>
+      ) : null}
 
       <View style={{ marginBottom: spacing.lg, gap: spacing.md }}>
         <SectionHeader title="Recent payments" />

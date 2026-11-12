@@ -16,18 +16,7 @@ export interface Money {
   currency: CurrencyCode;
 }
 
-// --- Auth -------------------------------------------------------------------
-
-export interface MagicLinkRequest {
-  requestId: string;
-  email: string;
-  expiresAt: IsoDateTime;
-  /**
-   * Only ever set by a mock backend, so the sign-in screen can offer a
-   * "complete the link" shortcut. A real backend emails the code instead.
-   */
-  devCode: string | null;
-}
+// --- Sign-in, activation and step-up ------------------------------------------
 
 export interface SessionUser {
   id: string;
@@ -35,8 +24,66 @@ export interface SessionUser {
   displayName: string;
 }
 
+/** A company the signed-in person can act for. */
+export interface CompanyOption {
+  id: string;
+  name: string;
+}
+
+export type UserRole = 'creator' | 'approver' | 'admin';
+
+/** What the selected company's account supports. The app hides what is not supported. */
+export interface Capabilities {
+  forwardContracts: boolean;
+  paymentApprovals: boolean;
+}
+
+/** Actions that can need a fresh authenticator code. */
+export type StepUpAction = 'payment.create' | 'payment.approve' | 'payment.reject' | 'beneficiary.create' | 'conversion.book';
+
+/** A signed-in person acting for one company. */
 export interface Session {
   user: SessionUser;
+  company: CompanyOption;
+  role: UserRole;
+  capabilities: Capabilities;
+  /** Actions the backend will refuse without a fresh authenticator code. */
+  stepUpActions: StepUpAction[];
+}
+
+/** Password accepted; a code from the authenticator app is needed next. */
+export interface LoginChallenge {
+  challengeId: string;
+}
+
+export type CodeMethod = 'totp' | 'recovery';
+
+/** Signed in. `session` is null until a company is chosen (only when there are several). */
+export interface SignInResult {
+  user: SessionUser;
+  companies: CompanyOption[];
+  session: Session | null;
+}
+
+export interface PasswordPolicy {
+  minLength: number;
+}
+
+export interface ActivationStart {
+  email: string;
+  displayName: string;
+  passwordPolicy: PasswordPolicy;
+}
+
+/** What the authenticator app needs: scan `otpauthUri` as a QR code or type `secret`. */
+export interface TotpEnrolment {
+  otpauthUri: string;
+  secret: string;
+}
+
+export interface ActivationResult {
+  /** Shown once. Each works one time in place of an authenticator code at sign-in. */
+  recoveryCodes: string[];
 }
 
 export interface CompanyProfile {

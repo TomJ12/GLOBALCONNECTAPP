@@ -13,11 +13,9 @@ import {
 } from '@tanstack/react-query';
 
 import { getAlertsStore, type NewRateAlert } from '@/alerts';
-import { getProviderClient } from '@/api';
-import { ProviderError } from '@/api/errors';
-import type { BookConversionRequest, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
-import { clearSignInAttempt, loadSignInAttempt, newDeviceSecret, saveSignInAttempt } from '@/lib/signInAttempt';
-import { useSession } from '@/state/session';
+import { getAuthClient, getProviderClient } from '@/api';
+import type { BookConversionRequest, CodeMethod, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
+import { useCapabilities, useSession } from '@/state/session';
 
 export const queryKeys = {
   company: ['company'] as const,
@@ -145,36 +143,35 @@ export function uniqueById<T extends { id: string }>(items: readonly T[]): T[] {
   return items.filter((item) => (seen.has(item.id) ? false : (seen.add(item.id), true)));
 }
 
-// --- Sign-in ------------------------------------------------------------------
+// --- Sign-in and activation ----------------------------------------------------
 
-/** Asks for a login link and remembers, on this device only, the secret that goes with it. */
-export function useRequestMagicLink() {
+/** Step 1: email and password. */
+export function useSignIn() {
+  return useMutation({ mutationFn: (input: { email: string; password: string }) => getAuthClient().signIn(input.email, input.password) });
+}
+
+/** Step 2: a code from the authenticator app, or a recovery code. */
+export function useCompleteSignIn() {
   return useMutation({
-    mutationFn: async (email: string) => {
-      const secret = newDeviceSecret();
-      const link = await getProviderClient().requestMagicLink(email, secret);
-      await saveSignInAttempt({ requestId: link.requestId, secret });
-      return link;
-    },
+    mutationFn: (input: { challengeId: string; code: string; method: CodeMethod }) =>
+      getAuthClient().completeSignIn(input.challengeId, input.code, input.method),
   });
 }
 
-/**
- * Completes a login link or code. Only works on the device that asked for it:
- * without the matching secret stored here, it is refused before anything is sent.
- */
-export function useVerifyMagicLink() {
-  return useMutation({
-    mutationFn: async (input: { requestId: string; code: string }) => {
-      const attempt = await loadSignInAttempt();
-      if (!attempt || attempt.requestId !== input.requestId) {
-        throw new ProviderError('forbidden', { detail: 'Login link was not requested on this device' });
-      }
-      const session = await getProviderClient().verifyMagicLink(input.requestId, input.code, attempt.secret);
-      await clearSignInAttempt();
-      return session;
-    },
-  });
+export function useSelectCompany() {
+  return useMutation({ mutationFn: (companyId: string) => getAuthClient().selectCompany(companyId) });
+}
+
+export function useBeginActivation() {
+  return useMutation({ mutationFn: (activationCode: string) => getAuthClient().beginActivation(activationCode) });
+}
+
+export function useSetActivationPassword() {
+  return useMutation({ mutationFn: (password: string) => getAuthClient().setActivationPassword(password) });
+}
+
+export function useConfirmActivation() {
+  return useMutation({ mutationFn: (code: string) => getAuthClient().confirmActivation(code) });
 }
 
 // --- Reconciliation after an unknown outcome ------------------------------------
@@ -189,15 +186,20 @@ export function useFindPaymentByKey() {
   return useMutation({ mutationFn: (idempotencyKey: string) => getProviderClient().findPaymentByIdempotencyKey(idempotencyKey) });
 }
 
+/** Not asked for at all when the account has no payment approvals. */
 export function usePendingApprovals() {
+  const { paymentApprovals } = useCapabilities();
   return useQuery({
     queryKey: queryKeys.pendingApprovals,
     queryFn: () => getProviderClient().listPendingApprovals(),
+    enabled: paymentApprovals,
   });
 }
 
+/** Not asked for at all when the account has no forward contracts. */
 export function useForwardContracts() {
-  return useQuery({ queryKey: queryKeys.forwards, queryFn: () => getProviderClient().listForwardContracts() });
+  const { forwardContracts } = useCapabilities();
+  return useQuery({ queryKey: queryKeys.forwards, queryFn: () => getProviderClient().listForwardContracts(), enabled: forwardContracts });
 }
 
 /** After money moves, everything derived from balances and payments is stale. */

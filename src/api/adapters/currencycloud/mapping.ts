@@ -18,7 +18,6 @@ import type {
   ConversionStatus,
   ForwardContract,
   IsoDate,
-  MagicLinkRequest,
   Money,
   NewBeneficiary,
   Page,
@@ -30,14 +29,12 @@ import type {
   QuoteRequest,
   RateHistory,
   RatePair,
-  Session,
   Transaction,
   TransactionKind,
 } from '../../types';
 import {
   rawErrorBody,
   type RawAccount,
-  type RawAppSession,
   type RawBalance,
   type RawBasicRates,
   type RawBeneficiary,
@@ -45,7 +42,6 @@ import {
   type RawConversion,
   type RawFundingAccount,
   type RawHeldRateQuote,
-  type RawMagicLinkRequest,
   type RawPagination,
   type RawPayment,
   type RawPaymentAuthorisation,
@@ -155,25 +151,8 @@ export function mapPage<T>(pagination: RawPagination, items: T[]): Page<T> {
 
 // --- Auth and profile -------------------------------------------------------
 
-export function mapMagicLinkRequest(raw: RawMagicLinkRequest, devCode: string | null): MagicLinkRequest {
-  return { requestId: raw.request_id, email: raw.email, expiresAt: raw.expires_at, devCode };
-}
-
 export function contactDisplayName(contact: RawContact): string {
   return `${contact.first_name} ${contact.last_name}`.trim();
-}
-
-export function mapSession(raw: RawAppSession): { session: Session; token: string } {
-  return {
-    token: raw.auth_token,
-    session: {
-      user: {
-        id: raw.contact.id,
-        email: raw.contact.email_address ?? '',
-        displayName: contactDisplayName(raw.contact),
-      },
-    },
-  };
 }
 
 export function mapCompanyProfile(raw: RawAccount, planName: string | null): CompanyProfile {

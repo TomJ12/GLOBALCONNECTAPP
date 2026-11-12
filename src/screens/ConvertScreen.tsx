@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
-import type { Conversion, ConversionKind, FixedSide, Quote, QuoteRequest } from '@/api/types';
+import type { BookConversionRequest, Conversion, ConversionKind, FixedSide, Quote, QuoteRequest } from '@/api/types';
 import { AmountField } from '@/components/AmountField';
 import { AppText } from '@/components/AppText';
 import { DetailRow } from '@/components/Bits';
@@ -28,6 +28,7 @@ import { amountInputMessage, compareAmounts, formatMoney, formatRate, readAmount
 import { useIsOnline } from '@/lib/online';
 import { conversionMatchesQuote, formatCountdown, isQuoteExpired } from '@/lib/quote';
 import { colors, radii, sizes, spacing } from '@/theme';
+import { useCapabilities } from '@/state/session';
 
 /** A booking request must reach the provider before the hold ends, so stop a little early. */
 const EXPIRY_SAFETY_MS = 1000;
@@ -48,7 +49,10 @@ export function ConvertScreen() {
   const focused = useIsFocused();
   const appActive = useAppIsActive();
 
-  const [kind, setKind] = useState<ConversionKind>('spot');
+  const capabilities = useCapabilities();
+  const [chosenKind, setKind] = useState<ConversionKind>('spot');
+  // An account without forward contracts is never offered one, whatever was chosen before.
+  const kind: ConversionKind = capabilities.forwardContracts ? chosenKind : 'spot';
   const [sellCurrency, setSellCurrency] = useState('GBP');
   const [buyCurrency, setBuyCurrency] = useState('USD');
   const [fixedSide, setFixedSide] = useState<FixedSide>('sell');
@@ -167,6 +171,9 @@ export function ConvertScreen() {
     setBooking(true);
     try {
       const summary = `${formatMoney(quote.sellAmount, quote.sellCurrency)} to ${formatMoney(quote.buyAmount, quote.buyCurrency)}`;
+      const signature = quoteRequestKey(request);
+      const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('conversion');
+      const booking: BookConversionRequest = { quote, idempotencyKey: key };
       const confirmed = await confirmAction({
         title: kind === 'forward' ? 'Book this forward?' : 'Convert now?',
         message:
@@ -174,6 +181,8 @@ export function ConvertScreen() {
             ? `${summary} at ${formatRate(quote.rate)}, settling ${formatDate(settlementDate)}.`
             : `${summary} at ${formatRate(quote.rate)}.`,
         confirmLabel: kind === 'forward' ? 'Book forward' : `Convert ${formatMoney(quote.sellAmount, quote.sellCurrency)}`,
+        // Only asked for when the backend lists conversions as needing a code. Off by default.
+        stepUp: { action: 'conversion.book', payload: { quoteId: quote.id, idempotencyKey: key } },
       });
       if (!confirmed) return;
       // The hold may have run out while the confirmation was on screen.
@@ -182,8 +191,6 @@ export function ConvertScreen() {
         held.refresh();
         return;
       }
-      const signature = quoteRequestKey(request);
-      const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('conversion');
       setAttempt({ signature, key });
       setConfirmedQuote(quote);
       try {
@@ -194,7 +201,7 @@ export function ConvertScreen() {
         return;
       }
       try {
-        const conversion = await book.mutateAsync({ quote, idempotencyKey: key });
+        const conversion = await book.mutateAsync(booking);
         await outcome.settle();
         finish(conversion);
       } catch (caught) {
@@ -328,19 +335,21 @@ export function ConvertScreen() {
         )
       }
     >
-      <SegmentedControl
-        accessibilityLabel="Conversion type"
-        value={kind}
-        disabled={locked}
-        onChange={(next) => {
-          setKind(next);
-          setNotice(null);
-        }}
-        options={[
-          { value: 'spot', label: 'Spot', accessibilityLabel: 'Spot, convert now' },
-          { value: 'forward', label: 'Forward', accessibilityLabel: 'Forward, lock a rate for later' },
-        ]}
-      />
+      {capabilities.forwardContracts ? (
+        <SegmentedControl
+          accessibilityLabel="Conversion type"
+          value={kind}
+          disabled={locked}
+          onChange={(next) => {
+            setKind(next);
+            setNotice(null);
+          }}
+          options={[
+            { value: 'spot', label: 'Spot', accessibilityLabel: 'Spot, convert now' },
+            { value: 'forward', label: 'Forward', accessibilityLabel: 'Forward, lock a rate for later' },
+          ]}
+        />
+      ) : null}
 
       <Card style={{ gap: spacing.md }}>
         <AmountField

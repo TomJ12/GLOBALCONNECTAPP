@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
-import type { Beneficiary, Payment, PaymentStatus } from '@/api/types';
+import type { Beneficiary, NewPayment, Payment, PaymentStatus } from '@/api/types';
 import { AmountField } from '@/components/AmountField';
 import { AppText } from '@/components/AppText';
 import { Avatar, DetailRow, ListRow } from '@/components/Bits';
@@ -156,14 +156,25 @@ export function NewPaymentScreen() {
   const send = useSingleFlight(async () => {
     if (!payee || amount === null || amountError || referenceError || outcomeUnknown || !outcome.ready) return;
     setNotice(null);
+    const signature = [payee.id, amount, currency, trimmedReference].join('|');
+    const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('payment');
+    const input: NewPayment = {
+      beneficiaryId: payee.id,
+      amount,
+      currency,
+      reference: trimmedReference,
+      // The provider requires a reason. Until the product decides what to ask, the reference is reused.
+      reason: trimmedReference,
+      idempotencyKey: key,
+    };
     const confirmed = await confirmAction({
       title: 'Send this payment?',
       message: `${formatMoney(amount, currency)} to ${payee.name}, ${describeBeneficiaryAccount(payee)}. Reference ${trimmedReference}.`,
       confirmLabel: 'Send payment',
+      // The authenticator code is tied to exactly this payment.
+      stepUp: { action: 'payment.create', payload: input },
     });
     if (!confirmed) return;
-    const signature = [payee.id, amount, currency, trimmedReference].join('|');
-    const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('payment');
     setAttempt({ signature, key });
     setSent({ beneficiaryId: payee.id, amount, currency, reference: trimmedReference });
     try {
@@ -174,15 +185,7 @@ export function NewPaymentScreen() {
       return;
     }
     try {
-      const payment = await createPayment.mutateAsync({
-        beneficiaryId: payee.id,
-        amount,
-        currency,
-        reference: trimmedReference,
-        // The provider requires a reason. Until the product decides what to ask, the reference is reused.
-        reason: trimmedReference,
-        idempotencyKey: key,
-      });
+      const payment = await createPayment.mutateAsync(input);
       await outcome.settle();
       finish(payment);
     } catch (caught) {

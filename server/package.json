@@ -1,0 +1,27 @@
+{
+  "name": "globalconnect-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Global Connect API server: sign-in, 2FA, step-up and provider routing. Shares src/api with the app; run npm install in the repository root as well (zod and big.js come from there).",
+  "scripts": {
+    "start": "tsx --env-file-if-exists=.env src/index.ts",
+    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
+    "invite": "tsx --env-file-if-exists=.env src/cli/invite.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@fastify/static": "^10.1.10",
+    "fastify": "^5.6.0",
+    "tsx": "^4.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "~5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

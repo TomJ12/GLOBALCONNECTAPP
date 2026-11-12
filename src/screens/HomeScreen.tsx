@@ -22,6 +22,7 @@ import {
 } from '@/hooks/queries';
 import { formatTimeOfDay } from '@/lib/dates';
 import { currencyName, currencyPrefix, formatMoney, totalInBaseCurrency } from '@/lib/money';
+import { useCapabilities } from '@/state/session';
 import { colors, radii, sizes, spacing } from '@/theme';
 
 import { TransactionRow } from './shared';
@@ -117,6 +118,7 @@ export function HomeScreen() {
   const router = useRouter();
   const company = useCompanyProfile();
   const balances = useBalances();
+  const capabilities = useCapabilities();
   const approvals = usePendingApprovals();
   const activity = useRecentTransactions(5);
 
@@ -124,7 +126,7 @@ export function HomeScreen() {
   const refresh = () => {
     void company.refetch();
     void balances.refetch();
-    void approvals.refetch();
+    if (capabilities.paymentApprovals) void approvals.refetch();
     void activity.refetch();
   };
 
