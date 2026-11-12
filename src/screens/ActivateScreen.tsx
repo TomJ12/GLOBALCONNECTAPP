@@ -16,6 +16,7 @@ import { TextField } from '@/components/TextField';
 import { APP_NAME } from '@/config/app';
 import { useBeginActivation, useConfirmActivation, useSetActivationPassword } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
+import { activationCodeFromLink, clearFragment, currentFragment } from '@/lib/activationLink';
 import { showToast } from '@/state/toast';
 import { colors, radii, spacing } from '@/theme';
 
@@ -51,7 +52,9 @@ export function ActivateScreen() {
   const sampleCode = getAuthClient().sampleCode;
 
   const [stage, setStage] = useState<Stage>({ name: 'code' });
-  const [activationCode, setActivationCode] = useState(typeof params.code === 'string' ? params.code : '');
+  // From the link: after "#" (never sent to a server), or handed over as a parameter by a deep link.
+  const [linkCode] = useState(() => activationCodeFromLink(params.code, currentFragment()));
+  const [activationCode, setActivationCode] = useState(linkCode);
   const [password, setPassword] = useState('');
   const [repeat, setRepeat] = useState('');
   const [code, setCode] = useState('');
@@ -79,10 +82,11 @@ export function ActivateScreen() {
   const startedFromLink = useRef(false);
   const startRun = start.run;
   useEffect(() => {
-    if (startedFromLink.current || typeof params.code !== 'string' || params.code === '') return;
+    if (startedFromLink.current || linkCode === '') return;
     startedFromLink.current = true;
-    startRun(params.code);
-  }, [params.code, startRun]);
+    clearFragment();
+    startRun(linkCode);
+  }, [linkCode, startRun]);
 
   const choosePassword = useSingleFlight(async () => {
     if (stage.name !== 'password') return;

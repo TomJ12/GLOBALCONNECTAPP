@@ -45,7 +45,7 @@ test('a code is accepted one step either side, and never twice', () => {
 
 test('passwords are hashed with scrypt and checked against the policy', async () => {
   const hash = await hashPassword('correct horse battery');
-  assert.match(hash, /^scrypt\$16384\$8\$1\$/);
+  assert.match(hash, /^scrypt\$131072\$8\$1\$/);
   assert.ok(!hash.includes('correct'));
   assert.equal(await verifyPassword('correct horse battery', hash), true);
   assert.equal(await verifyPassword('correct horse batterz', hash), false);

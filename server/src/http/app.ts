@@ -18,10 +18,12 @@ import { isProviderError, type ProviderError } from '@/api/errors';
 import * as schemas from '@/api/schemas';
 import type { NewBeneficiary, Quote, Session, StepUpAction, UserRole } from '@/api/types';
 
-import { AuthService, type SessionContext } from '../auth/service';
+import { AuthService, partyOf, reasonOf, type SessionContext } from '../auth/service';
 import type { Config } from '../config';
-import { safeEqual } from '../crypto';
+import { safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
+import { activationMessage, maskEmail, type Mailer } from '../mailer';
+import { assertAmount } from '../money';
 import { OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
@@ -31,8 +33,33 @@ export interface AppDeps {
   config: Config;
   stores: Stores;
   registry: ProviderRegistry;
+  /** Delivers activation links to the address on file. Links are never returned over HTTP. */
+  mailer: Mailer;
   now?: () => number;
+  /** Where request logs go (tests). Defaults to stdout. */
+  logStream?: { write(line: string): void };
+  /** Most addresses the rate limiter tracks at once, and most quotes held (tests lower them). */
+  maxRateWindows?: number;
+  maxHeldQuotes?: number;
 }
+
+/**
+ * What is logged about a request: method, PATH and where it came from. The
+ * query string is dropped (it can carry search terms or, from an old link, a
+ * code); headers and bodies are never logged.
+ */
+export function requestLogEntry(request: { method?: string; url?: string; ip?: string }) {
+  return { method: request.method, url: (request.url ?? '').split('?')[0], remoteAddress: request.ip };
+}
+
+/**
+ * Most addresses the rate limiter tracks. When full, windows that have run out
+ * are dropped; if every tracked address is still inside its minute, a NEW
+ * address is refused. Nobody's count is ever reset to make room.
+ */
+const MAX_RATE_WINDOWS = 50_000;
+/** Most quotes held. When full, expired ones go first, then the oldest. */
+const MAX_HELD_QUOTES = 20_000;
 
 interface CompanyContext extends SessionContext {
   company: CompanyRecord;
@@ -71,16 +98,80 @@ function header(request: FastifyRequest, name: string): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
-/** Creates the first ops admin, or re-invites one that is not activated yet. Null when an active ops admin already exists. */
-export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, email: string, name: string, at: number, source: string) {
+const SYSTEM = { type: 'system' as const, id: null, label: 'operator command' };
+
+/**
+ * Bootstrap for `npm run create-ops-admin`. Four-eyes approval needs two staff
+ * members, and the console cannot create the second without the first being
+ * approved by someone, so this command may create ops admins while FEWER THAN
+ * TWO active staff exist (or re-send the link of one of them that is not yet
+ * activated). After that it refuses and staff are invited from the console.
+ * The link goes to the mailer, never back to the caller.
+ */
+export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, mailer: Mailer, email: string, name: string, at: number, source: string) {
   const staff = await stores.ops.users.list();
-  if (staff.some((user) => user.role === 'ops_admin' && user.activatedAt !== null && user.disabledAt === null)) return null;
+  if (staff.filter((user) => user.activatedAt !== null && user.disabledAt === null).length >= 2) return null;
   const existing = await stores.ops.users.findByEmail(email);
-  if (existing && (existing.role !== 'ops_admin' || existing.disabledAt !== null)) return null;
+  if (existing && (existing.role !== 'ops_admin' || existing.disabledAt !== null || existing.activatedAt !== null)) return null;
   const user = existing ?? (await opsAuth.createUser(email, name, 'ops_admin'));
   const invite = await opsAuth.createInvite(user.id);
-  await stores.audit.append({ at, actor: { type: 'system', id: null, label: 'bootstrap' }, target: { type: 'ops', id: user.id, label: user.email }, action: 'ops.bootstrap_admin', outcome: 'success', source, detail: {} });
-  return invite;
+  await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
+  await stores.audit.append({ at, actor: SYSTEM, target: { type: 'ops', id: user.id, label: user.email }, action: 'ops.bootstrap_admin', outcome: 'success', source, detail: {} });
+  return { sentTo: maskEmail(user.email), expiresAt: invite.expiresAt };
+}
+
+/**
+ * The operator commands (`npm run invite`, `npm run create-ops-admin`). This
+ * is a SEPARATE server that index.ts binds to the loopback address only; the
+ * public listener has no /admin route at all. Still guarded by ADMIN_TOKEN.
+ */
+export async function buildAdminApp(deps: { config: Config; stores: Stores; auth: AuthService; opsAuth: OpsAuthService; mailer: Mailer; now: () => number }) {
+  const { config, stores, auth, opsAuth, mailer, now } = deps;
+  const admin = Fastify({ bodyLimit: 16 * 1024, logger: false });
+  admin.setErrorHandler((error, _request, reply) => {
+    const apiError = error instanceof ApiError ? error : new ApiError((error as { statusCode?: number }).statusCode === 400 ? 'validation' : 'server', { status: (error as { statusCode?: number }).statusCode === 400 ? 400 : 500 });
+    return reply.status(apiError.status).send(apiError.body());
+  });
+  admin.setNotFoundHandler((_request, reply) => reply.status(404).send(new ApiError('not_found').body()));
+  admin.addHook('preHandler', async (request) => {
+    const token = bearer(request);
+    if (!config.adminToken || !token || !safeEqual(token, config.adminToken)) throw new ApiError('not_found');
+  });
+  const stringField = (body: unknown, name: string): string => {
+    const value = (body as Record<string, unknown> | null)?.[name];
+    return typeof value === 'string' ? value.trim() : '';
+  };
+
+  admin.post('/admin/invites', async (request) => {
+    const email = stringField(request.body, 'email').toLowerCase();
+    if (!email) throw new ApiError('validation', { fields: ['email'] });
+    const user = await stores.directory.findUserByEmail(email);
+    const record = (outcome: 'success' | 'failure', detail: Record<string, string>) =>
+      stores.audit.append({ at: now(), actor: SYSTEM, target: user ? partyOf(user) : { type: 'client', id: null, label: email.slice(0, 80) }, action: 'system.client.activation_link', outcome, source: request.ip, detail });
+    try {
+      const invite = await auth.createInvite(email);
+      await mailer.send(activationMessage(invite, email, user?.name ?? '', 'client'));
+      await record('success', { expires: new Date(invite.expiresAt).toISOString() });
+      return { sentTo: maskEmail(email), expiresAt: new Date(invite.expiresAt).toISOString() };
+    } catch (error) {
+      await record('failure', { reason: reasonOf(error) });
+      throw error;
+    }
+  });
+
+  admin.post('/admin/ops-admins', async (request) => {
+    const email = stringField(request.body, 'email').toLowerCase();
+    const name = stringField(request.body, 'name');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new ApiError('validation', { fields: ['email'] });
+    if (!name || name.length > 120) throw new ApiError('validation', { fields: ['name'] });
+    const sent = await bootstrapOpsAdmin(stores, opsAuth, mailer, email, name, now(), request.ip);
+    if (!sent) {
+      await stores.audit.append({ at: now(), actor: SYSTEM, target: { type: 'ops', id: null, label: email.slice(0, 80) }, action: 'ops.bootstrap_admin', outcome: 'failure', source: request.ip, detail: { reason: 'refused' } });
+      throw new ApiError('forbidden');
+    }
+    return { ...sent, expiresAt: new Date(sent.expiresAt).toISOString() };
+  });
+  return admin;
 }
 
 export async function buildApp(deps: AppDeps) {
@@ -91,10 +182,17 @@ export async function buildApp(deps: AppDeps) {
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
 
   const app = Fastify({
-    trustProxy: config.trustProxy,
+    // The proxies' own addresses (preferred), or a number of hops counted back from the connection: never "trust whatever
+    // the client sent". A hop count is only right when the server can be reached ONLY through that many proxies.
+    trustProxy: typeof config.trustProxy === 'number' ? ((hops) => (_address: string, hop: number) => hop < hops)(config.trustProxy) : config.trustProxy,
     bodyLimit: 64 * 1024,
-    // The default serializers log method, URL and status only: no headers, no bodies.
-    logger: config.log ? { level: 'info', redact: ['req.headers.authorization', 'req.headers["x-step-up-token"]'] } : false,
+    // Method, path (no query string) and status only: no headers, no bodies.
+    logger: config.log || deps.logStream ? { level: 'info', serializers: { req: requestLogEntry }, ...(deps.logStream ? { stream: deps.logStream } : {}) } : false,
+  });
+
+  // Fail safe: when the audit log cannot take another entry, no change is accepted (rather than made unrecorded).
+  app.addHook('preHandler', async (request) => {
+    if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS') await deps.stores.audit.assertCapacity();
   });
 
   if (config.corsOrigins.length > 0) {
@@ -132,11 +230,17 @@ export async function buildApp(deps: AppDeps) {
 
   // --- Per-address rate limit on the unauthenticated and code-checking routes ---
   const windows = new Map<string, { startedAt: number; count: number }>();
+  const maxRateWindows = deps.maxRateWindows ?? MAX_RATE_WINDOWS;
   const limitAttempts = async (request: FastifyRequest): Promise<void> => {
     const at = now();
     const entry = windows.get(request.ip);
     if (!entry || at - entry.startedAt >= 60_000) {
-      if (windows.size > 50_000) windows.clear();
+      windows.delete(request.ip);
+      if (windows.size >= maxRateWindows) {
+        // Make room without resetting anyone who is still inside their window.
+        for (const [address, window] of windows) if (at - window.startedAt >= 60_000) windows.delete(address);
+        if (windows.size >= maxRateWindows) throw new ApiError('rate_limited', { retryAfterSeconds: 60 });
+      }
       windows.set(request.ip, { startedAt: at, count: 1 });
       return;
     }
@@ -210,6 +314,7 @@ export async function buildApp(deps: AppDeps) {
   const quotes = new Map<string, Quote>();
   const rememberQuote = (companyId: string, quote: Quote): void => {
     for (const [key, held] of quotes) if (Date.parse(held.expiresAt) < now() - 60_000) quotes.delete(key);
+    while (quotes.size >= (deps.maxHeldQuotes ?? MAX_HELD_QUOTES)) quotes.delete(quotes.keys().next().value as string);
     quotes.set(`${companyId}:${quote.id}`, quote);
   };
 
@@ -253,7 +358,7 @@ export async function buildApp(deps: AppDeps) {
         return { ok: true };
       });
       api.post('/session/company', async (request) => {
-        const context = await auth.selectCompany(await sessionOf(request), field(request.body, 'companyId', text(64)));
+        const context = await auth.selectCompany(await sessionOf(request), field(request.body, 'companyId', text(64)), request.ip);
         return sessionView(context as CompanyContext);
       });
 
@@ -304,11 +409,31 @@ export async function buildApp(deps: AppDeps) {
         return withProvider(context, (provider) => provider.getRateHistory(base, quote));
       });
 
+      /**
+       * Runs a money action and writes it to the audit log, success or failure:
+       * who, for which company, what (amount, currency, payee id) and a hash of
+       * the idempotency key. Never a token or a code.
+       */
+      const audited = async <T>(request: FastifyRequest, context: CompanyContext, action: StepUpAction, detail: Record<string, string>, run: () => Promise<T>, after: (result: T) => Record<string, string> = () => ({})): Promise<T> => {
+        const target = { type: 'company' as const, id: context.company.id, label: context.company.name };
+        try {
+          const result = await run();
+          await auth.record(`client.${action}`, 'success', partyOf(context.user), request.ip, { ...detail, ...after(result) }, target);
+          return result;
+        } catch (error) {
+          const reason = error instanceof ApiError ? reasonOf(error) : isProviderError(error) ? (error.reason ?? error.kind) : 'error';
+          await auth.record(`client.${action}`, 'failure', partyOf(context.user), request.ip, { ...detail, reason }, target);
+          throw error;
+        }
+      };
+      const keyHash = (idempotencyKey: string): string => sha256(idempotencyKey).slice(0, 16);
+
       // --- Conversions --------------------------------------------------------
       api.post('/quotes', async (request) => {
         const context = await companyOf(request);
         if (!MAY['conversion.book'].includes(context.role)) throw new ApiError('forbidden');
         const input = parse(schemas.quoteRequest, request.body);
+        assertAmount(input.amount, input.fixedSide === 'sell' ? input.sellCurrency : input.buyCurrency);
         const provider = await providerOf(context);
         if (input.kind === 'forward' && !provider.capabilities.forwardContracts) {
           throw new ApiError('validation', { reason: 'not_supported', fields: ['kind'] });
@@ -321,10 +446,20 @@ export async function buildApp(deps: AppDeps) {
         const context = await companyOf(request);
         const idempotencyKey = idempotencyKeyOf(request);
         const quoteId = field(request.body, 'quoteId', text(120));
-        await authorize(request, context, 'conversion.book', { quoteId, idempotencyKey });
-        const quote = quotes.get(`${context.company.id}:${quoteId}`);
-        if (!quote) throw new ApiError('quote_expired');
-        return withProvider(context, (provider) => provider.bookConversion({ quote, idempotencyKey }));
+        return audited(
+          request,
+          context,
+          'conversion.book',
+          { quote: quoteId, key: keyHash(idempotencyKey) },
+          async () => {
+            await authorize(request, context, 'conversion.book', { quoteId, idempotencyKey });
+            // Only a quote this server issued to THIS company can be booked: the id alone is not trusted.
+            const quote = quotes.get(`${context.company.id}:${quoteId}`);
+            if (!quote) throw new ApiError('quote_expired');
+            return withProvider(context, (provider) => provider.bookConversion({ quote, idempotencyKey }));
+          },
+          (conversion) => ({ conversion: conversion.id, sell: `${conversion.sellAmount} ${conversion.sellCurrency}`, buy: `${conversion.buyAmount} ${conversion.buyCurrency}` }),
+        );
       });
       api.get('/conversions/by-key/:key', async (request) => {
         const context = await companyOf(request);
@@ -339,6 +474,19 @@ export async function buildApp(deps: AppDeps) {
       });
 
       // --- Payees and payments ------------------------------------------------
+      /**
+       * An id from the request is acted on only after it has been found among
+       * THIS company's own records, read through this company's scope. The
+       * server does not rely on the provider refusing somebody else's id.
+       */
+      const assertOwnPayee = async (context: CompanyContext, beneficiaryId: string): Promise<void> => {
+        const own = await withProvider(context, (provider) => provider.listBeneficiaries());
+        if (!own.items.some((payee) => payee.id === beneficiaryId)) throw new ApiError('validation', { fields: ['beneficiaryId'] });
+      };
+      const assertOwnPendingPayment = async (context: CompanyContext, paymentId: string): Promise<void> => {
+        const own = await withProvider(context, (provider) => provider.listPendingApprovals());
+        if (!own.some((item) => item.payment.id === paymentId)) throw new ApiError('not_found');
+      };
       api.get('/beneficiaries', async (request) => {
         const context = await companyOf(request);
         return withProvider(context, (provider) => provider.listBeneficiaries());
@@ -346,9 +494,18 @@ export async function buildApp(deps: AppDeps) {
       api.post('/beneficiaries', async (request) => {
         const context = await companyOf(request);
         const input: NewBeneficiary = parse(schemas.newBeneficiary, request.body);
-        // Bound to the body exactly as it was sent.
-        await authorize(request, context, 'beneficiary.create', request.body);
-        return withProvider(context, (provider) => provider.createBeneficiary(input));
+        return audited(
+          request,
+          context,
+          'beneficiary.create',
+          { currency: input.currency, country: input.bankCountry },
+          async () => {
+            // Bound to the body exactly as it was sent.
+            await authorize(request, context, 'beneficiary.create', request.body);
+            return withProvider(context, (provider) => provider.createBeneficiary(input));
+          },
+          (payee) => ({ payee: payee.id }),
+        );
       });
       api.get('/payments', async (request) => {
         const context = await companyOf(request);
@@ -358,8 +515,19 @@ export async function buildApp(deps: AppDeps) {
         const context = await companyOf(request);
         const idempotencyKey = idempotencyKeyOf(request);
         const input = parse(schemas.newPaymentBody, request.body);
-        await authorize(request, context, 'payment.create', { ...(request.body as object), idempotencyKey });
-        return withProvider(context, (provider) => provider.createPayment({ ...input, idempotencyKey }));
+        return audited(
+          request,
+          context,
+          'payment.create',
+          { amount: String(input.amount).slice(0, 40), currency: input.currency, payee: input.beneficiaryId, key: keyHash(idempotencyKey) },
+          async () => {
+            assertAmount(input.amount, input.currency);
+            await authorize(request, context, 'payment.create', { ...(request.body as object), idempotencyKey });
+            await assertOwnPayee(context, input.beneficiaryId);
+            return withProvider(context, (provider) => provider.createPayment({ ...input, idempotencyKey }));
+          },
+          (payment) => ({ payment: payment.id, status: payment.status }),
+        );
       });
       api.get('/payments/by-key/:key', async (request) => {
         const context = await companyOf(request);
@@ -377,10 +545,13 @@ export async function buildApp(deps: AppDeps) {
         const paymentId = parse(z.string().min(1).max(120), (request.params as { id: string }).id);
         const provider = await providerOf(context);
         if (!provider.capabilities.paymentApprovals) throw new ApiError('validation', { reason: 'not_supported' });
-        await authorize(request, context, action, { paymentId });
-        if (action === 'payment.approve') return withProvider(context, () => provider.approvePayment(paymentId));
-        await withProvider(context, () => provider.rejectPayment(paymentId));
-        return { ok: true };
+        return audited(request, context, action, { payment: paymentId }, async () => {
+          await authorize(request, context, action, { paymentId });
+          await assertOwnPendingPayment(context, paymentId);
+          if (action === 'payment.approve') return withProvider(context, () => provider.approvePayment(paymentId));
+          await withProvider(context, () => provider.rejectPayment(paymentId));
+          return { ok: true };
+        });
       };
       api.post('/payments/:id/approve', decide('payment.approve'));
       api.post('/payments/:id/reject', decide('payment.reject'));
@@ -388,35 +559,9 @@ export async function buildApp(deps: AppDeps) {
     { prefix: '/v1' },
   );
 
-  // --- Operations: invitations. Disabled unless ADMIN_TOKEN is set. --------------
-  app.post('/admin/invites', { preHandler: limitAttempts }, async (request) => {
-    const token = bearer(request);
-    if (!config.adminToken || !token || !safeEqual(token, config.adminToken)) throw new ApiError('not_found');
-    const email = (request.body as { email?: unknown } | null)?.email;
-    if (typeof email !== 'string') throw new ApiError('validation', { fields: ['email'] });
-    const invite = await auth.createInvite(email);
-    return { ...invite, expiresAt: new Date(invite.expiresAt).toISOString() };
-  });
-
-  /**
-   * Bootstrap for `npm run create-ops-admin`: creates the FIRST ops admin (or
-   * re-issues the link of one not yet activated). Refused once an active ops
-   * admin exists; from then on staff are invited from the ops console.
-   */
-  app.post('/admin/ops-admins', { preHandler: limitAttempts }, async (request) => {
-    const token = bearer(request);
-    if (!config.adminToken || !token || !safeEqual(token, config.adminToken)) throw new ApiError('not_found');
-    const body = request.body as { email?: unknown; name?: unknown } | null;
-    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
-    const name = typeof body?.name === 'string' ? body.name.trim() : '';
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new ApiError('validation', { fields: ['email'] });
-    if (!name || name.length > 120) throw new ApiError('validation', { fields: ['name'] });
-    const invite = await bootstrapOpsAdmin(deps.stores, opsAuth, email, name, now(), request.ip);
-    if (!invite) throw new ApiError('forbidden');
-    return { ...invite, expiresAt: new Date(invite.expiresAt).toISOString() };
-  });
-
-  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, now, limitAttempts });
+  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mailer: deps.mailer, now, limitAttempts });
+  // Null when no ADMIN_TOKEN is set: the operator commands are then off.
+  const admin = config.adminToken ? await buildAdminApp({ config, stores: deps.stores, auth, opsAuth, mailer: deps.mailer, now }) : null;
 
   app.get('/healthz', async () => ({ ok: true }));
 
@@ -434,5 +579,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, auth, opsAuth, opsRoutes };
+  return { app, admin, auth, opsAuth, opsRoutes };
 }

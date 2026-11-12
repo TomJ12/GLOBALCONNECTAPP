@@ -50,6 +50,13 @@ export interface Directory {
   findUserByEmail(email: string): Promise<UserRecord | null>;
   getUser(id: string): Promise<UserRecord | null>;
   saveUser(user: UserRecord): Promise<void>;
+  /**
+   * Atomic read-modify-write of one user. `change` returns the new record, or
+   * null to leave the user as it is (the condition did not hold). Returns the
+   * saved record, or null when nothing was written. A database implements
+   * this as a transaction or a compare-and-set loop.
+   */
+  updateUser(id: string, change: (user: UserRecord) => UserRecord | null): Promise<UserRecord | null>;
   listUsers(): Promise<UserRecord[]>;
   getCompany(id: string): Promise<CompanyRecord | null>;
   membershipsOf(userId: string): Promise<Membership[]>;
@@ -95,6 +102,15 @@ export interface StepUpRecord {
 export interface AttemptRecord {
   failures: number;
   lockedUntil: number;
+  /** Whose credential is being guessed, e.g. `email:a@b.example` or `user:usr_1`; lets operations find and clear locks. */
+  subject: string;
+  updatedAt: number;
+}
+
+/** Idempotency key -> provider order id, kept outside any adapter instance. Key: `<companyId>:<kind>:<idempotency key>`. */
+export interface ProviderKeyRecord {
+  orderId: string;
+  createdAt: number;
 }
 
 /** A small keyed table. Keys are always hashes or internal ids, never raw tokens. */
@@ -105,6 +121,16 @@ export interface Table<T> {
   /** Remove every row the predicate matches. */
   deleteWhere(predicate: (value: T) => boolean): Promise<void>;
   count(predicate: (value: T) => boolean): Promise<number>;
+  list(predicate?: (value: T) => boolean): Promise<T[]>;
+  /**
+   * Atomic read-modify-write. `change` gets the current row (or null) and
+   * returns the row to store, null to delete it, or undefined to leave it
+   * untouched. Returns what is stored afterwards. Every read-modify-write of
+   * security state goes through this (or `take`), never get-then-put.
+   */
+  mutate(key: string, change: (current: T | null) => T | null | undefined): Promise<T | null>;
+  /** Atomic read-and-delete: of two simultaneous callers only one gets the row. */
+  take(key: string): Promise<T | null>;
 }
 
 export interface AuthStore {
@@ -138,7 +164,29 @@ export interface OpsDirectory {
   findByEmail(email: string): Promise<OpsUserRecord | null>;
   get(id: string): Promise<OpsUserRecord | null>;
   save(user: OpsUserRecord): Promise<void>;
+  /** Atomic read-modify-write; see Directory.updateUser. */
+  update(id: string, change: (user: OpsUserRecord) => OpsUserRecord | null): Promise<OpsUserRecord | null>;
   list(): Promise<OpsUserRecord[]>;
+}
+
+/** A change one staff member asked for that another must approve before it takes effect. */
+export interface ApprovalRecord {
+  id: string;
+  /** The console action, e.g. `client.reset_authenticator`. */
+  action: string;
+  /** The validated input of the action. Never a credential. */
+  params: Record<string, string>;
+  /** One line for the approver: what will happen. */
+  summary: string;
+  /** Consequences the approver must see (for example sessions that will be ended). */
+  warnings: string[];
+  target: AuditParty | null;
+  requestedBy: { id: string; email: string };
+  requestedAt: number;
+  expiresAt: number;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled' | 'expired';
+  decidedBy: { id: string; email: string } | null;
+  decidedAt: number | null;
 }
 
 export interface OpsSessionRecord {
@@ -154,6 +202,9 @@ export interface OpsStore {
   challenges: Table<LoginChallengeRecord>;
   sessions: Table<OpsSessionRecord>;
   attempts: Table<AttemptRecord>;
+  approvals: Table<ApprovalRecord>;
+  /** CSRF anchors handed to browsers before sign-in, by SHA-256. */
+  preSessions: Table<{ expiresAt: number }>;
 }
 
 // --- Audit log -----------------------------------------------------------------
@@ -178,6 +229,8 @@ export interface AuditEntry {
   source: string;
   /** Short facts about the event. NEVER a password, key, code or token. */
   detail: Record<string, string>;
+  /** True for a failure by nobody we can identify (see AuditLog.append). */
+  anonymous?: boolean;
 }
 
 export interface AuditFilter {
@@ -191,7 +244,16 @@ export interface AuditFilter {
 
 /** Append-only by contract: there is no way to change or remove an entry. */
 export interface AuditLog {
-  append(entry: Omit<AuditEntry, 'id'>): Promise<void>;
+  /**
+   * A failure by a person nobody has identified (`actor.id === null`) goes to a
+   * separate, bounded, rate-limited stream with a truncated label, so that
+   * anonymous noise can never push out or fill the main log. Everything else
+   * goes to the main log; when that cannot take the entry, append THROWS
+   * rather than drop it or an older one.
+   */
+  append(entry: Omit<AuditEntry, 'id' | 'anonymous'>): Promise<void>;
+  /** Throws when the main log cannot take another entry, so a change is refused BEFORE it is made rather than made unrecorded. */
+  assertCapacity(): Promise<void>;
   /** Newest first. */
   query(filter?: AuditFilter): Promise<AuditEntry[]>;
 }
@@ -201,4 +263,5 @@ export interface Stores {
   auth: AuthStore;
   ops: OpsStore;
   audit: AuditLog;
+  providerKeys: Table<ProviderKeyRecord>;
 }

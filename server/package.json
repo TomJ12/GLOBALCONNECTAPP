@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Global Connect API server: sign-in, 2FA, step-up and provider routing. Shares src/api with the app; run npm install in the repository root as well (zod and big.js come from there).",
+  "description": "Global Connect API server: sign-in, 2FA, step-up, provider routing and the ops console. Shares src/api with the app: run npm install in the repository root as well (the shared files resolve their own imports from there).",
   "scripts": {
     "start": "tsx --env-file-if-exists=.env src/index.ts",
-    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
+    "start:dev": "tsx --env-file=.env.development --env-file-if-exists=.env src/index.ts",
+    "dev": "tsx watch --env-file=.env.development --env-file-if-exists=.env src/index.ts",
     "invite": "tsx --env-file-if-exists=.env src/cli/invite.ts",
     "create-ops-admin": "tsx --env-file-if-exists=.env src/cli/create-ops-admin.ts",
     "typecheck": "tsc --noEmit",
@@ -15,10 +16,14 @@
   "dependencies": {
     "@fastify/cors": "^11.1.0",
     "@fastify/static": "^10.1.10",
+    "big.js": "7.0.1",
     "fastify": "^5.6.0",
-    "tsx": "^4.20.0"
+    "qrcode-generator": "2.0.4",
+    "tsx": "^4.20.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
+    "@types/big.js": "7.0.0",
     "@types/node": "^22.0.0",
     "typescript": "~5.9.0"
   },

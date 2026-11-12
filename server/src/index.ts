@@ -1,41 +1,43 @@
-/** Starts the server with the in-memory stores (or, for a local demo, the file store) and the sample directory. */
+/** Starts the server. See startup.ts for what it refuses to start on. */
 import { loadConfig } from './config';
-import { bootstrapOpsAdmin, buildApp } from './http/app';
-import { ProviderRegistry } from './providers/adapter';
-import { currencycloudFactory } from './providers/currencycloud';
-import { equalsFactory } from './providers/equals/adapter';
-import { createFileStores } from './store/file';
-import { createMemoryStores } from './store/memory';
-import { seedDirectory } from './store/seed';
+import { buildApp } from './http/app';
+import { createRuntime } from './startup';
 
-const DEMO_OPS_ADMIN = { email: 'ops.admin@globalconnect.example', name: 'Demo Ops Admin' };
+const DEMO_STAFF = [
+  { email: 'ops.admin@globalconnect.example', name: 'Demo Ops Admin', role: 'ops_admin' as const },
+  { email: 'ops.second@globalconnect.example', name: 'Demo Ops Second', role: 'ops' as const },
+];
 
 const config = loadConfig();
-// loadConfig has already refused DATA_FILE in production.
-const stores = config.dataFile ? createFileStores(config.dataFile, seedDirectory(), { production: config.production }) : createMemoryStores(seedDirectory());
-const registry = new ProviderRegistry({
-  currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud }),
-  equals: equalsFactory({ credentials: config.providers.equals }),
-});
-const { app, auth, opsAuth } = await buildApp({ config, stores, registry });
+const { stores, registry, mailer } = createRuntime(config);
+const { app, admin, auth, opsAuth } = await buildApp({ config, stores, registry, mailer });
 await app.listen({ port: config.port, host: config.host });
+// The operator commands are served on the loopback address ONLY, on their own port.
+if (admin) await admin.listen({ port: config.adminPort, host: '127.0.0.1' });
 
-if (!config.production) {
-  // DEVELOPMENT ONLY. There is no email delivery yet, so activation codes for
-  // accounts that are not activated are printed here. This block never runs in production.
-  const lines: string[] = [];
-  if (config.dataFile) {
-    lines.push(`Accounts are being KEPT in ${config.dataFile} (password hashes and authenticator keys in plain form: local demo only).`, '');
-  }
-  lines.push('DEVELOPMENT ONLY: activation codes for accounts not yet activated (sample data)');
+if (config.development) {
+  // EXPLICIT DEVELOPMENT MODE ONLY (APP_ENV=development). There is no email
+  // delivery, so activation codes for accounts that are not activated are
+  // printed here. Nothing below runs in any other mode.
+  const lines: string[] = ['DEVELOPMENT MODE (APP_ENV=development): mock providers, sample data, emails printed to this console.'];
+  if (config.dataFile) lines.push(`Accounts are being KEPT in ${config.dataFile} (password hashes and authenticator keys in plain form: local demo only).`);
+  if (!config.fourEyes) lines.push('FOUR-EYES APPROVAL IS OFF (FOUR_EYES=off): one staff member alone can make sensitive changes.');
+  lines.push('', 'Activation codes for accounts not yet activated (sample data):');
   for (const user of await stores.directory.listUsers()) {
     if (user.activatedAt !== null || user.disabledAt) continue;
     const invite = await auth.createInvite(user.email);
     lines.push(`  ${user.email.padEnd(34)} ${invite.activationCode}   ${invite.activationLink}`);
   }
-  // One demo ops admin, only while no ops admin has been activated.
-  const admin = await bootstrapOpsAdmin(stores, opsAuth, DEMO_OPS_ADMIN.email, DEMO_OPS_ADMIN.name, Date.now(), '');
-  if (admin) lines.push(`  ${DEMO_OPS_ADMIN.email.padEnd(34)} ${admin.activationCode}   ${admin.activationLink}   (ops admin)`);
+  // Two demo staff, so that four-eyes approval can be shown: an ops admin and an ops user.
+  const staff = await stores.ops.users.list();
+  for (const demo of DEMO_STAFF) {
+    const existing = staff.find((user) => user.email === demo.email);
+    if (!existing && staff.length >= DEMO_STAFF.length) continue;
+    const user = existing ?? (await opsAuth.createUser(demo.email, demo.name, demo.role));
+    if (user.activatedAt !== null || user.disabledAt !== null) continue;
+    const invite = await opsAuth.createInvite(user.id);
+    lines.push(`  ${demo.email.padEnd(34)} ${invite.activationCode}   ${invite.activationLink}   (staff: ${demo.role})`);
+  }
   lines.push('', `Ops console: ${config.opsUrl}/ops`);
   console.log(['', ...lines, ''].join('\n'));
 }

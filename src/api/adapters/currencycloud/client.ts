@@ -81,6 +81,13 @@ export interface CurrencycloudClientOptions {
   /** Most pages a "read everything" loop will fetch (100 rows each). */
   maxPages?: number;
   now?: () => number;
+  /**
+   * The contact id of the client this instance acts for. When set (always, on
+   * the server, where one set of API credentials serves many clients) it is
+   * sent as `on_behalf_of` with EVERY call after login, so the provider scopes
+   * the call to that client's account.
+   */
+  onBehalfOf?: string;
 }
 
 const MAX_PAGE_SIZE = 100;
@@ -115,7 +122,7 @@ export class CurrencycloudClient implements ProviderClient {
       // A request that never answers must not leave a spinner and a lock forever.
       // The request may still have been applied, so `timeout` counts as outcome-unknown.
       response = await Promise.race([
-        this.transport.request({ method, path, params, token: this.token }),
+        this.transport.request({ method, path, params: this.scoped(path, params), token: this.token }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new ProviderError('timeout', { detail: `No response after ${timeoutMs} ms` })), timeoutMs);
         }),
@@ -133,6 +140,23 @@ export class CurrencycloudClient implements ProviderClient {
       throw mapHttpError(response.status, response.body);
     }
     return parseBody(schema, response.body);
+  }
+
+  private scoped(path: string, params: TransportParams | undefined): TransportParams | undefined {
+    const onBehalfOf = this.options.onBehalfOf;
+    if (onBehalfOf === undefined || path.startsWith('/v2/authenticate/')) return params;
+    return { ...params, on_behalf_of: onBehalfOf };
+  }
+
+  /** Whether the provider knows this account id for the contact this instance acts for. */
+  async accountExists(accountId: string): Promise<boolean> {
+    try {
+      const raw = await this.call(rawAccount, 'GET', `/v2/accounts/${encodeURIComponent(accountId)}`);
+      return raw.id === accountId;
+    } catch (error) {
+      if (error instanceof ProviderError && (error.kind === 'not_found' || error.kind === 'forbidden' || error.kind === 'validation')) return false;
+      throw error;
+    }
   }
 
   // --- Provider session ----------------------------------------------------------------

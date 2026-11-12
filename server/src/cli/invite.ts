@@ -1,22 +1,24 @@
 /**
  * npm run invite -- <email>
  *
- * Asks the RUNNING server for an activation code for someone already in the
- * directory, and prints it. Stands in for an admin tool and for email
- * delivery. Needs ADMIN_TOKEN (the same value the server was started with).
+ * Asks the RUNNING server to email a new activation link to someone already
+ * in the directory. The link is not printed here: it goes to the address on
+ * file (in development mode, to the server's console outbox). Talks to the
+ * server's loopback-only operator port and needs ADMIN_TOKEN (the same value
+ * the server was started with).
  */
 export {};
 
 const email = process.argv[2];
 const token = process.env.ADMIN_TOKEN;
-const server = process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 3001}`;
+const server = process.env.ADMIN_URL ?? `http://127.0.0.1:${process.env.ADMIN_PORT ?? 3002}`;
 
 if (!email) {
   console.error('Usage: npm run invite -- <email>');
   process.exit(2);
 }
-if (!token || token.length < 16) {
-  console.error('Set ADMIN_TOKEN (16+ characters) in server/.env for both the server and this command.');
+if (!token) {
+  console.error('Set ADMIN_TOKEN in server/.env for both the server and this command (openssl rand -base64 32).');
   process.exit(2);
 }
 
@@ -31,14 +33,14 @@ try {
     process.exit(1);
   }
   if (!response.ok) {
-    console.error(response.status === 400 ? 'That account is already activated.' : `The server answered ${response.status}.`);
+    console.error(response.status === 400 ? 'That account is already activated, or is disabled.' : `The server answered ${response.status}.`);
     process.exit(1);
   }
-  const invite = (await response.json()) as { activationCode: string; activationLink: string; expiresAt: string };
-  console.log(`Activation code: ${invite.activationCode}`);
-  console.log(`Activation link: ${invite.activationLink}`);
-  console.log(`Expires:         ${invite.expiresAt}`);
+  const sent = (await response.json()) as { sentTo: string; expiresAt: string };
+  console.log(`Activation email sent to ${sent.sentTo}`);
+  console.log(`Expires: ${sent.expiresAt}`);
+  console.log('(In development mode the email is printed in the server console.)');
 } catch {
-  console.error(`Could not reach the server at ${server}. Is it running?`);
+  console.error(`Could not reach the operator port at ${server}. Is the server running with ADMIN_TOKEN set, on this machine?`);
   process.exit(1);
 }

@@ -60,11 +60,12 @@
     "test": "jest",
     "typecheck": "tsc --noEmit",
     "export:web": "expo export -p web",
-    "server": "npm --prefix server run start",
+    "server": "npm --prefix server run start:dev",
     "demo": "node scripts/demo.mjs",
     "demo:reset": "node scripts/demo.mjs --reset",
     "create-ops-admin": "npm --prefix server run create-ops-admin --",
-    "postinstall": "npm --prefix server install --no-audit --no-fund"
+    "postinstall": "npm --prefix server install --no-audit --no-fund",
+    "invite": "npm --prefix server run invite --"
   },
   "private": true,
   "jest": {

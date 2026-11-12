@@ -35,7 +35,7 @@ import type {
 } from '@/api/types';
 import { currencyDecimals } from '@/lib/money';
 
-import type { CompanyRecord } from '../../store/types';
+import type { CompanyRecord, ProviderKeyRecord, Table } from '../../store/types';
 import type { ProviderAdapter, ProviderFactory } from '../adapter';
 import { MockEqualsServer, QUOTE_TTL_MS } from './mockServer';
 import {
@@ -133,20 +133,48 @@ export function mapBalances(budget: RawBudget): Balance[] {
   }));
 }
 
+/**
+ * The provider's documented wire format for an amount is a JSON number. Ours is
+ * a decimal string everywhere else. The string is turned into a number only
+ * here, at the last moment, and only if the number says exactly the same
+ * thing; anything that would be rounded is refused instead of sent.
+ */
+export function wireAmount(amount: string): number {
+  const value = Number(amount);
+  if (!/^\d+(\.\d+)?$/.test(amount) || !Number.isFinite(value) || !(value > 0) || !new Big(value.toString()).eq(new Big(amount))) {
+    throw new ProviderError('validation', { fields: ['amount'] });
+  }
+  return value;
+}
+
 export class EqualsAdapter implements ProviderAdapter {
   readonly capabilities = { forwardContracts: false, paymentApprovals: false };
   private readonly now: () => number;
-  /** Order ids of quotes we issued, and which idempotency key booked which order. PLACEHOLDER: belongs in the database. */
-  private readonly orderForQuote = new Map<string, string>();
-  private readonly orderForKey = new Map<string, string>();
+  /**
+   * Order ids of quotes we issued, and which idempotency key booked which
+   * order. Kept in the store, keyed by company, NOT in this instance: an
+   * adapter is rebuilt whenever the provider session is renewed, and a booked
+   * conversion must still be found by its key afterwards.
+   */
+  private readonly keys: Table<ProviderKeyRecord>;
 
   constructor(
     private readonly transport: EqualsTransport,
     private readonly company: CompanyRecord,
     private readonly apiKey: string,
-    options: { now?: () => number } = {},
+    options: { now?: () => number; keys: Table<ProviderKeyRecord> },
   ) {
     this.now = options.now ?? Date.now;
+    this.keys = options.keys;
+    // Fail closed: without the account scope no call may be made.
+    if (!company.providerAccountId) throw new Error('This company has no provider account scope; refusing to call the provider without one');
+  }
+
+  private async orderFor(kind: 'quote' | 'key', id: string): Promise<string | null> {
+    return (await this.keys.get(`${this.company.id}:${kind}:${id}`))?.orderId ?? null;
+  }
+  private remember(kind: 'quote' | 'key', id: string, orderId: string): Promise<void> {
+    return this.keys.put(`${this.company.id}:${kind}:${id}`, { orderId, createdAt: this.now() });
   }
 
   private async call<S extends z.ZodType>(schema: S, method: 'GET' | 'POST', path: string, query: Record<string, string> = {}, body?: unknown): Promise<z.infer<S>> {
@@ -261,7 +289,7 @@ export class EqualsAdapter implements ProviderAdapter {
     if (request.kind !== 'spot') throw new ProviderError('validation', { reason: 'not_supported', fields: ['kind'] });
     const budget = await this.budget('balance');
     const leg = (currencyCode: string, fixed: boolean) => ({
-      ...(fixed ? { amount: Number(request.amount) } : {}),
+      ...(fixed ? { amount: wireAmount(request.amount) } : {}),
       currency: { budgetId: budget.id, currencyCode },
     });
     const createdAt = this.now();
@@ -271,7 +299,7 @@ export class EqualsAdapter implements ProviderAdapter {
       settlementDate: compactDate(new Date(createdAt).toISOString().slice(0, 10)),
       type: { from: 'balance', to: 'balance' },
     });
-    this.orderForQuote.set(raw.quoteRequestId, raw.orderId);
+    await this.remember('quote', raw.quoteRequestId, raw.orderId);
     return {
       id: raw.quoteRequestId,
       kind: 'spot',
@@ -309,15 +337,15 @@ export class EqualsAdapter implements ProviderAdapter {
   }
 
   async bookConversion(request: BookConversionRequest): Promise<Conversion> {
-    const orderId = this.orderForKey.get(request.idempotencyKey) ?? this.orderForQuote.get(request.quote.id);
+    const orderId = (await this.orderFor('key', request.idempotencyKey)) ?? (await this.orderFor('quote', request.quote.id));
     if (!orderId) throw new ProviderError('quote_expired');
     // Remembered BEFORE sending, so a lost reply can still be reconciled by key.
-    this.orderForKey.set(request.idempotencyKey, orderId);
+    await this.remember('key', request.idempotencyKey, orderId);
     return this.mapTrade(await this.call(rawTradeOrder, 'POST', '/v2/orders/trade', {}, { orderId, quoteRequestId: request.quote.id }));
   }
 
   async findConversionByIdempotencyKey(idempotencyKey: string): Promise<Conversion | null> {
-    const orderId = this.orderForKey.get(idempotencyKey);
+    const orderId = await this.orderFor('key', idempotencyKey);
     if (!orderId) return null;
     try {
       return this.mapTrade(await this.call(rawTradeOrder, 'GET', `/v2/orders/${encodeURIComponent(orderId)}`));
@@ -367,7 +395,7 @@ export class EqualsAdapter implements ProviderAdapter {
     const raw = await this.call(rawPaymentOrder, 'POST', '/v2/orders/payment', {}, {
       clientReference: input.idempotencyKey,
       payments: {
-        amount: Number(input.amount),
+        amount: wireAmount(input.amount),
         currency: { budgetId: budget.id, currencyCode: input.currency },
         recipientId: input.beneficiaryId,
         internalReference: input.reason,
@@ -398,23 +426,26 @@ export class EqualsAdapter implements ProviderAdapter {
 
 export interface EqualsFactoryOptions {
   credentials: { apiKey: string } | null;
-  /** The wire for one company's account. Defaults to an in-memory mock per company. */
-  transportFor?: (company: CompanyRecord) => EqualsTransport;
+  /** The wire to the provider. Defaults to the in-memory mock holding several accounts. */
+  transport?: EqualsTransport;
+  /** Where idempotency-key -> order mappings are kept (outside any adapter instance). */
+  keys: Table<ProviderKeyRecord>;
   now?: () => number;
 }
 
 export function equalsFactory(options: EqualsFactoryOptions): ProviderFactory {
-  const mocks = new Map<string, EqualsTransport>();
-  const mockFor = (company: CompanyRecord): EqualsTransport => {
-    let mock = mocks.get(company.providerAccountId);
-    if (!mock) {
-      mock = new MockEqualsServer(company.providerAccountId, { now: options.now });
-      mocks.set(company.providerAccountId, mock);
-    }
-    return mock;
-  };
-  return async (company) => {
-    if (!options.credentials) throw new Error('Provider credentials are not configured');
-    return new EqualsAdapter((options.transportFor ?? mockFor)(company), company, options.credentials.apiKey, { now: options.now });
+  const transport = options.transport ?? new MockEqualsServer({ now: options.now });
+  return {
+    mock: options.transport === undefined || options.transport instanceof MockEqualsServer,
+    async forCompany(company) {
+      if (!options.credentials) throw new Error('Provider credentials are not configured');
+      return new EqualsAdapter(transport, company, options.credentials.apiKey, { now: options.now, keys: options.keys });
+    },
+    async accountExists(mapping) {
+      if (!options.credentials || !mapping.providerAccountId) return false;
+      // The account's budgets can be listed only if the account exists for these credentials.
+      const response = await transport.request({ method: 'GET', path: '/v2/budgets', query: { accountId: mapping.providerAccountId, limit: '1' }, apiKey: options.credentials.apiKey });
+      return response.status >= 200 && response.status < 300;
+    },
   };
 }

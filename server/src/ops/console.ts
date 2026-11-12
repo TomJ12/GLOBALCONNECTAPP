@@ -5,14 +5,22 @@
  * own session cookie and session table, its own routes. It reads no bearer
  * token, and the client API reads no cookie.
  *
- * What staff CANNOT do is enforced by absence: there is no route here that
- * reads or sets a password, authenticator key or recovery code of someone
- * else, none that reaches a provider (balances, transactions, payments,
- * conversions), and none that starts a client session.
+ * Three things keep one staff member from becoming a client or re-pointing a
+ * client's money:
+ *  1. No activation link or code is ever rendered. Links go by email to the
+ *     address on file (Mailer); the console shows only a masked address.
+ *  2. FOUR-EYES: the sensitive actions (see `fourEyes` below) only create a
+ *     request. A DIFFERENT active staff member must approve it, with their own
+ *     fresh authenticator code, before anything changes.
+ *  3. A company's provider mapping can be set only by an ops admin, to an
+ *     account the provider confirms exists and that no other company uses.
  *
- * Every state-changing request needs: the session cookie, the CSRF field, and
- * a fresh authenticator code from the staff member (step-up). Each one is
- * written to the audit log, whether it succeeded or not.
+ * Every state-changing request needs the session cookie, the CSRF field and a
+ * fresh authenticator code from the staff member (step-up), and is written to
+ * the audit log whether it succeeded or not. There is no route that reads or
+ * sets someone else's password, authenticator key or recovery codes, none
+ * that reaches a provider's balances, transactions or payments, and none that
+ * starts a client session.
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -25,9 +33,10 @@ import { reasonOf, type AuthService } from '../auth/service';
 import type { Config } from '../config';
 import { randomToken, safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
+import { activationMessage, maskEmail, type Mailer } from '../mailer';
 import type { ProviderRegistry } from '../providers/adapter';
-import type { AuditParty, CompanyRecord, OpsRole, OpsUserRecord, ProviderKey, Stores, UserRecord } from '../store/types';
-import { opsParty, type Invitation, type OpsAuthService, type OpsContext } from './auth';
+import type { ApprovalRecord, AuditParty, CompanyRecord, OpsRole, OpsUserRecord, ProviderKey, Stores, UserRecord } from '../store/types';
+import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { codeField, h, Html, layout, qrSvg, when } from './html';
 
 export interface OpsDeps {
@@ -36,14 +45,14 @@ export interface OpsDeps {
   auth: AuthService;
   opsAuth: OpsAuthService;
   registry: ProviderRegistry;
+  mailer: Mailer;
   now: () => number;
   limitAttempts: (request: FastifyRequest) => Promise<void>;
 }
 
-const SESSION_COOKIE = 'gc_ops_session';
-const PRE_COOKIE = 'gc_ops_pre';
 const CLIENT_ROLES: UserRole[] = ['creator', 'approver', 'admin'];
 const OPS_ROLES: OpsRole[] = ['ops', 'ops_admin'];
+const PRE_SESSION_MS = 30 * 60_000;
 
 /** Staff choose a provider by a neutral label; the name is shown beside it because staff need it. Never sent to the client app. */
 const PROVIDERS: Record<ProviderKey, { slug: string; label: string }> = {
@@ -64,27 +73,33 @@ export class OpsError extends Error {
 
 const MESSAGES: Record<string, string> = {
   invalid_code: 'That authenticator code was not accepted. Nothing was changed.',
-  code_reused: 'That code has already been used. Wait for the next code and try again. Nothing was changed.',
+  code_reused: 'That code has already been used. Nothing was changed.',
   locked: 'Too many wrong attempts. Try again later.',
   invalid_credentials: 'The email or password is not right.',
   challenge_expired: 'That sign-in attempt has expired. Start again.',
   activation_invalid: 'That activation code is not valid. It may have expired, been used or been replaced.',
   weak_password: 'Choose a password of at least 12 characters that is not a common one.',
 };
-const messageOf = (error: unknown): string =>
-  error instanceof OpsError ? error.message : error instanceof ApiError ? (MESSAGES[error.options.reason ?? ''] ?? (error.kind === 'not_found' ? 'Not found.' : 'The request was not accepted.')) : 'Something went wrong.';
+function messageOf(error: unknown): string {
+  if (error instanceof OpsError) return error.message;
+  if (!(error instanceof ApiError)) return 'Something went wrong.';
+  const reason = error.options.reason ?? '';
+  // Accurate about the wait: the next code appears when the authenticator's 30-second step changes.
+  if (reason === 'code_reused') return `${MESSAGES.code_reused} Your authenticator shows a new code in about ${error.options.retryAfterSeconds ?? 30} seconds; use that one.`;
+  return MESSAGES[reason] ?? (error.kind === 'not_found' ? 'Not found.' : error.kind === 'rate_limited' ? 'Too many requests. Try again shortly.' : 'The request was not accepted.');
+}
 const statusOf = (error: unknown): number => (error instanceof OpsError ? error.status : error instanceof ApiError ? error.status : 500);
 
 /** A staff member may not remove their own access, and the last active ops admin may not be removed. */
 export async function assertStaffRemovalAllowed(stores: Stores, actorId: string, target: OpsUserRecord): Promise<void> {
   if (actorId === target.id) throw new OpsError('You cannot do this to your own account.', 403, 'self');
   if (target.role !== 'ops_admin') return;
-  const others = (await stores.ops.users.list()).filter((user) => user.id !== target.id && user.role === 'ops_admin' && user.disabledAt === null && user.activatedAt !== null);
+  const others = (await stores.ops.users.list()).filter((user) => user.id !== target.id && user.role === 'ops_admin' && isActiveStaff(user));
   if (others.length === 0) throw new OpsError('This is the last active ops admin and cannot be removed.', 403, 'last_admin');
 }
 
 type Form = Record<string, string>;
-const text = (form: Form, name: string): string => (form[name] ?? '').trim();
+const text = (form: Form, name: string): string => (typeof form[name] === 'string' ? (form[name] as string) : '').trim();
 function need(form: Form, name: string, label: string, max = 120): string {
   const value = text(form, name);
   if (!value || value.length > max) throw new OpsError(`${label} is required (at most ${max} characters).`);
@@ -118,11 +133,15 @@ const asset = (relative: string): Buffer | null => {
 };
 
 export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<{ method: string; url: string }[]> {
-  const { config, stores, auth, opsAuth, registry, now, limitAttempts } = deps;
+  const { config, stores, auth, opsAuth, registry, mailer, now, limitAttempts } = deps;
   const routes: { method: string; url: string }[] = [];
-  const secure = !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(config.opsUrl);
+  // Outside development OPS_URL must be https (config.ts), so the cookie is always Secure there.
+  const secure = config.opsUrl.startsWith('https://');
+  // With Secure the cookies take the __Host- prefix (which requires Path=/): a sibling subdomain cannot plant or overwrite them.
+  const SESSION_COOKIE = secure ? '__Host-gc_ops_session' : 'gc_ops_session';
+  const PRE_COOKIE = secure ? '__Host-gc_ops_pre' : 'gc_ops_pre';
   const cookie = (name: string, value: string, clear = false) =>
-    `${name}=${value}; Path=/ops; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}${clear ? '; Max-Age=0' : ''}`;
+    `${name}=${value}; Path=${secure ? '/' : '/ops'}; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}${clear ? '; Max-Age=0' : ''}`;
   const csrfFor = (anchor: string): string => sha256(`ops-csrf:${anchor}`);
   const providerKeys = (Object.keys(PROVIDERS) as ProviderKey[]).filter((key) => config.providers[key] !== null);
 
@@ -141,6 +160,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         for (const method of [route.method].flat()) routes.push({ method: String(method), url: route.url });
       });
       ops.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string', bodyLimit: 16 * 1024 }, (_request, body, done) => {
+        // A repeated field keeps its last value; every value is a string.
         done(null, Object.fromEntries(new URLSearchParams(body as string)));
       });
       ops.addHook('onSend', async (_request, reply) => {
@@ -149,11 +169,12 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         reply.header('Referrer-Policy', 'no-referrer');
         reply.header('Cache-Control', 'no-store');
         reply.header('X-Content-Type-Options', 'nosniff');
+        if (secure) reply.header('Strict-Transport-Security', 'max-age=31536000');
       });
 
       const send = (reply: FastifyReply, status: number, page: string) => reply.status(status).type('text/html; charset=utf-8').send(page);
       const chromeOf = (ctx: OpsContext, title: string, flash?: string) => ({ title, user: ctx.user, csrf: csrfFor(ctx.token), flash });
-      const problem = (reply: FastifyReply, ctx: OpsContext | null, error: unknown, csrf = '') => {
+      const problem = (reply: FastifyReply, ctx: OpsContext | null, error: unknown) => {
         const status = statusOf(error);
         if (error instanceof ApiError && error.options.retryAfterSeconds !== undefined) reply.header('Retry-After', String(error.options.retryAfterSeconds));
         if (status >= 500) app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'ops request failed');
@@ -161,7 +182,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           reply,
           status,
           layout(
-            { title: status === 404 ? 'Not found' : 'Not done', user: ctx?.user ?? null, csrf: ctx ? csrfFor(ctx.token) : csrf },
+            { title: status === 404 ? 'Not found' : 'Not done', user: ctx?.user ?? null, csrf: ctx ? csrfFor(ctx.token) : '' },
             h`<div class="card"><p class="error" role="alert">${messageOf(error)}</p><p>Use your browser’s back button to try again, or <a href="/ops">return to the console</a>.</p></div>`,
           ),
         );
@@ -174,7 +195,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const site = request.headers['sec-fetch-site'];
         return site === undefined || site === 'same-origin' || site === 'none';
       };
-      const csrfOk = (request: FastifyRequest, anchor: string | undefined): boolean => {
+      const fieldOk = (request: FastifyRequest, anchor: string | undefined): boolean => {
         const sent = (request.body as Form | null)?._csrf;
         return sameSite(request) && !!anchor && typeof sent === 'string' && safeEqual(sent, csrfFor(anchor));
       };
@@ -184,6 +205,12 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         } catch {
           return null;
         }
+      };
+      /** One value of a query parameter, however many times it was given. */
+      const queryOf = (request: FastifyRequest, name: string): string => {
+        const value = (request.query as Record<string, unknown>)[name];
+        const first = Array.isArray(value) ? value[0] : value;
+        return typeof first === 'string' ? first.trim().slice(0, 200) : '';
       };
 
       type PageHandler = (ctx: OpsContext, request: FastifyRequest, reply: FastifyReply) => Promise<unknown>;
@@ -199,52 +226,136 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           }
         });
 
-      interface ActionInput {
+      // --- Actions -------------------------------------------------------------------
+
+      /** What an action will do, checked and ready, but not done. `params` is what is stored for a second staff member to approve: never a credential. */
+      interface Prepared {
+        params: Record<string, string>;
+        /** One line for the approver. */
+        summary: string;
+        warnings?: string[];
+      }
+      interface Actors {
+        requester: OpsUserRecord;
+        /** Null when the action needs no second person (or four-eyes is off in development). */
+        approver: OpsUserRecord | null;
+        source: string;
+      }
+      interface Applied {
+        target: AuditParty | null;
+        detail?: Record<string, string>;
+        redirect: string;
+      }
+      interface PrepareInput {
+        actor: OpsUserRecord;
+        form: Form;
+        params: Record<string, string>;
+        /** Names who or what the action is about, as early as possible, so that a refusal is logged against it. */
+        aim: (target: AuditParty) => void;
+      }
+      interface ActionDef {
+        name: string;
+        admin?: boolean;
+        /** Needs approval by a second staff member. A function when it depends on what is being changed. */
+        fourEyes?: boolean | ((params: Record<string, string>) => boolean);
+        /** The result is an activation email; the approval page then says where it went. */
+        mails?: boolean;
+        prepare(input: PrepareInput): Promise<Prepared>;
+        /** Does it. Re-checks everything: by the time a request is approved, things may have changed. */
+        apply(params: Record<string, string>, actors: Actors): Promise<Applied>;
+      }
+      const actions = new Map<string, ActionDef>();
+      const needsApproval = (def: ActionDef, params: Record<string, string>): boolean =>
+        config.fourEyes && (typeof def.fourEyes === 'function' ? def.fourEyes(params) : def.fourEyes === true);
+      const person = (user: OpsUserRecord) => ({ id: user.id, email: user.email });
+      const append = (actor: AuditParty, action: string, outcome: 'success' | 'failure', target: AuditParty | null, source: string, detail: Record<string, string>) =>
+        stores.audit.append({ at: now(), actor, target, action, outcome, source, detail });
+
+      /**
+       * The frame every state-changing POST runs in: session, CSRF field, role,
+       * `run` (which must call stepUp before changing anything) and an audit
+       * entry for the outcome, with the target when it is known.
+       */
+      interface PostInput {
         ctx: OpsContext;
         form: Form;
         params: Record<string, string>;
         source: string;
-        /** Must be called once the input is valid and before anything is changed. */
+        aim: (target: AuditParty) => void;
         stepUp: () => Promise<void>;
       }
-      interface ActionResult {
-        target: AuditParty | null;
-        detail?: Record<string, string>;
-        redirect?: string;
-        /** A page shown once instead of a redirect (an activation link). */
-        show?: Html;
-        title?: string;
-      }
-      const action = (url: string, options: { name: string; admin?: boolean }, handler: (input: ActionInput) => Promise<ActionResult>) =>
+      const post = (url: string, options: { name: string; admin?: boolean }, run: (input: PostInput) => Promise<{ detail?: Record<string, string>; redirect: string; audited?: boolean }>) =>
         ops.post(url, { preHandler: limitAttempts }, async (request, reply) => {
           const ctx = await sessionOf(request);
           if (!ctx) return problem(reply, null, new OpsError('Your session has ended. Sign in again.', 401));
-          if (!csrfOk(request, ctx.token)) return problem(reply, ctx, new OpsError('This form could not be verified. Reload the page and try again.', 403));
+          if (!fieldOk(request, ctx.token)) return problem(reply, ctx, new OpsError('This form could not be verified. Reload the page and try again.', 403));
           const form = (request.body ?? {}) as Form;
-          const record = (outcome: 'success' | 'failure', target: AuditParty | null, detail: Record<string, string>) =>
-            stores.audit.append({ at: now(), actor: opsParty(ctx.user), target, action: `ops.${options.name}`, outcome, source: request.ip, detail });
+          let target: AuditParty | null = null;
           let steppedUp = false;
           try {
             if (options.admin && ctx.user.role !== 'ops_admin') throw new OpsError('Only an ops admin can do that.', 403, 'forbidden');
-            const result = await handler({
+            const result = await run({
               ctx,
               form,
               params: request.params as Record<string, string>,
               source: request.ip,
+              aim: (party) => {
+                target = party;
+              },
               stepUp: async () => {
                 await opsAuth.stepUp(ctx, text(form, 'code'), options.name, request.ip);
                 steppedUp = true;
               },
             });
             if (!steppedUp) throw new Error(`ops action ${options.name} ran without step-up`);
-            await record('success', result.target, result.detail ?? {});
-            if (result.show) return send(reply, 200, layout(chromeOf(ctx, result.title ?? 'Done'), result.show));
-            return reply.redirect(result.redirect ?? '/ops', 303);
+            if (!result.audited) await append(opsParty(ctx.user), `ops.${options.name}`, 'success', target, request.ip, result.detail ?? {});
+            return reply.redirect(result.redirect, 303);
           } catch (error) {
-            await record('failure', null, { reason: error instanceof OpsError ? error.reason : reasonOf(error) });
+            await append(opsParty(ctx.user), `ops.${options.name}`, 'failure', target, request.ip, { reason: error instanceof OpsError ? error.reason : reasonOf(error) });
             return problem(reply, ctx, error);
           }
         });
+
+      /** Registers a console action: done at once, or turned into a request for a second staff member. */
+      const action = (url: string, def: ActionDef) => {
+        actions.set(def.name, def);
+        post(url, { name: def.name, admin: def.admin }, async ({ ctx, form, params, source, aim, stepUp }) => {
+          let target: AuditParty | null = null;
+          const prepared = await def.prepare({
+            actor: ctx.user,
+            form,
+            params,
+            aim: (party) => {
+              target = party;
+              aim(party);
+            },
+          });
+          await stepUp();
+          if (!needsApproval(def, prepared.params)) {
+            const applied = await def.apply(prepared.params, { requester: ctx.user, approver: null, source });
+            const about = applied.target ?? target;
+            if (about) aim(about);
+            return { detail: applied.detail, redirect: applied.redirect };
+          }
+          const request: ApprovalRecord = {
+            id: `req_${randomToken().slice(0, 16)}`,
+            action: def.name,
+            params: prepared.params,
+            summary: prepared.summary,
+            warnings: prepared.warnings ?? [],
+            target,
+            requestedBy: person(ctx.user),
+            requestedAt: now(),
+            expiresAt: now() + config.approvalTtlMs,
+            status: 'pending',
+            decidedBy: null,
+            decidedAt: null,
+          };
+          await stores.ops.approvals.put(request.id, request);
+          await append(opsParty(ctx.user), 'ops.approval.request', 'success', target, source, { request: request.id, action: def.name, summary: prepared.summary });
+          return { redirect: `/ops/approvals/${request.id}?done=requested`, audited: true };
+        });
+      };
 
       // --- Static files (no session needed: they hold nothing private) ---------
       ops.get('/static/:file', async (request, reply) => {
@@ -254,13 +365,22 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       });
 
       // --- Activation and sign-in (no session yet) -------------------------------
-      /** The cookie that anchors the CSRF field before there is a session. */
-      const preAnchor = (request: FastifyRequest, reply: FastifyReply): string => {
+      /**
+       * The cookie that anchors the CSRF field before there is a session. It is
+       * issued by the server and remembered (hashed) for half an hour: a value
+       * the server did not issue anchors nothing.
+       */
+      const preAnchor = async (request: FastifyRequest, reply: FastifyReply): Promise<string> => {
         const existing = cookiesOf(request)[PRE_COOKIE];
-        if (existing && /^[\w-]{20,}$/.test(existing)) return existing;
+        if (existing && (await preAnchorKnown(existing))) return existing;
         const fresh = randomToken();
+        await stores.ops.preSessions.put(sha256(fresh), { expiresAt: now() + PRE_SESSION_MS });
         reply.header('Set-Cookie', cookie(PRE_COOKIE, fresh));
         return fresh;
+      };
+      const preAnchorKnown = async (anchor: string | undefined): Promise<boolean> => {
+        const record = anchor ? await stores.ops.preSessions.get(sha256(anchor)) : null;
+        return record !== null && record.expiresAt > now();
       };
       const publicPage = (reply: FastifyReply, anchor: string, title: string, body: Html, status = 200) =>
         send(reply, status, layout({ title, user: null, csrf: csrfFor(anchor) }, h`<div class="card narrow">${body}</div>`));
@@ -272,7 +392,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       const publicPost = (url: string, handler: (form: Form, anchor: string, request: FastifyRequest, reply: FastifyReply) => Promise<unknown>, again: (form: Form, anchor: string, message: string, reply: FastifyReply) => Promise<unknown> | unknown) =>
         ops.post(url, { preHandler: limitAttempts }, async (request, reply) => {
           const anchor = cookiesOf(request)[PRE_COOKIE];
-          if (!csrfOk(request, anchor)) return problem(reply, null, new OpsError('This form could not be verified. Reload the page and try again.', 403));
+          if (!fieldOk(request, anchor) || !(await preAnchorKnown(anchor))) return problem(reply, null, new OpsError('This form could not be verified. Reload the page and try again.', 403));
           const form = (request.body ?? {}) as Form;
           try {
             return await handler(form, anchor as string, request, reply);
@@ -309,7 +429,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           reply.statusCode,
         );
 
-      ops.get('/activate', async (request, reply) => activateForm(reply, preAnchor(request, reply)));
+      ops.get('/activate', async (request, reply) => activateForm(reply, await preAnchor(request, reply)));
       publicPost(
         '/activate',
         async (form, anchor, _request, reply) => passwordForm(reply, anchor, text(form, 'activationCode'), await opsAuth.activationStart(text(form, 'activationCode'))),
@@ -317,7 +437,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       );
       publicPost(
         '/activate/password',
-        async (form, anchor, _request, reply) => enrolForm(reply, anchor, text(form, 'activationCode'), await opsAuth.activationPassword(text(form, 'activationCode'), form.password ?? '')),
+        async (form, anchor, _request, reply) => enrolForm(reply, anchor, text(form, 'activationCode'), await opsAuth.activationPassword(text(form, 'activationCode'), typeof form.password === 'string' ? form.password : '')),
         async (form, anchor, message, reply) => {
           try {
             return passwordForm(reply, anchor, text(form, 'activationCode'), await opsAuth.activationStart(text(form, 'activationCode')), message);
@@ -362,53 +482,64 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           h`${alert(message)}<form method="post" action="/ops/login/verify">${hidden(anchor, { challengeId })}<label>Code from your authenticator app, or a recovery code <input name="code" required autocomplete="one-time-code"></label><label>Type <select name="method"><option value="totp">Authenticator code</option><option value="recovery">Recovery code</option></select></label><button>Sign in</button></form>`,
           reply.statusCode,
         );
-      ops.get('/login', async (request, reply) => loginForm(reply, preAnchor(request, reply)));
+      ops.get('/login', async (request, reply) => loginForm(reply, await preAnchor(request, reply)));
       publicPost(
         '/login',
-        async (form, anchor, request, reply) => codeForm(reply, anchor, (await opsAuth.login(text(form, 'email'), form.password ?? '', request.ip)).challengeId),
+        async (form, anchor, request, reply) => codeForm(reply, anchor, (await opsAuth.login(text(form, 'email'), typeof form.password === 'string' ? form.password : '', request.ip)).challengeId),
         (_form, anchor, message, reply) => loginForm(reply, anchor, message),
       );
       publicPost(
         '/login/verify',
-        async (form, _anchor, request, reply) => {
+        async (form, anchor, request, reply) => {
           const { token } = await opsAuth.verifyLogin(text(form, 'challengeId'), text(form, 'code'), form.method === 'recovery' ? 'recovery' : 'totp', request.ip);
+          await stores.ops.preSessions.delete(sha256(anchor));
           return reply.header('Set-Cookie', [cookie(SESSION_COOKIE, token), cookie(PRE_COOKIE, '', true)]).redirect('/ops', 303);
         },
         (form, anchor, message, reply) => (message === MESSAGES.challenge_expired ? loginForm(reply, anchor, message) : codeForm(reply, anchor, text(form, 'challengeId'), message)),
       );
       ops.post('/logout', async (request, reply) => {
         const token = cookiesOf(request)[SESSION_COOKIE];
-        if (!csrfOk(request, token)) return problem(reply, null, new OpsError('This form could not be verified.', 403));
+        if (!fieldOk(request, token)) return problem(reply, null, new OpsError('This form could not be verified.', 403));
         await opsAuth.logout(token, request.ip);
         return reply.header('Set-Cookie', cookie(SESSION_COOKIE, '', true)).redirect('/ops/login', 303);
       });
 
       // --- Shared page pieces ------------------------------------------------------
-      const FLASH: Record<string, string> = { saved: 'Saved.', created: 'Created.', unlocked: 'Account unlocked.', revoked: 'Sessions revoked.', disabled: 'Disabled.', enabled: 'Re-enabled.' };
-      const flashOf = (request: FastifyRequest): string | undefined => FLASH[(request.query as Record<string, string>).done ?? ''];
-      const queryOf = (request: FastifyRequest, name: string): string => ((request.query as Record<string, string | undefined>)[name] ?? '').trim();
-      const post = (ctx: OpsContext, url: string, fields: Html, button: string, options: { danger?: boolean; confirm?: string } = {}) =>
-        h`<form method="post" action="${url}"${options.confirm ? h` data-confirm="${options.confirm}"` : ''}><input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}"><div class="row tight">${fields}${codeField}<button${options.danger ? h` class="danger"` : ''}>${button}</button></div></form>`;
+      const FLASH: Record<string, string> = {
+        saved: 'Saved.',
+        created: 'Created.',
+        unlocked: 'Account unlocked.',
+        revoked: 'Sessions revoked.',
+        disabled: 'Disabled.',
+        enabled: 'Re-enabled.',
+        mailed: 'An activation email was sent to the address on file. The link is not shown to staff.',
+        requested: 'Request created. Nothing has changed yet: a different staff member must approve it.',
+        approved: 'Approved and carried out.',
+        rejected: 'Request rejected. Nothing was changed.',
+        cancelled: 'Request cancelled. Nothing was changed.',
+      };
+      const flashOf = (request: FastifyRequest): string | undefined => FLASH[queryOf(request, 'done')];
+      const csrfInput = (ctx: OpsContext) => h`<input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}">`;
+      /** A one-line form with the step-up field. `request` marks an action that only creates a request for approval. */
+      const form = (ctx: OpsContext, url: string, fields: Html, button: string, options: { danger?: boolean; confirm?: string; request?: boolean } = {}) =>
+        h`<form method="post" action="${url}"${options.confirm ? h` data-confirm="${options.confirm}"` : ''}>${csrfInput(ctx)}<div class="row tight">${fields}${codeField}<button${options.danger ? h` class="danger"` : ''}>${options.request && config.fourEyes ? `Request: ${button}` : button}</button></div></form>`;
+      const fourEyesNote = config.fourEyes ? h`<p class="muted">Needs approval by a second staff member before it takes effect.</p>` : h``;
       const search = (url: string, q: string, label: string) =>
         h`<form method="get" action="${url}"><label>${label} <input type="search" name="q" value="${q}"></label><button class="quiet">Search</button></form>`;
       const tag = (ok: boolean, yes: string, no: string) => h`<span class="tag ${ok ? 'ok' : 'bad'}">${ok ? yes : no}</span>`;
       const roleSelect = (name: string, roles: readonly string[], current = '', blank = false) =>
         h`<select name="${name}">${blank && h`<option value="">—</option>`}${roles.map((role) => h`<option value="${role}"${role === current ? h` selected` : ''}>${role}</option>`)}</select>`;
       const VERIFY_WARNING =
-        'Verify this person’s identity BEFORE resetting. Anyone who receives the new activation link can take over the account. Use a contact detail already on file, not one given in the request.';
-      const verifyField = h`<label>How was identity verified? (kept in the audit log) <textarea name="verification" required minlength="10" maxlength="500" rows="2"></textarea></label>`;
-      const needVerification = (form: Form): string => {
-        const value = text(form, 'verification');
+        'Verify this person’s identity BEFORE resetting. The new activation link is emailed to the address on file; whoever controls that mailbox controls the account. Use a contact detail already on file, not one given in the request.';
+      const verifyField = h`<label>How was identity verified? (kept in the audit log and shown to the approver) <textarea name="verification" required minlength="10" maxlength="500" rows="2"></textarea></label>`;
+      const needVerification = (input: Form): string => {
+        const value = text(input, 'verification');
         if (value.length < 10 || value.length > 500) throw new OpsError('Say how the person’s identity was verified (10 to 500 characters).');
         return value;
       };
-      const linkPage = (invite: Invitation, who: string, back: string, forceNew: boolean) =>
-        h`<div class="card"><p class="warn"><strong>This link is shown once.</strong> Global Connect does not email it. Pass it to ${who} only through an approved channel, after confirming who you are talking to.</p>
-<p>Activation link:</p><p class="secret" id="link">${invite.activationLink}</p><p><button type="button" class="quiet" data-copy="link">Copy link</button></p>
-<p>Activation code: <span class="secret">${invite.activationCode}</span></p><p>Expires ${when(invite.expiresAt)}. Any earlier link for this person no longer works.${forceNew && ' They will choose a new password and add their authenticator again.'}</p><p><a href="${back}">Back</a></p></div>`;
 
       const clientParty = (user: UserRecord): AuditParty => ({ type: 'client', id: user.id, label: user.email });
-      const companyParty = (company: CompanyRecord): AuditParty => ({ type: 'company', id: company.id, label: company.name });
+      const companyParty = (company: Pick<CompanyRecord, 'id' | 'name'>): AuditParty => ({ type: 'company', id: company.id, label: company.name });
       const clientOf = async (id: string | undefined): Promise<UserRecord> => {
         const user = id ? await stores.directory.getUser(id) : null;
         if (!user) throw new OpsError('No such client user.', 404, 'not_found');
@@ -425,25 +556,179 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         return user;
       };
       /** Ends a client's sessions and records that it happened. */
-      const revokeClientSessions = async (ctx: OpsContext, user: UserRecord, source: string, why: string): Promise<number> => {
+      const revokeClientSessions = async (actor: OpsUserRecord, user: UserRecord, source: string, why: string): Promise<number> => {
         const total = await auth.revokeAllSessions(user.id);
-        await stores.audit.append({ at: now(), actor: opsParty(ctx.user), target: clientParty(user), action: 'client.session_revoked', outcome: 'success', source, detail: { sessions: String(total), why } });
+        await append(opsParty(actor), 'client.session_revoked', 'success', clientParty(user), source, { sessions: String(total), why });
         return total;
+      };
+      /** Emails a new activation link to the address on file. The link itself never reaches the console. */
+      const mailClientLink = async (user: UserRecord): Promise<Record<string, string>> => {
+        const invite = await auth.createInvite(user.email);
+        await mailer.send(activationMessage(invite, user.email, user.name, 'client'));
+        return { sentTo: maskEmail(user.email), expires: when(invite.expiresAt) };
+      };
+      const mailStaffLink = async (user: OpsUserRecord): Promise<Record<string, string>> => {
+        const invite = await opsAuth.createInvite(user.id);
+        await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
+        return { sentTo: maskEmail(user.email), expires: when(invite.expiresAt) };
       };
 
       ops.get('/', async (_request, reply) => reply.redirect('/ops/users', 303));
+
+      // --- Approvals (four-eyes) ---------------------------------------------------------
+      /** Marks requests past their 24 hours as expired, and records each one. */
+      const expireApprovals = async (): Promise<void> => {
+        const at = now();
+        for (const stale of await stores.ops.approvals.list((item) => item.status === 'pending' && item.expiresAt <= at)) {
+          let mine = false;
+          await stores.ops.approvals.mutate(stale.id, (current) => {
+            mine = current !== null && current.status === 'pending';
+            return mine && current ? { ...current, status: 'expired', decidedAt: at } : undefined;
+          });
+          if (mine) {
+            await append({ type: 'system', id: null, label: 'expiry' }, 'ops.approval.expire', 'success', stale.target, '', { request: stale.id, action: stale.action, requestedBy: stale.requestedBy.email });
+          }
+        }
+      };
+      const approvalOf = async (id: string | undefined): Promise<ApprovalRecord> => {
+        await expireApprovals();
+        const request = id ? await stores.ops.approvals.get(id) : null;
+        if (!request) throw new OpsError('No such request.', 404, 'not_found');
+        return request;
+      };
+      /** Moves a pending request to its final state. Atomic: of two decisions arriving together, one wins. */
+      const decide = async (request: ApprovalRecord, status: 'approved' | 'rejected' | 'cancelled', by: OpsUserRecord): Promise<void> => {
+        const decidedAt = now();
+        const changed = await stores.ops.approvals.mutate(request.id, (current) =>
+          current && current.status === 'pending' && current.expiresAt > decidedAt ? { ...current, status, decidedBy: person(by), decidedAt } : undefined,
+        );
+        if (!changed || changed.status !== status || changed.decidedBy?.id !== by.id || changed.decidedAt !== decidedAt) throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
+      };
+      const statusTag = (request: ApprovalRecord) => h`<span class="tag ${request.status === 'approved' ? 'ok' : request.status === 'pending' ? '' : 'bad'}">${request.status}</span>`;
+
+      page('/approvals', {}, async (ctx, request, reply) => {
+        await expireApprovals();
+        const all = (await stores.ops.approvals.list()).sort((a, b) => b.requestedAt - a.requestedAt);
+        const row = (item: ApprovalRecord) =>
+          h`<tr><td><a href="/ops/approvals/${item.id}">${item.summary}</a></td><td>${item.requestedBy.email}</td><td>${when(item.requestedAt)}</td><td>${statusTag(item)}</td><td>${item.status === 'pending' ? `expires ${when(item.expiresAt)}` : item.decidedBy ? `${item.decidedBy.email}, ${when(item.decidedAt)}` : when(item.decidedAt)}</td></tr>`;
+        const pending = all.filter((item) => item.status === 'pending');
+        return send(
+          reply,
+          200,
+          layout(
+            chromeOf(ctx, 'Approvals', flashOf(request)),
+            h`<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
+<div class="card"><h2>Decided (latest 50)</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th>Decided</th></tr>${all.filter((item) => item.status !== 'pending').slice(0, 50).map(row)}</table></div>`,
+          ),
+        );
+      });
+      page('/approvals/:id', {}, async (ctx, request, reply) => {
+        const item = await approvalOf((request.params as { id: string }).id);
+        const def = actions.get(item.action);
+        const base = `/ops/approvals/${item.id}`;
+        const mine = item.requestedBy.id === ctx.user.id;
+        const aboutMe = item.target?.type === 'ops' && item.target.id === ctx.user.id;
+        return send(
+          reply,
+          200,
+          layout(
+            chromeOf(ctx, 'Approval request', flashOf(request)),
+            h`<div class="grid"><div class="card"><h2>${item.summary} ${statusTag(item)}</h2>${item.warnings.map((warning) => h`<p class="warn">${warning}</p>`)}<dl><dt>Action</dt><dd>${item.action}</dd><dt>About</dt><dd>${item.target?.label ?? ''}</dd><dt>Requested by</dt><dd>${item.requestedBy.email}, ${when(item.requestedAt)}</dd><dt>Expires</dt><dd>${when(item.expiresAt)}</dd>${
+              item.decidedBy && h`<dt>Decided by</dt><dd>${item.decidedBy.email}, ${when(item.decidedAt)}</dd>`
+            }${Object.entries(item.params).map(([key, value]) => h`<dt>${key}</dt><dd>${value}</dd>`)}</dl>${
+              item.status === 'approved' && def?.mails && item.target && h`<p class="flash">An activation email was sent to ${maskEmail(item.target.label)}. The link is not shown to staff.</p>`
+            }</div>
+<div>${
+              item.status !== 'pending'
+                ? h`<div class="card"><p class="muted">This request is ${item.status}.</p></div>`
+                : mine
+                  ? h`<div class="card"><h2>Your request</h2><p class="muted">You cannot approve your own request. A different staff member must do it.</p>${form(ctx, `${base}/cancel`, h``, 'Cancel request')}</div>`
+                  : h`<div class="card"><h2>Decide</h2>${
+                      aboutMe
+                        ? h`<p class="muted">This request is about your own account, so you cannot approve it.</p>`
+                        : h`<p class="muted">Approving carries the change out now, in your name and the requester’s. Check it against what you know.</p>${form(ctx, `${base}/approve`, h``, 'Approve', { confirm: 'Approve and carry out this change?' })}`
+                    }${form(ctx, `${base}/reject`, h``, 'Reject', { danger: true })}</div>`
+            }</div></div>`,
+          ),
+        );
+      });
+      post('/approvals/:id/approve', { name: 'approval.approve' }, async ({ ctx, params, source, aim, stepUp }) => {
+        const item = await approvalOf(params.id);
+        if (item.target) aim(item.target);
+        const def = actions.get(item.action);
+        if (!def || item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
+        // Four eyes: never the person who asked, and never the person the request is about.
+        if (item.requestedBy.id === ctx.user.id) throw new OpsError('You cannot approve your own request. A different staff member must do it.', 403, 'own_request');
+        if (item.target?.type === 'ops' && item.target.id === ctx.user.id) throw new OpsError('This request is about your own account, so you cannot approve it.', 403, 'self');
+        const requester = await stores.ops.users.get(item.requestedBy.id);
+        if (!requester || !isActiveStaff(requester) || (def.admin && requester.role !== 'ops_admin')) throw new OpsError('The staff member who made this request can no longer make it. Reject it instead.', 409, 'requester_inactive');
+        await stepUp();
+        await decide(item, 'approved', ctx.user);
+        let applied: Applied;
+        try {
+          applied = await def.apply(item.params, { requester, approver: ctx.user, source });
+        } catch (error) {
+          // It could not be carried out (things changed since it was asked for): it goes back to waiting.
+          await stores.ops.approvals.mutate(item.id, (current) => (current && current.status === 'approved' ? { ...current, status: 'pending', decidedBy: null, decidedAt: null } : undefined));
+          throw error;
+        }
+        const both = { request: item.id, requestedBy: requester.email, approvedBy: ctx.user.email };
+        await append(opsParty(requester), `ops.${def.name}`, 'success', applied.target ?? item.target, source, { ...applied.detail, ...both });
+        await append(opsParty(ctx.user), 'ops.approval.approve', 'success', applied.target ?? item.target, source, { ...both, action: def.name });
+        return { redirect: `/ops/approvals/${item.id}?done=approved`, audited: true };
+      });
+      post('/approvals/:id/reject', { name: 'approval.reject' }, async ({ ctx, params, aim, stepUp }) => {
+        const item = await approvalOf(params.id);
+        if (item.target) aim(item.target);
+        if (item.requestedBy.id === ctx.user.id) throw new OpsError('To withdraw your own request, cancel it.', 403, 'own_request');
+        await stepUp();
+        await decide(item, 'rejected', ctx.user);
+        return { detail: { request: item.id, action: item.action, requestedBy: item.requestedBy.email, rejectedBy: ctx.user.email }, redirect: `/ops/approvals/${item.id}?done=rejected` };
+      });
+      post('/approvals/:id/cancel', { name: 'approval.cancel' }, async ({ ctx, params, aim, stepUp }) => {
+        const item = await approvalOf(params.id);
+        if (item.target) aim(item.target);
+        if (item.requestedBy.id !== ctx.user.id) throw new OpsError('Only the staff member who made a request can cancel it. You can reject it.', 403, 'not_requester');
+        await stepUp();
+        await decide(item, 'cancelled', ctx.user);
+        return { detail: { request: item.id, action: item.action, requestedBy: item.requestedBy.email }, redirect: `/ops/approvals/${item.id}?done=cancelled` };
+      });
 
       // --- Companies ---------------------------------------------------------------
       const companyFields = (company: Partial<CompanyRecord> = {}) =>
         h`<label>Name <input name="name" required maxlength="120" value="${company.name ?? ''}"></label>
 <label>Provider <select name="provider" required>${providerKeys.map((key) => h`<option value="${PROVIDERS[key].slug}"${company.providerKey === key ? h` selected` : ''}>${PROVIDERS[key].label}</option>`)}</select></label>
 <label>Provider account id <input name="providerAccountId" required maxlength="120" value="${company.providerAccountId ?? ''}"></label>
-<label>Provider contact id (optional) <input name="providerContactId" maxlength="120" value="${company.providerContactId ?? ''}"></label>`;
-      const companyInput = (form: Form) => {
-        const slug = text(form, 'provider');
-        const providerKey = providerKeys.find((key) => PROVIDERS[key].slug === slug);
+<label>Provider contact id (required for provider A) <input name="providerContactId" maxlength="120" value="${company.providerContactId ?? ''}"></label>`;
+      type Mapping = Pick<CompanyRecord, 'providerKey' | 'providerAccountId' | 'providerContactId'>;
+      const mappingOf = (input: Record<string, string>): Mapping & { name: string } => {
+        const providerKey = providerKeys.find((key) => PROVIDERS[key].slug === text(input, 'provider'));
         if (!providerKey) throw new OpsError('Choose a provider.');
-        return { name: need(form, 'name', 'Name'), providerKey, providerAccountId: need(form, 'providerAccountId', 'Provider account id'), providerContactId: text(form, 'providerContactId').slice(0, 120) };
+        const providerContactId = text(input, 'providerContactId').slice(0, 120);
+        if (providerKey === 'currencycloud' && !providerContactId) throw new OpsError('Provider A needs the client’s contact id: every call is made on behalf of that contact.');
+        return { name: need(input, 'name', 'Name'), providerKey, providerAccountId: need(input, 'providerAccountId', 'Provider account id'), providerContactId };
+      };
+      const sameMapping = (a: Mapping, b: Mapping): boolean => a.providerKey === b.providerKey && a.providerAccountId === b.providerAccountId && a.providerContactId === b.providerContactId;
+      /**
+       * A company may be pointed only at an account that no other company
+       * (active or not) is pointed at, and that the provider confirms exists.
+       * Otherwise one tenant's users would read and move another's money.
+       */
+      const assertMappingAllowed = async (mapping: Mapping, exceptCompanyId: string | null): Promise<void> => {
+        const taken = (await stores.directory.listCompanies()).some((other) => other.id !== exceptCompanyId && other.providerKey === mapping.providerKey && other.providerAccountId === mapping.providerAccountId);
+        if (taken) throw new OpsError('Another company is already mapped to that provider account. Two companies can never share one.', 409, 'mapping_taken');
+        let exists = false;
+        try {
+          exists = await registry.accountExists(mapping.providerKey, mapping);
+        } catch {
+          throw new OpsError('The provider could not be asked whether that account exists. Nothing was changed; try again.', 502, 'provider_unavailable');
+        }
+        if (!exists) throw new OpsError('The provider does not know that account id (with that contact id). Check it and try again.', 400, 'mapping_unknown');
+      };
+      const membersOf = async (companyId: string): Promise<UserRecord[]> => {
+        const ids = (await stores.directory.listMemberships()).filter((item) => item.companyId === companyId).map((item) => item.userId);
+        const users = await Promise.all(ids.map((id) => stores.directory.getUser(id)));
+        return users.filter((user): user is UserRecord => user !== null);
       };
 
       page('/companies', {}, async (ctx, request, reply) => {
@@ -454,56 +739,112 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           200,
           layout(
             chromeOf(ctx, 'Companies', flashOf(request)),
-            h`<div class="toolbar">${search('/ops/companies', q, 'Search name or id')}<a class="button" href="/ops/companies/new">New company</a></div>
+            h`<div class="toolbar">${search('/ops/companies', q, 'Search name or id')}${ctx.user.role === 'ops_admin' && h`<a class="button" href="/ops/companies/new">New company</a>`}</div>
 <div class="card"><table><tr><th>Name</th><th>Provider</th><th>Provider account id</th><th>Status</th></tr>${companies.map(
               (company) => h`<tr><td><a href="/ops/companies/${company.id}">${company.name}</a></td><td>${PROVIDERS[company.providerKey].label}</td><td>${company.providerAccountId}</td><td>${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</td></tr>`,
             )}</table>${companies.length === 0 && h`<p class="muted">No companies found.</p>`}</div>`,
           ),
         );
       });
-      page('/companies/new', {}, async (ctx, _request, reply) =>
-        send(reply, 200, layout(chromeOf(ctx, 'New company'), h`<div class="card narrow"><form method="post" action="/ops/companies"><input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}">${companyFields()}${codeField}<button>Create company</button></form></div>`)),
+      page('/companies/new', { admin: true }, async (ctx, _request, reply) =>
+        send(
+          reply,
+          200,
+          layout(chromeOf(ctx, 'New company'), h`<div class="card narrow"><form method="post" action="/ops/companies">${csrfInput(ctx)}${companyFields()}<p class="muted">The provider is asked whether the account exists, and no two companies can use the same account.</p>${fourEyesNote}${codeField}<button>${config.fourEyes ? 'Request: create company' : 'Create company'}</button></form></div>`),
+        ),
       );
-      action('/companies', { name: 'company.create' }, async ({ form, stepUp }) => {
-        const input = companyInput(form);
-        await stepUp();
-        const company: CompanyRecord = { id: `co_${randomToken().slice(0, 12)}`, ...input, deactivatedAt: null };
-        await stores.directory.saveCompany(company);
-        return { target: companyParty(company), detail: { provider: PROVIDERS[company.providerKey].slug }, redirect: `/ops/companies/${company.id}?done=created` };
+      action('/companies', {
+        name: 'company.create',
+        admin: true,
+        fourEyes: true,
+        async prepare({ form: input }) {
+          const mapping = mappingOf(input);
+          await assertMappingAllowed(mapping, null);
+          return { params: { name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId }, summary: `Create company “${mapping.name}” on ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}` };
+        },
+        async apply(params) {
+          const mapping = mappingOf(params);
+          await assertMappingAllowed(mapping, null);
+          const company: CompanyRecord = { id: `co_${randomToken().slice(0, 12)}`, ...mapping, deactivatedAt: null };
+          await stores.directory.saveCompany(company);
+          return { target: companyParty(company), detail: { provider: PROVIDERS[company.providerKey].slug, providerAccountId: company.providerAccountId }, redirect: `/ops/companies/${company.id}?done=created` };
+        },
       });
       page('/companies/:id', {}, async (ctx, request, reply) => {
         const company = await companyOf((request.params as { id: string }).id);
-        const members = (await stores.directory.listMemberships()).filter((item) => item.companyId === company.id);
-        const users = await Promise.all(members.map(async (item) => ({ role: item.role, user: await stores.directory.getUser(item.userId) })));
+        const memberships = (await stores.directory.listMemberships()).filter((item) => item.companyId === company.id);
+        const users = await Promise.all(memberships.map(async (item) => ({ role: item.role, user: await stores.directory.getUser(item.userId) })));
         return send(
           reply,
           200,
           layout(
             chromeOf(ctx, company.name, flashOf(request)),
-            h`<div class="grid"><div class="card"><h2>Details ${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</h2><form method="post" action="/ops/companies/${company.id}"><input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}">${companyFields(company)}${codeField}<button>Save changes</button></form></div>
+            h`<div class="grid"><div class="card"><h2>Details ${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</h2><form method="post" action="/ops/companies/${company.id}">${csrfInput(ctx)}${companyFields(company)}<p class="muted">Changing the provider, account id or contact id needs an ops admin${config.fourEyes ? ' and approval by a second staff member' : ''}, and ends the sessions of everyone attached to this company.</p>${codeField}<button>Save changes</button></form></div>
 <div><div class="card"><h2>People</h2><table><tr><th>Name</th><th>Email</th><th>Role</th></tr>${users.map(({ role, user }) => user && h`<tr><td><a href="/ops/users/${user.id}">${user.name}</a></td><td>${user.email}</td><td>${role}</td></tr>`)}</table>${users.length === 0 && h`<p class="muted">Nobody yet. Attach people from their client user page.</p>`}</div>
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
-                ? post(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company')
-                : post(ctx, `/ops/companies/${company.id}/deactivate`, h``, 'Deactivate company', { danger: true, confirm: 'Deactivate this company?' })
+                ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company')
+                : form(ctx, `/ops/companies/${company.id}/deactivate`, h``, 'Deactivate company', { danger: true, confirm: 'Deactivate this company?' })
             }</div></div></div>`,
           ),
         );
       });
-      action('/companies/:id', { name: 'company.edit' }, async ({ form, params, stepUp }) => {
-        const company = await companyOf(params.id);
-        const input = companyInput(form);
-        await stepUp();
-        await stores.directory.saveCompany({ ...company, ...input });
-        registry.invalidate(company.id);
-        return { target: companyParty({ ...company, ...input }), detail: { provider: PROVIDERS[input.providerKey].slug }, redirect: `/ops/companies/${company.id}?done=saved` };
+      action('/companies/:id', {
+        name: 'company.edit',
+        // The mapping decides whose money a company's users see: changing it is the sensitive part.
+        fourEyes: (params) => params.mapping === 'changed',
+        async prepare({ actor, form: input, params, aim }) {
+          const company = await companyOf(params.id);
+          aim(companyParty(company));
+          const mapping = mappingOf(input);
+          const changed = !sameMapping(company, mapping);
+          const warnings: string[] = [];
+          if (changed) {
+            if (actor.role !== 'ops_admin') throw new OpsError('Only an ops admin can change a company’s provider, account id or contact id.', 403, 'forbidden');
+            await assertMappingAllowed(mapping, company.id);
+            const members = await membersOf(company.id);
+            warnings.push(`This re-points the company at a different provider account. ${members.length} ${members.length === 1 ? 'person is' : 'people are'} attached to it; ALL of their sessions will be ended when this is carried out.`);
+          }
+          return {
+            params: { id: company.id, name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId, mapping: changed ? 'changed' : 'same' },
+            summary: changed ? `Re-point company “${company.name}” to ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}` : `Rename company “${company.name}” to “${mapping.name}”`,
+            warnings,
+          };
+        },
+        async apply(params, { requester, source }) {
+          const company = await companyOf(params.id);
+          const mapping = mappingOf(params);
+          const changed = !sameMapping(company, mapping);
+          const detail: Record<string, string> = { provider: PROVIDERS[mapping.providerKey].slug, mapping: changed ? 'changed' : 'same' };
+          if (changed) {
+            // What was approved is what is done: a "same mapping" request can never change the mapping.
+            if (params.mapping !== 'changed' || requester.role !== 'ops_admin') throw new OpsError('The company’s mapping changed since this was requested. Make the request again.', 409, 'stale');
+            await assertMappingAllowed(mapping, company.id);
+          }
+          await stores.directory.saveCompany({ ...company, ...mapping });
+          if (changed) {
+            registry.invalidate(company.id);
+            let sessions = 0;
+            for (const member of await membersOf(company.id)) sessions += await revokeClientSessions(requester, member, source, 'company provider mapping changed');
+            detail.providerAccountId = mapping.providerAccountId;
+            detail.sessionsEnded = String(sessions);
+          }
+          return { target: companyParty({ id: company.id, name: mapping.name }), detail, redirect: `/ops/companies/${company.id}?done=saved` };
+        },
       });
       for (const [verb, deactivate] of [['deactivate', true], ['reactivate', false]] as const) {
-        action(`/companies/:id/${verb}`, { name: `company.${verb}` }, async ({ params, stepUp }) => {
-          const company = await companyOf(params.id);
-          await stepUp();
-          await stores.directory.saveCompany({ ...company, deactivatedAt: deactivate ? now() : null });
-          return { target: companyParty(company), redirect: `/ops/companies/${company.id}?done=saved` };
+        action(`/companies/:id/${verb}`, {
+          name: `company.${verb}`,
+          async prepare({ params, aim }) {
+            const company = await companyOf(params.id);
+            aim(companyParty(company));
+            return { params: { id: company.id }, summary: `${verb} company “${company.name}”` };
+          },
+          async apply(params) {
+            const company = await companyOf(params.id);
+            await stores.directory.saveCompany({ ...company, deactivatedAt: deactivate ? now() : null });
+            return { target: companyParty(company), redirect: `/ops/companies/${company.id}?done=saved` };
+          },
         });
       }
 
@@ -532,27 +873,43 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           200,
           layout(
             chromeOf(ctx, 'New client user'),
-            h`<div class="card narrow"><form method="post" action="/ops/users"><input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}"><label>Name <input name="name" required maxlength="120"></label><label>Email <input type="email" name="email" required maxlength="254"></label>${[1, 2, 3].map(pick)}<p class="muted">More companies can be attached afterwards. The person cannot sign in until you issue an activation link.</p>${codeField}<button>Create client user</button></form></div>`,
+            h`<div class="card narrow"><form method="post" action="/ops/users">${csrfInput(ctx)}<label>Name <input name="name" required maxlength="120"></label><label>Email <input type="email" name="email" required maxlength="254"></label>${[1, 2, 3].map(pick)}<p class="muted">The activation link will be emailed to this address, so it must be the client’s own. More companies can be attached afterwards.</p>${fourEyesNote}${codeField}<button>${config.fourEyes ? 'Request: create client user' : 'Create client user'}</button></form></div>`,
           ),
         );
       });
-      action('/users', { name: 'client.create' }, async ({ form, stepUp }) => {
-        const name = need(form, 'name', 'Name');
-        const email = needEmail(form);
+      const newClientOf = async (input: Record<string, string>) => {
+        const name = need(input, 'name', 'Name');
+        const email = needEmail(input);
         if (await stores.directory.findUserByEmail(email)) throw new OpsError('A client user with that email already exists.');
-        const memberships = new Map<string, UserRole>();
+        const memberships = new Map<string, { role: UserRole; company: CompanyRecord }>();
         for (const index of [1, 2, 3]) {
-          const companyId = text(form, `company${index}`);
+          const companyId = text(input, `company${index}`);
           if (!companyId) continue;
-          await companyOf(companyId);
-          memberships.set(companyId, oneOf(text(form, `role${index}`), CLIENT_ROLES, 'role'));
+          const company = await companyOf(companyId);
+          memberships.set(companyId, { role: oneOf(text(input, `role${index}`), CLIENT_ROLES, 'role'), company });
         }
         if (memberships.size === 0) throw new OpsError('Attach the person to at least one company.');
-        await stepUp();
-        const user: UserRecord = { id: `usr_${randomToken().slice(0, 12)}`, email, name, passwordHash: null, totpSecret: null, lastTotpStep: 0, recoveryCodeHashes: [], activatedAt: null, disabledAt: null, lastSignInAt: null };
-        await stores.directory.saveUser(user);
-        for (const [companyId, role] of memberships) await stores.directory.setMembership({ userId: user.id, companyId, role });
-        return { target: clientParty(user), detail: { companies: [...memberships].map(([companyId, role]) => `${companyId}:${role}`).join(' ') }, redirect: `/ops/users/${user.id}?done=created` };
+        return { name, email, memberships };
+      };
+      action('/users', {
+        name: 'client.create',
+        fourEyes: true,
+        async prepare({ form: input }) {
+          const { name, email, memberships } = await newClientOf(input);
+          const params: Record<string, string> = { name, email };
+          [...memberships].forEach(([companyId, { role }], index) => {
+            params[`company${index + 1}`] = companyId;
+            params[`role${index + 1}`] = role;
+          });
+          return { params, summary: `Create client user ${name} <${email}> in ${[...memberships.values()].map(({ company, role }) => `“${company.name}” as ${role}`).join(', ')}` };
+        },
+        async apply(params) {
+          const { name, email, memberships } = await newClientOf(params);
+          const user: UserRecord = { id: `usr_${randomToken().slice(0, 12)}`, email, name, passwordHash: null, totpSecret: null, lastTotpStep: 0, recoveryCodeHashes: [], activatedAt: null, disabledAt: null, lastSignInAt: null };
+          await stores.directory.saveUser(user);
+          for (const [companyId, { role }] of memberships) await stores.directory.setMembership({ userId: user.id, companyId, role });
+          return { target: clientParty(user), detail: { companies: [...memberships].map(([companyId, { role }]) => `${companyId}:${role}`).join(' ') }, redirect: `/ops/users/${user.id}?done=created` };
+        },
       });
       page('/users/:id', {}, async (ctx, request, reply) => {
         const user = await clientOf((request.params as { id: string }).id);
@@ -571,80 +928,124 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             chromeOf(ctx, user.name, flashOf(request)),
             h`<div class="grid"><div><div class="card"><h2>Status</h2><dl><dt>Email</dt><dd>${user.email}</dd><dt>Activated</dt><dd>${user.activatedAt ? `Yes, ${when(user.activatedAt)}` : 'No'}</dd><dt>Last sign-in</dt><dd>${when(user.lastSignInAt)}</dd><dt>Locked out</dt><dd>${locked ? 'Yes' : 'No'}</dd><dt>Active sessions</dt><dd>${sessions}</dd><dt>Account</dt><dd>${tag(!user.disabledAt, 'Enabled', 'Disabled')}</dd></dl></div>
 <div class="card"><h2>Companies</h2><table><tr><th>Company</th><th>Role</th><th></th></tr>${memberships.map(
-              (item) => h`<tr><td><a href="/ops/companies/${item.companyId}">${nameOf(item.companyId)}</a></td><td>${post(ctx, `${base}/memberships`, h`<input type="hidden" name="companyId" value="${item.companyId}"><label>Role ${roleSelect('role', CLIENT_ROLES, item.role)}</label>`, 'Change role')}</td><td>${post(ctx, `${base}/memberships/remove`, h`<input type="hidden" name="companyId" value="${item.companyId}">`, 'Remove', { danger: true, confirm: 'Remove this person from the company?' })}</td></tr>`,
-            )}</table>${free.length > 0 && h`<h2>Attach to a company</h2>${post(ctx, `${base}/memberships`, h`<label>Company <select name="companyId" required>${free.map((company) => h`<option value="${company.id}">${company.name}</option>`)}</select></label><label>Role ${roleSelect('role', CLIENT_ROLES)}</label>`, 'Attach')}`}</div></div>
+              (item) => h`<tr><td><a href="/ops/companies/${item.companyId}">${nameOf(item.companyId)}</a></td><td>${form(ctx, `${base}/memberships`, h`<input type="hidden" name="companyId" value="${item.companyId}"><label>Role ${roleSelect('role', CLIENT_ROLES, item.role)}</label>`, 'Change role', { request: true })}</td><td>${form(ctx, `${base}/memberships/remove`, h`<input type="hidden" name="companyId" value="${item.companyId}">`, 'Remove', { danger: true, confirm: 'Remove this person from the company?' })}</td></tr>`,
+            )}</table>${free.length > 0 && h`<h2>Attach to a company</h2>${form(ctx, `${base}/memberships`, h`<label>Company <select name="companyId" required>${free.map((company) => h`<option value="${company.id}">${company.name}</option>`)}</select></label><label>Role ${roleSelect('role', CLIENT_ROLES)}</label>`, 'Attach', { request: true })}`}</div></div>
 <div>${
               user.activatedAt === null
-                ? h`<div class="card"><h2>Activation link</h2><p class="muted">Issues a new link and cancels any earlier one. Valid for 72 hours. Email delivery is not built: you pass the link on through an approved channel.</p>${post(ctx, `${base}/activation-link`, h``, 'Issue activation link')}</div>`
-                : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><p class="muted">Removes the authenticator, the recovery codes and the password, ends every session and issues a new activation link.</p><form method="post" action="${base}/reset-authenticator" data-confirm="Reset this person’s authenticator?"><input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}">${verifyField}<div class="row tight">${codeField}<button class="danger">Reset authenticator</button></div></form></div>`
+                ? h`<div class="card"><h2>Activation link</h2><p class="muted">Emails a new link to ${maskEmail(user.email)} and cancels any earlier one. Valid for 72 hours. The link is never shown to staff.</p>${fourEyesNote}${form(ctx, `${base}/activation-link`, h``, 'Email activation link', { request: true })}</div>`
+                : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><p class="muted">Removes the authenticator, the recovery codes and the password, ends every session and emails a new activation link to ${maskEmail(user.email)}.</p>${fourEyesNote}<form method="post" action="${base}/reset-authenticator" data-confirm="Reset this person’s authenticator?">${csrfInput(ctx)}${verifyField}<div class="row tight">${codeField}<button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
             }
-${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the failed-attempt count so the person can try again now.</p>${post(ctx, `${base}/unlock`, h``, 'Unlock account')}</div>`}
-<div class="card"><h2>Sessions</h2>${post(ctx, `${base}/revoke-sessions`, h``, 'Revoke all sessions')}</div>
+${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the failed-attempt count so the person can try again now.</p>${form(ctx, `${base}/unlock`, h``, 'Unlock account')}</div>`}
+<div class="card"><h2>Sessions</h2>${form(ctx, `${base}/revoke-sessions`, h``, 'Revoke all sessions')}</div>
 <div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2><p class="muted">A disabled person cannot sign in. Disabling ends every session at once.</p>${
-              user.disabledAt ? post(ctx, `${base}/enable`, h``, 'Re-enable user') : post(ctx, `${base}/disable`, h``, 'Disable user', { danger: true, confirm: 'Disable this person?' })
+              user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable user') : form(ctx, `${base}/disable`, h``, 'Disable user', { danger: true, confirm: 'Disable this person?' })
             }</div></div></div>`,
           ),
         );
       });
-      action('/users/:id/memberships', { name: 'client.membership.set' }, async ({ form, params, stepUp }) => {
-        const user = await clientOf(params.id);
-        const company = await companyOf(text(form, 'companyId'));
-        const role = oneOf(text(form, 'role'), CLIENT_ROLES, 'role');
-        await stepUp();
-        await stores.directory.setMembership({ userId: user.id, companyId: company.id, role });
-        return { target: clientParty(user), detail: { company: company.id, role }, redirect: `/ops/users/${user.id}?done=saved` };
+      action('/users/:id/memberships', {
+        name: 'client.membership.set',
+        fourEyes: true,
+        async prepare({ form: input, params, aim }) {
+          const user = await clientOf(params.id);
+          aim(clientParty(user));
+          const company = await companyOf(text(input, 'companyId'));
+          const role = oneOf(text(input, 'role'), CLIENT_ROLES, 'role');
+          return { params: { id: user.id, companyId: company.id, role }, summary: `Give ${user.email} the role ${role} in “${company.name}”` };
+        },
+        async apply(params) {
+          const user = await clientOf(params.id);
+          const company = await companyOf(params.companyId);
+          const role = oneOf(params.role ?? '', CLIENT_ROLES, 'role');
+          await stores.directory.setMembership({ userId: user.id, companyId: company.id, role });
+          return { target: clientParty(user), detail: { company: company.id, role }, redirect: `/ops/users/${user.id}?done=saved` };
+        },
       });
-      action('/users/:id/memberships/remove', { name: 'client.membership.remove' }, async ({ form, params, stepUp }) => {
-        const user = await clientOf(params.id);
-        const company = await companyOf(text(form, 'companyId'));
-        await stepUp();
-        await stores.directory.removeMembership(user.id, company.id);
-        return { target: clientParty(user), detail: { company: company.id }, redirect: `/ops/users/${user.id}?done=saved` };
+      action('/users/:id/memberships/remove', {
+        name: 'client.membership.remove',
+        async prepare({ form: input, params, aim }) {
+          const user = await clientOf(params.id);
+          aim(clientParty(user));
+          const company = await companyOf(text(input, 'companyId'));
+          return { params: { id: user.id, companyId: company.id }, summary: `Remove ${user.email} from “${company.name}”` };
+        },
+        async apply(params) {
+          const user = await clientOf(params.id);
+          await stores.directory.removeMembership(user.id, params.companyId ?? '');
+          return { target: clientParty(user), detail: { company: params.companyId ?? '' }, redirect: `/ops/users/${user.id}?done=saved` };
+        },
       });
-      action('/users/:id/activation-link', { name: 'client.activation_link' }, async ({ params, stepUp }) => {
-        const user = await clientOf(params.id);
+      const linkable = async (id: string | undefined): Promise<UserRecord> => {
+        const user = await clientOf(id);
         if (user.activatedAt !== null) throw new OpsError('This account is already activated. Use "Reset authenticator" if the person has lost access.');
         if (user.disabledAt) throw new OpsError('Re-enable this person first.');
-        await stepUp();
-        const invite = await auth.createInvite(user.email);
-        return { target: clientParty(user), detail: { expires: when(invite.expiresAt) }, title: `Activation link for ${user.name}`, show: linkPage(invite, user.name, `/ops/users/${user.id}`, false) };
+        return user;
+      };
+      action('/users/:id/activation-link', {
+        name: 'client.activation_link',
+        fourEyes: true,
+        mails: true,
+        async prepare({ params, aim }) {
+          aim(clientParty(await clientOf(params.id)));
+          const user = await linkable(params.id);
+          return { params: { id: user.id }, summary: `Email an activation link to client ${user.email}` };
+        },
+        async apply(params) {
+          const user = await linkable(params.id);
+          return { target: clientParty(user), detail: await mailClientLink(user), redirect: `/ops/users/${user.id}?done=mailed` };
+        },
       });
-      action('/users/:id/unlock', { name: 'client.unlock' }, async ({ params, stepUp }) => {
-        const user = await clientOf(params.id);
-        await stepUp();
-        await auth.unlock(user);
-        return { target: clientParty(user), redirect: `/ops/users/${user.id}?done=unlocked` };
-      });
-      action('/users/:id/reset-authenticator', { name: 'client.reset_authenticator' }, async ({ ctx, form, params, source, stepUp }) => {
-        const user = await clientOf(params.id);
+      const resettable = async (id: string | undefined): Promise<UserRecord> => {
+        const user = await clientOf(id);
         if (user.activatedAt === null) throw new OpsError('This account is not activated. Issue an activation link instead.');
         if (user.disabledAt) throw new OpsError('Re-enable this person first.');
-        const verification = needVerification(form);
-        await stepUp();
-        const total = await auth.clearCredentials(user.id);
-        await stores.audit.append({ at: now(), actor: opsParty(ctx.user), target: clientParty(user), action: 'client.session_revoked', outcome: 'success', source, detail: { sessions: String(total), why: 'authenticator reset' } });
-        const invite = await auth.createInvite(user.email);
-        return { target: clientParty(user), detail: { identityVerification: verification, expires: when(invite.expiresAt) }, title: `New activation link for ${user.name}`, show: linkPage(invite, user.name, `/ops/users/${user.id}`, true) };
+        return user;
+      };
+      action('/users/:id/reset-authenticator', {
+        name: 'client.reset_authenticator',
+        fourEyes: true,
+        mails: true,
+        async prepare({ form: input, params, aim }) {
+          aim(clientParty(await clientOf(params.id)));
+          const user = await resettable(params.id);
+          return {
+            params: { id: user.id, identityVerification: needVerification(input) },
+            summary: `Reset the authenticator of client ${user.email}`,
+            warnings: ['Removes the password, authenticator and recovery codes, ends every session, and emails a new activation link to the address on file. Check the identity verification below before approving.'],
+          };
+        },
+        async apply(params, { requester, source }) {
+          const user = await resettable(params.id);
+          const total = await auth.clearCredentials(user.id);
+          await append(opsParty(requester), 'client.session_revoked', 'success', clientParty(user), source, { sessions: String(total), why: 'authenticator reset' });
+          const fresh = await clientOf(user.id);
+          return { target: clientParty(user), detail: { identityVerification: params.identityVerification ?? '', ...(await mailClientLink(fresh)) }, redirect: `/ops/users/${user.id}?done=mailed` };
+        },
       });
-      action('/users/:id/revoke-sessions', { name: 'client.revoke_sessions' }, async ({ ctx, params, source, stepUp }) => {
-        const user = await clientOf(params.id);
-        await stepUp();
-        const total = await revokeClientSessions(ctx, user, source, 'revoked by ops');
-        return { target: clientParty(user), detail: { sessions: String(total) }, redirect: `/ops/users/${user.id}?done=revoked` };
-      });
-      action('/users/:id/disable', { name: 'client.disable' }, async ({ ctx, params, source, stepUp }) => {
-        const user = await clientOf(params.id);
-        await stepUp();
-        await stores.directory.saveUser({ ...user, disabledAt: now() });
+      /** The client actions that take effect at once: none of them gives anyone access. */
+      const simple = (path: string, name: string, flash: string, run: (user: UserRecord, actors: Actors) => Promise<Record<string, string> | void>) =>
+        action(`/users/:id/${path}`, {
+          name,
+          async prepare({ params, aim }) {
+            const user = await clientOf(params.id);
+            aim(clientParty(user));
+            return { params: { id: user.id }, summary: `${name} ${user.email}` };
+          },
+          async apply(params, actors) {
+            const user = await clientOf(params.id);
+            const detail = await run(user, actors);
+            return { target: clientParty(user), detail: detail ?? {}, redirect: `/ops/users/${user.id}?done=${flash}` };
+          },
+        });
+      simple('unlock', 'client.unlock', 'unlocked', async (user) => auth.unlock(user));
+      simple('revoke-sessions', 'client.revoke_sessions', 'revoked', async (user, { requester, source }) => ({ sessions: String(await revokeClientSessions(requester, user, source, 'revoked by ops')) }));
+      simple('disable', 'client.disable', 'disabled', async (user, { requester, source }) => {
+        await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: now() }));
         await stores.auth.activations.deleteWhere((record) => record.userId === user.id);
-        await revokeClientSessions(ctx, user, source, 'user disabled');
-        return { target: clientParty(user), redirect: `/ops/users/${user.id}?done=disabled` };
+        await revokeClientSessions(requester, user, source, 'user disabled');
       });
-      action('/users/:id/enable', { name: 'client.enable' }, async ({ params, stepUp }) => {
-        const user = await clientOf(params.id);
-        await stepUp();
-        await stores.directory.saveUser({ ...user, disabledAt: null });
-        return { target: clientParty(user), redirect: `/ops/users/${user.id}?done=enabled` };
+      simple('enable', 'client.enable', 'enabled', async (user) => {
+        await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: null }));
       });
 
       // --- Audit log: read only. There is no route that changes or removes an entry. ---
@@ -663,8 +1064,8 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             chromeOf(ctx, 'Audit log'),
             h`<div class="card"><form method="get" action="/ops/audit"><div class="row"><label>Actor <input name="actor" value="${actor}"></label><label>Target <input name="target" value="${target}"></label><label>Action <input name="action" value="${act}"></label><label>From (UTC) <input type="date" name="from" value="${from}"></label><label>To (UTC) <input type="date" name="to" value="${to}"></label><button class="quiet">Filter</button></div></form></div>
 <div class="card"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th><th>Source</th><th>Detail</th></tr>${entries.map(
-              (entry) => h`<tr><td>${when(entry.at)}</td><td>${entry.actor.label} <span class="muted">(${entry.actor.type})</span></td><td>${entry.action}</td><td>${entry.target ? entry.target.label : ''}</td><td>${tag(entry.outcome === 'success', 'success', 'failure')}</td><td>${entry.source}</td><td>${Object.entries(entry.detail).map(([key, value]) => h`<div>${key}: ${value}</div>`)}</td></tr>`,
-            )}</table>${entries.length === 0 && h`<p class="muted">No entries match.</p>`}<p class="muted">Newest first, at most 500 entries. Entries cannot be changed or removed.</p></div>`,
+              (entry) => h`<tr><td>${when(entry.at)}</td><td>${entry.actor.label} <span class="muted">(${entry.anonymous ? 'not identified' : entry.actor.type})</span></td><td>${entry.action}</td><td>${entry.target ? entry.target.label : ''}</td><td>${tag(entry.outcome === 'success', 'success', 'failure')}</td><td>${entry.source}</td><td>${Object.entries(entry.detail).map(([key, value]) => h`<div>${key}: ${value}</div>`)}</td></tr>`,
+            )}</table>${entries.length === 0 && h`<p class="muted">No entries match.</p>`}<p class="muted">Newest first, at most 500 entries. Entries cannot be changed or removed. Failures by people who were not identified (a wrong password, for example) are kept separately: only the most recent, and only a limited number per source address.</p></div>`,
           ),
         );
       });
@@ -680,20 +1081,32 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             h`<div class="card"><table><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last sign-in</th></tr>${staff.map(
               (user) => h`<tr><td><a href="/ops/staff/${user.id}">${user.name}</a></td><td>${user.email}</td><td>${user.role}</td><td>${user.disabledAt ? tag(false, '', 'Disabled') : tag(user.activatedAt !== null, 'Activated', 'Not activated')}</td><td>${when(user.lastSignInAt)}</td></tr>`,
             )}</table></div>
-<div class="card"><h2>Invite a staff member</h2>${post(ctx, '/ops/staff', h`<label>Name <input name="name" required maxlength="120"></label><label>Email <input type="email" name="email" required maxlength="254"></label><label>Role ${roleSelect('role', OPS_ROLES)}</label>`, 'Invite')}</div>`,
+<div class="card"><h2>Invite a staff member</h2><p class="muted">The activation link is emailed to the address you give.</p>${fourEyesNote}${form(ctx, '/ops/staff', h`<label>Name <input name="name" required maxlength="120"></label><label>Email <input type="email" name="email" required maxlength="254"></label><label>Role ${roleSelect('role', OPS_ROLES)}</label>`, 'Invite', { request: true })}</div>`,
           ),
         );
       });
-      const staffParty = opsParty;
-      action('/staff', { name: 'staff.invite', admin: true }, async ({ form, stepUp }) => {
-        const name = need(form, 'name', 'Name');
-        const email = needEmail(form);
-        const role = oneOf(text(form, 'role'), OPS_ROLES, 'role');
+      const newStaffOf = async (input: Record<string, string>) => {
+        const name = need(input, 'name', 'Name');
+        const email = needEmail(input);
+        const role = oneOf(text(input, 'role'), OPS_ROLES, 'role');
         if (await stores.ops.users.findByEmail(email)) throw new OpsError('A staff account with that email already exists.');
-        await stepUp();
-        const user = await opsAuth.createUser(email, name, role);
-        const invite = await opsAuth.createInvite(user.id);
-        return { target: staffParty(user), detail: { role, expires: when(invite.expiresAt) }, title: `Activation link for ${user.name}`, show: linkPage(invite, user.name, `/ops/staff/${user.id}`, false) };
+        return { name, email, role };
+      };
+      action('/staff', {
+        name: 'staff.invite',
+        admin: true,
+        fourEyes: true,
+        mails: true,
+        async prepare({ form: input, aim }) {
+          const { name, email, role } = await newStaffOf(input);
+          aim({ type: 'ops', id: null, label: email });
+          return { params: { name, email, role }, summary: `Invite ${name} <${email}> as staff with the role ${role}` };
+        },
+        async apply(params) {
+          const { name, email, role } = await newStaffOf(params);
+          const user = await opsAuth.createUser(email, name, role);
+          return { target: opsParty(user), detail: { role, ...(await mailStaffLink(user)) }, redirect: `/ops/staff/${user.id}?done=mailed` };
+        },
       });
       page('/staff/:id', { admin: true }, async (ctx, request, reply) => {
         const user = await staffOf((request.params as { id: string }).id);
@@ -708,61 +1121,107 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
 <div>${
               self
                 ? h`<div class="card"><p class="muted">This is your own account. You cannot change your own role, disable yourself or reset your own authenticator.</p></div>`
-                : h`<div class="card"><h2>Role</h2>${post(ctx, `${base}/role`, h`<label>Role ${roleSelect('role', OPS_ROLES, user.role)}</label>`, 'Change role')}</div>
+                : h`${fourEyesNote}<div class="card"><h2>Role</h2>${form(ctx, `${base}/role`, h`<label>Role ${roleSelect('role', OPS_ROLES, user.role)}</label>`, 'Change role', { request: true })}</div>
 ${
   user.activatedAt === null
-    ? h`<div class="card"><h2>Activation link</h2>${post(ctx, `${base}/activation-link`, h``, 'Issue activation link')}</div>`
-    : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><form method="post" action="${base}/reset-authenticator" data-confirm="Reset this staff member’s authenticator?"><input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}">${verifyField}<div class="row tight">${codeField}<button class="danger">Reset authenticator</button></div></form></div>`
+    ? h`<div class="card"><h2>Activation link</h2><p class="muted">Emails a new link to ${maskEmail(user.email)}.</p>${form(ctx, `${base}/activation-link`, h``, 'Email activation link', { request: true })}</div>`
+    : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><form method="post" action="${base}/reset-authenticator" data-confirm="Reset this staff member’s authenticator?">${csrfInput(ctx)}${verifyField}<div class="row tight">${codeField}<button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
 }
-<div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2>${user.disabledAt ? post(ctx, `${base}/enable`, h``, 'Re-enable') : post(ctx, `${base}/disable`, h``, 'Disable', { danger: true, confirm: 'Disable this staff member?' })}</div>`
+<div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2>${user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable', { danger: true, confirm: 'Disable this staff member?', request: true })}</div>`
             }</div></div>`,
           ),
         );
       });
-      action('/staff/:id/role', { name: 'staff.role', admin: true }, async ({ ctx, form, params, stepUp }) => {
-        const user = await staffOf(params.id);
-        const role = oneOf(text(form, 'role'), OPS_ROLES, 'role');
-        if (role !== 'ops_admin') await assertStaffRemovalAllowed(stores, ctx.user.id, user);
-        await stepUp();
-        await stores.ops.users.save({ ...user, role });
-        return { target: staffParty(user), detail: { role }, redirect: `/ops/staff/${user.id}?done=saved` };
-      });
-      action('/staff/:id/disable', { name: 'staff.disable', admin: true }, async ({ ctx, params, source, stepUp }) => {
-        const user = await staffOf(params.id);
-        await assertStaffRemovalAllowed(stores, ctx.user.id, user);
-        await stepUp();
-        await stores.ops.users.save({ ...user, disabledAt: now() });
-        await stores.ops.activations.deleteWhere((record) => record.userId === user.id);
-        const total = await opsAuth.revokeAllSessions(user.id);
-        await stores.audit.append({ at: now(), actor: opsParty(ctx.user), target: staffParty(user), action: 'ops.session_revoked', outcome: 'success', source, detail: { sessions: String(total), why: 'staff disabled' } });
-        return { target: staffParty(user), redirect: `/ops/staff/${user.id}?done=disabled` };
-      });
-      action('/staff/:id/enable', { name: 'staff.enable', admin: true }, async ({ params, stepUp }) => {
-        const user = await staffOf(params.id);
-        await stepUp();
-        await stores.ops.users.save({ ...user, disabledAt: null });
-        return { target: staffParty(user), redirect: `/ops/staff/${user.id}?done=enabled` };
-      });
-      action('/staff/:id/activation-link', { name: 'staff.activation_link', admin: true }, async ({ params, stepUp }) => {
-        const user = await staffOf(params.id);
-        if (user.activatedAt !== null) throw new OpsError('This account is already activated.');
-        if (user.disabledAt) throw new OpsError('Re-enable this staff member first.');
-        await stepUp();
-        const invite = await opsAuth.createInvite(user.id);
-        return { target: staffParty(user), detail: { expires: when(invite.expiresAt) }, title: `Activation link for ${user.name}`, show: linkPage(invite, user.name, `/ops/staff/${user.id}`, false) };
-      });
-      action('/staff/:id/reset-authenticator', { name: 'staff.reset_authenticator', admin: true }, async ({ ctx, form, params, source, stepUp }) => {
-        const user = await staffOf(params.id);
-        if (user.activatedAt === null) throw new OpsError('This account is not activated. Issue an activation link instead.');
-        if (user.disabledAt) throw new OpsError('Re-enable this staff member first.');
-        await assertStaffRemovalAllowed(stores, ctx.user.id, user);
-        const verification = needVerification(form);
-        await stepUp();
-        const total = await opsAuth.clearCredentials(user.id);
-        await stores.audit.append({ at: now(), actor: opsParty(ctx.user), target: staffParty(user), action: 'ops.session_revoked', outcome: 'success', source, detail: { sessions: String(total), why: 'authenticator reset' } });
-        const invite = await opsAuth.createInvite(user.id);
-        return { target: staffParty(user), detail: { identityVerification: verification, expires: when(invite.expiresAt) }, title: `New activation link for ${user.name}`, show: linkPage(invite, user.name, `/ops/staff/${user.id}`, true) };
-      });
+      /** A staff-management action on one existing staff member. `check` runs when it is requested AND again when it is carried out. */
+      const staffAction = (path: string, name: string, options: { mails?: boolean; flash: string; summary: (user: OpsUserRecord, params: Record<string, string>) => string }, check: (user: OpsUserRecord, input: Record<string, string>, requesterId: string) => Promise<Record<string, string>>, run: (user: OpsUserRecord, params: Record<string, string>, actors: Actors) => Promise<Record<string, string> | void>) =>
+        action(`/staff/:id/${path}`, {
+          name,
+          admin: true,
+          fourEyes: true,
+          mails: options.mails,
+          async prepare({ actor, form: input, params, aim }) {
+            const user = await staffOf(params.id);
+            aim(opsParty(user));
+            const checked = { id: user.id, ...(await check(user, input, actor.id)) };
+            return { params: checked, summary: options.summary(user, checked) };
+          },
+          async apply(params, actors) {
+            const user = await staffOf(params.id);
+            await check(user, params, actors.requester.id);
+            const detail = await run(user, params, actors);
+            return { target: opsParty(user), detail: detail ?? {}, redirect: `/ops/staff/${user.id}?done=${options.flash}` };
+          },
+        });
+      staffAction(
+        'role',
+        'staff.role',
+        { flash: 'saved', summary: (user, params) => `Change the staff role of ${user.email} to ${params.role}` },
+        async (user, input, requesterId) => {
+          const role = oneOf(text(input, 'role'), OPS_ROLES, 'role');
+          if (role !== 'ops_admin') await assertStaffRemovalAllowed(stores, requesterId, user);
+          else if (user.id === requesterId) throw new OpsError('You cannot do this to your own account.', 403, 'self');
+          return { role };
+        },
+        async (user, params) => {
+          await stores.ops.users.update(user.id, (current) => ({ ...current, role: params.role as OpsRole }));
+          return { role: params.role ?? '' };
+        },
+      );
+      staffAction(
+        'disable',
+        'staff.disable',
+        { flash: 'disabled', summary: (user) => `Disable staff member ${user.email}` },
+        async (user, _input, requesterId) => {
+          await assertStaffRemovalAllowed(stores, requesterId, user);
+          return {};
+        },
+        async (user, _params, { requester, source }) => {
+          await stores.ops.users.update(user.id, (current) => ({ ...current, disabledAt: now() }));
+          await stores.ops.activations.deleteWhere((record) => record.userId === user.id);
+          const total = await opsAuth.revokeAllSessions(user.id);
+          await append(opsParty(requester), 'ops.session_revoked', 'success', opsParty(user), source, { sessions: String(total), why: 'staff disabled' });
+        },
+      );
+      staffAction(
+        'enable',
+        'staff.enable',
+        { flash: 'enabled', summary: (user) => `Re-enable staff member ${user.email}` },
+        async (user, _input, requesterId) => {
+          if (user.id === requesterId) throw new OpsError('You cannot do this to your own account.', 403, 'self');
+          return {};
+        },
+        async (user) => {
+          await stores.ops.users.update(user.id, (current) => ({ ...current, disabledAt: null }));
+        },
+      );
+      staffAction(
+        'activation-link',
+        'staff.activation_link',
+        { mails: true, flash: 'mailed', summary: (user) => `Email an activation link to staff member ${user.email}` },
+        async (user) => {
+          if (user.activatedAt !== null) throw new OpsError('This account is already activated.');
+          if (user.disabledAt) throw new OpsError('Re-enable this staff member first.');
+          return {};
+        },
+        async (user) => mailStaffLink(user),
+      );
+      staffAction(
+        'reset-authenticator',
+        'staff.reset_authenticator',
+        { mails: true, flash: 'mailed', summary: (user) => `Reset the authenticator of staff member ${user.email}` },
+        async (user, input, requesterId) => {
+          if (user.activatedAt === null) throw new OpsError('This account is not activated. Issue an activation link instead.');
+          if (user.disabledAt) throw new OpsError('Re-enable this staff member first.');
+          await assertStaffRemovalAllowed(stores, requesterId, user);
+          // From the form it is `verification`; when the approved request is carried out it is the stored `identityVerification`.
+          return { identityVerification: needVerification({ verification: text(input, 'identityVerification') || text(input, 'verification') }) };
+        },
+        async (user, params, { requester, source }) => {
+          const total = await opsAuth.clearCredentials(user.id);
+          await append(opsParty(requester), 'ops.session_revoked', 'success', opsParty(user), source, { sessions: String(total), why: 'authenticator reset' });
+          return { identityVerification: params.identityVerification ?? '', ...(await mailStaffLink(await staffOf(user.id))) };
+        },
+      );
     },
     { prefix: '/ops' },
   );

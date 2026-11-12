@@ -43,7 +43,7 @@ export interface Chrome {
 
 export function layout(chrome: Chrome, body: Html): string {
   const nav = chrome.user
-    ? h`<nav><a href="/ops/companies">Companies</a><a href="/ops/users">Client users</a><a href="/ops/audit">Audit log</a>${
+    ? h`<nav><a href="/ops/companies">Companies</a><a href="/ops/users">Client users</a><a href="/ops/approvals">Approvals</a><a href="/ops/audit">Audit log</a>${
         chrome.user.role === 'ops_admin' && h`<a href="/ops/staff">Ops staff</a>`
       }<span class="who">${chrome.user.name} · ${chrome.user.role === 'ops_admin' ? 'Ops admin' : 'Ops'}</span><form method="post" action="/ops/logout"><input type="hidden" name="_csrf" value="${chrome.csrf}"><button class="link">Sign out</button></form></nav>`
     : h``;

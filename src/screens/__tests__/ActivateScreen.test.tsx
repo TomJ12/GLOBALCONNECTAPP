@@ -1,3 +1,4 @@
+import { activationCodeFromLink } from '@/lib/activationLink';
 import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 import * as Clipboard from 'expo-clipboard';
 
@@ -77,6 +78,31 @@ describe('ActivateScreen', () => {
     expect(expoRouter.router.replace).toHaveBeenCalledWith('/sign-in');
     // Activation does not sign anyone in.
     expect(useSession.getState().session).toBeNull();
+  });
+
+  it('reads the code from the link fragment (which a browser never sends to a server) and takes it out of the address bar', async () => {
+    const spy = jest.spyOn(getAuthClient(), 'beginActivation');
+    spy.mockClear();
+    const replaceState = jest.fn();
+    const address = globalThis as { location?: unknown; history?: unknown };
+    const before = { location: address.location, history: address.history };
+    address.location = { hash: `#code=${DEMO_ACTIVATION_CODE}`, pathname: '/activate', search: '' };
+    address.history = { replaceState };
+    try {
+      expoRouter.__setParams({});
+      await renderScreen(<ActivateScreen />);
+      expect(await screen.findByText('Step 1 of 3: choose a password')).toBeOnTheScreen();
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      expect(spy).toHaveBeenCalledWith(DEMO_ACTIVATION_CODE);
+      expect(replaceState).toHaveBeenCalledWith(null, '', '/activate');
+    } finally {
+      address.location = before.location;
+      address.history = before.history;
+    }
+    expect(activationCodeFromLink(undefined, '#code=ABCDE-FGHIJ-KLMNO-PQRST')).toBe('ABCDE-FGHIJ-KLMNO-PQRST');
+    expect(activationCodeFromLink('FROM-QUERY', '#other=1&code=FROM-FRAGMENT')).toBe('FROM-FRAGMENT');
+    expect(activationCodeFromLink('FROM-QUERY', '')).toBe('FROM-QUERY');
+    expect(activationCodeFromLink(undefined, '#code=<script>')).toBe('');
   });
 
   it('starts by itself when opened from an activation link', async () => {

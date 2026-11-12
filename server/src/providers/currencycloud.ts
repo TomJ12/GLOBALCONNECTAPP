@@ -1,44 +1,52 @@
 /**
- * Provider A: the Currencycloud-shaped adapter. The client, the wire schemas,
- * the mapping and the in-memory mock are the app's own files under
- * src/api/adapters/currencycloud, imported, not copied.
+ * Provider A: the Currencycloud-shaped adapter. The client, the wire schemas
+ * and the mapping are the app's own files under src/api/adapters/currencycloud,
+ * imported, not copied.
  *
- * MOCK: each company gets its own in-memory provider account with the sample
- * data. For the real API, replace `transportFor` with an HTTPS Transport; the
- * client must then also send `on_behalf_of` with the company's contact id on
- * every call, which it does not do yet.
+ * One set of API credentials serves every client, so the scope is everything:
+ * each adapter is built with its company's contact id and the client sends it
+ * as `on_behalf_of` with every call. A company without a contact id gets no
+ * adapter (it fails closed).
+ *
+ * MOCK unless `transport` is given: one in-memory platform holding several
+ * accounts (currencycloudMock.ts). The server refuses to start on it outside
+ * development mode.
  */
 import { CurrencycloudClient } from '@/api/adapters/currencycloud/client';
-import { MockCurrencycloudServer } from '@/api/adapters/currencycloud/mockServer';
 import type { Transport } from '@/api/adapters/currencycloud/transport';
-import { DEFAULT_MOCK_CONTROLS } from '@/api/mockControls';
 
-import type { CompanyRecord } from '../store/types';
-import type { ProviderAdapter, ProviderFactory } from './adapter';
+import type { ProviderAdapter, ProviderFactory, ProviderMapping } from './adapter';
+import { MockCurrencycloudPlatform } from './currencycloudMock';
 
 export interface CurrencycloudFactoryOptions {
   credentials: { loginId: string; apiKey: string } | null;
-  /** The wire for one company's account. Defaults to an in-memory mock per company. */
-  transportFor?: (company: CompanyRecord) => Transport;
+  /** The wire to the provider. Defaults to the in-memory mock platform. */
+  transport?: Transport;
   now?: () => number;
 }
 
 export function currencycloudFactory(options: CurrencycloudFactoryOptions): ProviderFactory {
-  const mocks = new Map<string, Transport>();
-  const mockFor = (company: CompanyRecord): Transport => {
-    let mock = mocks.get(company.providerAccountId);
-    if (!mock) {
-      mock = new MockCurrencycloudServer({ getControls: () => ({ ...DEFAULT_MOCK_CONTROLS, latencyMs: 0 }), now: options.now });
-      mocks.set(company.providerAccountId, mock);
-    }
-    return mock;
+  const transport = options.transport ?? new MockCurrencycloudPlatform({ now: options.now });
+  const mock = options.transport === undefined || options.transport instanceof MockCurrencycloudPlatform;
+
+  const clientFor = async (mapping: ProviderMapping): Promise<CurrencycloudClient> => {
+    if (!options.credentials) throw new Error('Provider credentials are not configured');
+    if (!mapping.providerContactId || !mapping.providerAccountId) throw new Error('This company has no provider account scope; refusing to call the provider without one');
+    const client = new CurrencycloudClient(transport, { planName: null, now: options.now, onBehalfOf: mapping.providerContactId });
+    await client.authenticate(options.credentials.loginId, options.credentials.apiKey);
+    return client;
   };
 
-  return async (company) => {
-    if (!options.credentials) throw new Error('Provider credentials are not configured');
-    const client = new CurrencycloudClient((options.transportFor ?? mockFor)(company), { planName: null, now: options.now });
-    await client.authenticate(options.credentials.loginId, options.credentials.apiKey);
-    const adapter: ProviderAdapter = Object.assign(client, { capabilities: { forwardContracts: true, paymentApprovals: true } });
-    return adapter;
+  return {
+    mock,
+    async forCompany(company) {
+      const client = await clientFor(company);
+      const adapter: ProviderAdapter = Object.assign(client, { capabilities: { forwardContracts: true, paymentApprovals: true } });
+      return adapter;
+    },
+    async accountExists(mapping) {
+      if (!mapping.providerContactId || !mapping.providerAccountId) return false;
+      return (await clientFor(mapping)).accountExists(mapping.providerAccountId);
+    },
   };
 }

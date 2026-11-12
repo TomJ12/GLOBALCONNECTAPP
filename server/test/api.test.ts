@@ -116,60 +116,115 @@ test('a person in two companies chooses one; the session is scoped to it and onl
   assert.equal((await h.call('GET', '/v1/balances', { token: amira.token })).json.items[0].amount, '101964.00');
 });
 
-test('isolation: ids from another company, and company ids in the request, get nowhere', async () => {
-  // Two companies on the SAME provider, so an id that is valid for one is the right shape for the other.
-  const directory = seedDirectory();
-  directory.companies.push({ id: 'co_other', name: 'Other Ltd', providerKey: 'currencycloud', providerAccountId: 'sample-account-0002', providerContactId: 'c2' });
-  directory.memberships = directory.memberships.filter((row) => row.userId !== 'usr_ben').concat({ userId: 'usr_ben', companyId: 'co_other', role: 'admin' });
-  h = await harness({}, directory);
-  const amira = await signedIn(AMIRA);
-  const ben = await signedIn(BEN);
+/**
+ * Both mock providers run with `enforceOwnership: false` here: handed an id,
+ * they act on it whichever account it belongs to, as a provider might under a
+ * master credential. So nothing in this test is proved by the mocks keeping
+ * accounts apart. What stands between two companies is the server: the scope
+ * it puts on every call, and its own check that an id belongs to the
+ * session's company before it acts on it.
+ */
+for (const provider of ['currencycloud', 'equals'] as const) {
+  test(`isolation (${provider}): one company cannot read, pay to, approve, reject or book with another company's ids`, async () => {
+    const directory = seedDirectory();
+    const mine = provider === 'currencycloud' ? { providerAccountId: 'sample-account-0001', providerContactId: 'sample-contact-0001' } : { providerAccountId: 'S00001', providerContactId: '' };
+    const theirs = provider === 'currencycloud' ? { providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0002' } : { providerAccountId: 'S00002', providerContactId: '' };
+    directory.companies = [
+      { id: 'co_mine', name: 'Mine Ltd', providerKey: provider, ...mine },
+      { id: 'co_theirs', name: 'Theirs Ltd', providerKey: provider, ...theirs },
+    ];
+    directory.memberships = [
+      { userId: 'usr_amira', companyId: 'co_mine', role: 'admin' },
+      { userId: 'usr_ben', companyId: 'co_theirs', role: 'admin' },
+    ];
+    h = await harness({}, directory, { enforceOwnership: false });
+    const amira = await signedIn(AMIRA);
+    const ben = await signedIn(BEN);
 
-  // Amira adds a payee and pays it.
-  const payee = { name: 'Private Supplier Ltd', entityType: 'company', currency: 'GBP', bankCountry: 'GB', accountNumber: '00000000', sortCode: '000000' };
-  const created = await h.call('POST', '/v1/beneficiaries', {
-    token: amira.token,
-    body: payee,
-    headers: { 'x-step-up-token': await h.stepUp(amira.token, amira.secret, 'beneficiary.create', payee) },
+    // Ben's company gets a payee, a payment and (provider A) a payment waiting for approval. All with ids only it has.
+    const payee = { name: 'Private Supplier Ltd', entityType: 'company', currency: 'GBP', bankCountry: 'GB', accountNumber: '00000000', sortCode: '000000' };
+    const created = await h.call('POST', '/v1/beneficiaries', { token: ben.token, body: payee, headers: { 'x-step-up-token': await h.stepUp(ben.token, ben.secret, 'beneficiary.create', payee) } });
+    assert.equal(created.status, 200);
+    const payment = await pay(ben.token, ben.secret, 'key-ben-000001', paymentBody({ beneficiaryId: created.json.id }));
+    assert.equal(payment.status, 200);
+    const bensPending: string[] = (await h.call('GET', '/v1/approvals', { token: ben.token })).json.items.map((row: any) => row.payment.id);
+    const bensBalances = (await h.call('GET', '/v1/balances', { token: ben.token })).json;
+
+    // READ: none of it shows up for Amira.
+    const payees = (await h.call('GET', '/v1/beneficiaries', { token: amira.token })).json.items;
+    assert.ok(!payees.some((row: any) => row.id === created.json.id || row.name === payee.name));
+    const payments = (await h.call('GET', '/v1/payments?page=1&perPage=100', { token: amira.token })).json.items;
+    assert.ok(!payments.some((row: any) => row.id === payment.json.id));
+    assert.equal((await h.call('GET', '/v1/payments/by-key/key-ben-000001', { token: amira.token })).json, null);
+    const pending: string[] = (await h.call('GET', '/v1/approvals', { token: amira.token })).json.items.map((row: any) => row.payment.id);
+    assert.ok(!pending.some((id) => bensPending.includes(id)));
+
+    // PAY TO their payee: refused by the server before the provider is asked to pay.
+    const stolen = await pay(amira.token, amira.secret, 'key-amira-00001', paymentBody({ beneficiaryId: created.json.id }));
+    assert.equal(stolen.status, 400);
+    assert.deepEqual(stolen.json, { error: { kind: 'validation', fields: ['beneficiaryId'] } });
+    assert.equal((await h.call('GET', '/v1/payments/by-key/key-amira-00001', { token: amira.token })).json, null);
+    assert.equal((await h.call('GET', '/v1/payments/by-key/key-amira-00001', { token: ben.token })).json, null);
+
+    // APPROVE / REJECT their payment by id.
+    for (const id of provider === 'currencycloud' ? bensPending : []) {
+      for (const action of ['approve', 'reject'] as const) {
+        const stepUp = await h.stepUp(amira.token, amira.secret, `payment.${action}`, { paymentId: id });
+        const reply = await h.call('POST', `/v1/payments/${id}/${action}`, { token: amira.token, headers: { 'x-step-up-token': stepUp } });
+        assert.equal(reply.status, 404, `${action} ${id}`);
+      }
+    }
+    if (provider === 'currencycloud') assert.ok(bensPending.length > 0);
+    assert.deepEqual((await h.call('GET', '/v1/approvals', { token: ben.token })).json.items.map((row: any) => row.payment.id), bensPending);
+
+    // BOOK with a quote held for the other company.
+    const quote = (await h.call('POST', '/v1/quotes', { token: ben.token, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '100.00' } })).json;
+    const hijack = await h.call('POST', '/v1/conversions', { token: amira.token, body: { quoteId: quote.id }, headers: { 'idempotency-key': 'key-amira-00002' } });
+    assert.equal(hijack.status, 409);
+    assert.equal(hijack.json.error.kind, 'quote_expired');
+
+    // Naming another company in the query, a header or the body changes nothing.
+    const before = (await h.call('GET', '/v1/balances', { token: amira.token })).json;
+    for (const [url, headers] of [
+      [`/v1/balances?companyId=co_theirs&accountId=${theirs.providerAccountId}&on_behalf_of=${theirs.providerContactId}`, {}],
+      ['/v1/balances', { 'x-company-id': 'co_theirs', 'x-account-id': theirs.providerAccountId }],
+    ] as const) {
+      assert.deepEqual((await h.call('GET', url, { token: amira.token, headers })).json.items.map((row: any) => row.amount), before.items.map((row: any) => row.amount));
+    }
+    // Ben's money is exactly where it was.
+    assert.deepEqual((await h.call('GET', '/v1/balances', { token: ben.token })).json.items.map((row: any) => row.amount), bensBalances.items.map((row: any) => row.amount));
+
+    // EVERY call the server made to the provider carried a scope, and only ever the scope of the session's company.
+    if (provider === 'currencycloud') {
+      assert.ok(h.providerA.seen.length > 20);
+      assert.deepEqual([...new Set(h.providerA.seen.map((call) => call.onBehalfOf))].sort(), ['sample-contact-0001', 'sample-contact-0002']);
+    } else {
+      assert.ok(h.providerB.seen.length > 10);
+      assert.deepEqual([...new Set(h.providerB.seen.map((call) => call.accountId))].sort(), ['S00001', 'S00002']);
+    }
   });
-  assert.equal(created.status, 200);
-  const payment = await pay(amira.token, amira.secret, 'key-amira-0001', paymentBody({ beneficiaryId: created.json.id }));
-  assert.equal(payment.status, 200);
+}
 
-  // Ben cannot see either.
-  const bensPayees = (await h.call('GET', '/v1/beneficiaries', { token: ben.token })).json.items;
-  assert.ok(!bensPayees.some((row: any) => row.id === created.json.id || row.name === payee.name));
-  const bensPayments = (await h.call('GET', '/v1/payments?page=1&perPage=100', { token: ben.token })).json.items;
-  assert.ok(!bensPayments.some((row: any) => row.id === payment.json.id));
-  assert.equal((await h.call('GET', '/v1/payments/by-key/key-amira-0001', { token: ben.token })).json, null);
-
-  // Ben cannot pay Amira's payee, or approve or reject by an id he should not know.
-  const stolen = await pay(ben.token, ben.secret, 'key-ben-00001', paymentBody({ beneficiaryId: created.json.id }));
-  assert.ok(stolen.status === 400 || stolen.status === 404, `status ${stolen.status}`);
-  for (const action of ['approve', 'reject'] as const) {
-    const stepUp = await h.stepUp(ben.token, ben.secret, `payment.${action}`, { paymentId: payment.json.id });
-    const reply = await h.call('POST', `/v1/payments/${payment.json.id}/${action}`, { token: ben.token, headers: { 'x-step-up-token': stepUp } });
-    assert.ok(reply.status === 400 || reply.status === 404, `${action} status ${reply.status}`);
+test('isolation: a company with no provider scope gets no provider call at all (fails closed)', async () => {
+  const directory = seedDirectory();
+  directory.companies = [
+    { id: 'co_northfield', name: 'Northfield Trading Ltd', providerKey: 'currencycloud', providerAccountId: 'sample-account-0001', providerContactId: '' },
+    { id: 'co_castlebrook', name: 'Castlebrook Imports Ltd', providerKey: 'equals', providerAccountId: '', providerContactId: '' },
+  ];
+  h = await harness({}, directory);
+  for (const email of [AMIRA, BEN]) {
+    const { secret } = await h.activate(email);
+    const login = await h.login(email, secret);
+    // Signing in already needs the adapter (capabilities), and there is none.
+    assert.equal(login.status, 502, email);
   }
-
-  // Naming another company in the query, a header or the body changes nothing.
-  const balancesBefore = (await h.call('GET', '/v1/balances', { token: ben.token })).json;
-  for (const [url, headers] of [
-    ['/v1/balances?companyId=co_northfield&accountId=sample-account-0001', {}],
-    ['/v1/balances', { 'x-company-id': 'co_northfield', 'x-account-id': 'sample-account-0001' }],
-  ] as const) {
-    assert.deepEqual((await h.call('GET', url, { token: ben.token, headers })).json, balancesBefore);
-  }
-  // Amira's balance moved; Ben's did not.
-  const amiraGbp = (await h.call('GET', '/v1/balances', { token: amira.token })).json.items[0].amount;
-  assert.equal(balancesBefore.items[0].amount, '101964.00');
-  assert.notEqual(amiraGbp, '101964.00');
-
-  // A quote held for one company cannot be booked by another.
-  const quote = (await h.call('POST', '/v1/quotes', { token: amira.token, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '100.00' } })).json;
-  const hijack = await h.call('POST', '/v1/conversions', { token: ben.token, body: { quoteId: quote.id }, headers: { 'idempotency-key': 'key-ben-00002' } });
-  assert.equal(hijack.status, 409);
-  assert.equal(hijack.json.error.kind, 'quote_expired');
+  assert.deepEqual(h.providerA.seen, []);
+  assert.deepEqual(h.providerB.seen, []);
+  // An unknown scope is refused by the provider, and a known one is accepted.
+  assert.equal(await h.registry.accountExists('currencycloud', { providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0001' }), false);
+  assert.equal(await h.registry.accountExists('currencycloud', { providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0002' }), true);
+  assert.equal(await h.registry.accountExists('equals', { providerAccountId: 'S00009', providerContactId: '' }), false);
+  assert.equal(await h.registry.accountExists('equals', { providerAccountId: 'S00002', providerContactId: '' }), true);
 });
 
 test('step-up: a payment needs a token bound to this person, session, action and exact payload, once', async () => {
@@ -237,7 +292,7 @@ test('step-up: wrong and reused codes are refused, and repeated wrong codes lock
   // The code that signed in cannot be used again.
   assert.equal((await ask(h.code(amira.secret))).json.error.reason, 'code_reused');
   assert.equal((await h.call('POST', '/v1/step-up', { body: { action: 'payment.approve', payload: {}, code: '000000' } })).status, 401);
-  for (let i = 0; i < 4; i += 1) assert.equal((await ask('000000')).json.error.reason, 'invalid_code');
+  for (let i = 0; i < 5; i += 1) assert.equal((await ask('000000')).json.error.reason, 'invalid_code');
   const locked = await ask(h.freshCode(amira.secret));
   assert.equal(locked.status, 429);
   assert.equal(locked.json.error.reason, 'locked');

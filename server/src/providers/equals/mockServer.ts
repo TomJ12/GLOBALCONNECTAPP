@@ -18,7 +18,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const decimals = (currency: string) => (currency === 'JPY' ? 0 : 2);
 const round = (value: Big, currency: string) => Number(value.round(decimals(currency), Big.roundHalfUp).toString());
 
+/** Accounts the mock knows. A company can only be mapped to one of these. */
+export const MOCK_ACCOUNTS_B = ['S00001', 'S00002', 'S00003'];
+
 interface State {
+  accountId: string;
   budgetId: string;
   balances: Map<string, Big>;
   recipients: Json[];
@@ -26,25 +30,60 @@ interface State {
   trades: Map<string, Json>;
   quotes: Map<string, { body: Json; expiresAtMs: number }>;
   activity: Json[];
-  counter: number;
 }
 
+const BY_ID = [/^\/v2\/orders\/payment$/, /^\/v2\/orders\/trade$/, /^\/v2\/orders\/[^/]+$/, /^\/v2\/recipients\/[^/]+\/confirm$/];
+
+/**
+ * ONE instance holds several accounts. Every call must carry `accountId`; a
+ * call without it, or for an unknown account, is refused, and each call sees
+ * only that account's data. Generated ids are unique across accounts.
+ *
+ * `enforceOwnership: false` models a provider that, given the master API key,
+ * acts on any id whatever the scope says; the isolation tests use it so that
+ * they prove the server's own checks.
+ */
 export class MockEqualsServer implements EqualsTransport {
   private readonly now: () => number;
-  private state: State;
+  private readonly states = new Map<string, State>();
+  private readonly enforceOwnership: boolean;
+  private counter = 0;
+  /** The account the current request is for. Set at the start of each (synchronous) request. */
+  private state!: State;
+  /** Every request received, for tests. */
+  readonly seen: { path: string; accountId: string | undefined }[] = [];
 
-  constructor(
-    private readonly accountId: string,
-    options: { now?: () => number } = {},
-  ) {
+  constructor(options: { accounts?: string[]; now?: () => number; enforceOwnership?: boolean } = {}) {
     this.now = options.now ?? Date.now;
-    this.state = this.seed();
+    this.enforceOwnership = options.enforceOwnership ?? true;
+    for (const accountId of options.accounts ?? MOCK_ACCOUNTS_B) this.states.set(accountId, this.seed(accountId));
+  }
+
+  private get accountId(): string {
+    return this.state.accountId;
   }
 
   async request(request: EqualsRequest): Promise<{ status: number; body: string }> {
     await Promise.resolve();
     if (!request.apiKey) return this.fail(401, 'unauthorised');
-    if (request.query?.accountId !== this.accountId) return this.fail(403, 'forbidden');
+    const scope = request.query?.accountId;
+    this.seen.push({ path: request.path, accountId: scope });
+    const own = scope ? this.states.get(scope) : undefined;
+    if (!own) return this.fail(403, 'forbidden');
+    this.state = own;
+    const response = this.route(request);
+    if (this.enforceOwnership || response.status < 400 || response.status >= 500 || !BY_ID.some((pattern) => pattern.test(request.path))) return response;
+    // Lax mode: the id was not in the scoped account, so act on it wherever it lives.
+    for (const other of this.states.values()) {
+      if (other === own) continue;
+      this.state = other;
+      const elsewhere = this.route(request);
+      if (elsewhere.status < 300) return elsewhere;
+    }
+    return response;
+  }
+
+  private route(request: EqualsRequest): { status: number; body: string } {
     const { method, path, query = {} } = request;
     const body = (request.body ?? {}) as Json;
     const key = `${method} ${path}`;
@@ -86,8 +125,8 @@ export class MockEqualsServer implements EqualsTransport {
     return new Date(this.now() + offsetMs).toISOString();
   }
   private id(prefix: string): string {
-    this.state.counter += 1;
-    return `SMPL${prefix}${this.state.counter.toString().padStart(6, '0')}`;
+    this.counter += 1;
+    return `SMPL${prefix}${this.counter.toString().padStart(6, '0')}`;
   }
   private page(rows: Json[], query: Record<string, string>): Json {
     const limit = Math.min(1000, Math.max(1, Number(query.limit ?? 100) || 100));
@@ -247,9 +286,11 @@ export class MockEqualsServer implements EqualsTransport {
     return this.ok(order);
   }
 
-  private seed(): State {
+  private seed(accountId: string): State {
     const state: State = {
-      budgetId: 'sample-budget-0001',
+      accountId,
+      // Not derived from the account id: budget ids end up in ids the client app sees.
+      budgetId: `sample-budget-${(this.states.size + 1).toString().padStart(4, '0')}`,
       balances: new Map([
         ['GBP', new Big('48250.75')],
         ['EUR', new Big('131900.00')],
@@ -260,7 +301,6 @@ export class MockEqualsServer implements EqualsTransport {
       trades: new Map(),
       quotes: new Map(),
       activity: [],
-      counter: 0,
     };
     this.state = state;
     const recipient = (id: string, name: string, currencyCode: string, accountIdentifier: string, bankIdentifier: string | undefined, countryCode: string): Json => ({

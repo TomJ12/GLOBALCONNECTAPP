@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { AMIRA, harness, PASSWORD, type Harness } from './helpers';
+import { ADMIN_TOKEN, AMIRA, harness, PASSWORD, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
@@ -67,16 +67,30 @@ test('a new invitation replaces the old one; an activated account cannot be re-i
   await assert.rejects(h.invite(AMIRA));
 });
 
-test('there is no self-signup: the admin endpoint needs the admin token and a directory entry', async () => {
+test('there is no self-signup: the operator command is not on the public listener, needs the admin token, and emails the link instead of returning it', async () => {
   h = await harness();
-  const post = (token: string | undefined, email: string) => h.call('POST', '/admin/invites', { token, body: { email } });
-  assert.equal((await post(undefined, AMIRA)).status, 404);
-  assert.equal((await post('wrong-token-0123456789', AMIRA)).status, 404);
-  assert.equal((await post('test-admin-token-0123456789', 'stranger@nowhere.example')).status, 404);
-  const ok = await post('test-admin-token-0123456789', AMIRA);
+  // The public listener has no /admin route at all, whatever token is sent.
+  for (const url of ['/admin/invites', '/admin/ops-admins']) {
+    assert.equal((await h.call('POST', url, { token: ADMIN_TOKEN, body: { email: AMIRA, name: 'A' } })).status, 404, url);
+  }
+  assert.equal(h.outbox.sent.length, 0);
+  // On the loopback listener: token and a directory entry.
+  assert.equal((await h.adminCall('/admin/invites', { email: AMIRA }, '')).status, 404);
+  assert.equal((await h.adminCall('/admin/invites', { email: AMIRA }, 'wrong-token-0123456789')).status, 404);
+  assert.equal((await h.adminCall('/admin/invites', { email: 'stranger@nowhere.example' })).status, 404);
+  const ok = await h.adminCall('/admin/invites', { email: AMIRA });
   assert.equal(ok.status, 200);
-  assert.match(ok.json.activationCode, /^[A-Z2-7]{5}(-[A-Z2-7]{5}){3}$/);
-  assert.ok(ok.json.activationLink.endsWith(`/activate?code=${ok.json.activationCode}`));
+  assert.deepEqual(Object.keys(ok.json).sort(), ['expiresAt', 'sentTo']);
+  assert.equal(ok.json.sentTo, 'a…@northfield.example');
+  assert.doesNotMatch(JSON.stringify(ok.json), /[A-Z2-7]{5}-[A-Z2-7]{5}|code=/);
+  // The link went to the address on file, with the code after "#".
+  assert.equal(h.outbox.sent.length, 1);
+  assert.equal(h.outbox.sent[0]?.to, AMIRA);
+  assert.match(h.outbox.sent[0]?.text ?? '', /\/activate#code=[A-Z2-7]{5}(-[A-Z2-7]{5}){3}\n/);
+  assert.equal((await h.call('POST', '/v1/activation/start', { body: { activationCode: h.mailedCode(AMIRA) } })).status, 200);
+  // And it is in the audit log, as is the refusal.
+  const entries = await h.stores.audit.query({ action: 'system.client.activation_link' });
+  assert.deepEqual(entries.map((entry) => [entry.outcome, entry.target?.label]), [['success', AMIRA], ['failure', 'stranger@nowhere.example']]);
 });
 
 test('sign-in: wrong password, unknown email and a not-yet-activated account are indistinguishable', async () => {

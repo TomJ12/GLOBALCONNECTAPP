@@ -9,6 +9,9 @@
  *
  * Sample data, mock providers, accounts kept in a local JSON file (DATA_FILE).
  * Not a deployment. `npm run demo:reset` (this script with --reset) wipes the file.
+ *
+ * The server is strict by default and would refuse all of that. This script
+ * starts it with APP_ENV=development, which is the explicit opt-in.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
@@ -23,8 +26,8 @@ const publicUrl = process.env.APP_URL ?? (codespace ? `https://${codespace}-${po
 const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-if (process.env.NODE_ENV === 'production') {
-  console.error('npm run demo is for demonstrations only and will not run with NODE_ENV=production.');
+if (process.env.NODE_ENV === 'production' || (process.env.APP_ENV && process.env.APP_ENV !== 'development')) {
+  console.error('npm run demo is for demonstrations only and will not run with NODE_ENV=production or APP_ENV=production.');
   process.exit(1);
 }
 
@@ -47,13 +50,25 @@ const build = spawnSync(npx, ['expo', 'export', '-p', 'web', '--output-dir', 'di
 if (build.status !== 0) process.exit(build.status ?? 1);
 
 console.log(
-  `\nOpen ${publicUrl} (client app) or ${publicUrl}/ops (ops console)\nActivation codes are printed below.\n` +
+  `\nOpen ${publicUrl} (client app) or ${publicUrl}/ops (ops console)\n` +
+    'Activation codes for the sample clients and the two demo staff are printed below.\n' +
+    'Nothing is emailed: when the ops console "sends an activation email", the email is printed in THIS terminal.\n' +
     `Demo accounts are being kept in ${dataFile} (local demo only; wipe with: npm run demo:reset).\n`,
 );
 const server = spawn(npm, ['--prefix', 'server', 'run', 'start'], {
   cwd: root,
   stdio: 'inherit',
-  env: { ...process.env, PORT: port, WEB_DIR: path.join(root, 'dist-demo'), APP_URL: publicUrl, DATA_FILE: dataFile, TRUST_PROXY: codespace ? '1' : (process.env.TRUST_PROXY ?? '0') },
+  env: {
+    ...process.env,
+    // The explicit opt-in to mock providers, sample data, printed codes and the file store.
+    APP_ENV: 'development',
+    PORT: port,
+    WEB_DIR: path.join(root, 'dist-demo'),
+    APP_URL: publicUrl,
+    DATA_FILE: dataFile,
+    // In a Codespace requests arrive through one forwarding proxy: believe exactly one hop of X-Forwarded-For.
+    TRUST_PROXY: process.env.TRUST_PROXY ?? (codespace ? '1' : '0'),
+  },
 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.kill(signal));
 server.on('exit', (code) => process.exit(code ?? 0));

@@ -77,6 +77,8 @@ export interface MockServerOptions {
   getControls: () => MockControls;
   now?: () => number;
   random?: () => number;
+  /** Put into every id this instance generates, so several instances never produce the same id. */
+  idNamespace?: string;
 }
 
 function one(params: TransportParams | undefined, key: string): string | undefined {
@@ -135,9 +137,11 @@ export class MockCurrencycloudServer implements Transport {
   private readonly getControls: () => MockControls;
   private readonly now: () => number;
   private readonly random: () => number;
+  private readonly idNamespace: string;
   private state: State;
 
   constructor(options: MockServerOptions) {
+    this.idNamespace = options.idNamespace ?? '';
     this.getControls = options.getControls;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
@@ -264,7 +268,7 @@ export class MockCurrencycloudServer implements Transport {
 
   private nextId(prefix: string): string {
     this.state.counter += 1;
-    return `sample-${prefix}-${this.state.counter.toString().padStart(4, '0')}`;
+    return `sample-${this.idNamespace}${prefix}-${this.state.counter.toString().padStart(4, '0')}`;
   }
 
   private shortReference(): string {

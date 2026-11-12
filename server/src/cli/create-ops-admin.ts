@@ -1,23 +1,25 @@
 /**
  * npm run create-ops-admin -- <email> "<name>"
  *
- * Asks the RUNNING server to create the first ops admin and prints the
- * activation link. Needs ADMIN_TOKEN (the same value the server was started
- * with). The server refuses once an active ops admin exists: further staff
- * are invited from the ops console.
+ * Asks the RUNNING server to create an ops admin and email them an activation
+ * link (in development mode the email is printed in the server console). The
+ * link is not printed here. Works only while fewer than two active staff
+ * exist: four-eyes approval needs two, and after that staff are invited from
+ * the ops console. Talks to the server's loopback-only operator port and
+ * needs ADMIN_TOKEN (the same value the server was started with).
  */
 export {};
 
 const [email, name] = process.argv.slice(2);
 const token = process.env.ADMIN_TOKEN;
-const server = process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 3001}`;
+const server = process.env.ADMIN_URL ?? `http://127.0.0.1:${process.env.ADMIN_PORT ?? 3002}`;
 
 if (!email || !name) {
   console.error('Usage: npm run create-ops-admin -- <email> "<name>"');
   process.exit(2);
 }
-if (!token || token.length < 16) {
-  console.error('Set ADMIN_TOKEN (16+ characters) in server/.env for both the server and this command.');
+if (!token) {
+  console.error('Set ADMIN_TOKEN in server/.env for both the server and this command (openssl rand -base64 32).');
   process.exit(2);
 }
 
@@ -30,18 +32,17 @@ try {
   if (!response.ok) {
     const reasons: Record<number, string> = {
       400: 'The email or name was not accepted.',
-      403: 'An active ops admin already exists (or that email belongs to another staff account). Invite further staff from the ops console.',
-      404: 'ADMIN_TOKEN does not match the server, or the server has none set.',
+      403: 'Refused: two active staff already exist (invite further staff from the ops console), or that email belongs to an existing staff account.',
+      404: 'ADMIN_TOKEN does not match the server.',
     };
     console.error(reasons[response.status] ?? `The server answered ${response.status}.`);
     process.exit(1);
   }
-  const invite = (await response.json()) as { activationCode: string; activationLink: string; expiresAt: string };
-  console.log(`Activation link: ${invite.activationLink}`);
-  console.log(`Activation code: ${invite.activationCode}`);
-  console.log(`Expires:         ${invite.expiresAt}`);
-  console.log('Pass the link to that person through an approved channel. It is not emailed.');
+  const sent = (await response.json()) as { sentTo: string; expiresAt: string };
+  console.log(`Activation email sent to ${sent.sentTo}`);
+  console.log(`Expires: ${sent.expiresAt}`);
+  console.log('(In development mode the email is printed in the server console.)');
 } catch {
-  console.error(`Could not reach the server at ${server}. Is it running?`);
+  console.error(`Could not reach the operator port at ${server}. Is the server running with ADMIN_TOKEN set, on this machine?`);
   process.exit(1);
 }
