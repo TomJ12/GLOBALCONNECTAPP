@@ -7,10 +7,13 @@ import { MockCurrencycloudPlatform } from '../src/providers/currencycloudMock';
 import { equalsFactory } from '../src/providers/equals/adapter';
 import { MockEqualsServer } from '../src/providers/equals/mockServer';
 import { ConsoleOutbox } from '../src/mailer';
-import { createMemoryStores, type AuditOptions, type DirectoryData } from '../src/store/memory';
+import { createSqliteStores, type DirectoryData, type SqliteStores } from '../src/store/sqlite';
+import type { AuditOptions } from '../src/store/sqlite/audit';
+import { dataKeys } from '../src/store/sqlite/keys';
 import { seedDirectory } from '../src/store/seed';
-import type { Stores } from '../src/store/types';
 
+/** A fixed data encryption key for the suite (32 bytes, base64). */
+export const TEST_DATA_KEY = 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=';
 export const PASSWORD = 'correct horse battery';
 export const ADMIN_TOKEN = 'k3Vq9xWm2ZrT7pLd5NfY8hJc4BsG6aQe1UoXiPzM';
 /** The suite hashes hundreds of passwords: a low cost keeps it quick. One test raises it to check the real setting. */
@@ -25,7 +28,7 @@ export interface Reply {
 
 export interface Harness {
   config: Config;
-  stores: Stores;
+  stores: SqliteStores;
   clock: { now: number; advance: (ms: number) => void };
   /** Every response body seen, for the "no provider name" scan. */
   bodies: string[];
@@ -65,6 +68,8 @@ export interface HarnessOptions {
   /** false = the mock providers act on any id whatever the scope says, so only the server's own checks stand between companies. */
   enforceOwnership?: boolean;
   audit?: AuditOptions;
+  /** A database file instead of the in-memory database (for restart tests). */
+  databasePath?: string;
   maxRateWindows?: number;
   maxHeldQuotes?: number;
   /**
@@ -102,7 +107,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
   };
   const now = () => clock.now;
   const warnings: string[] = [];
-  const stores = createMemoryStores(directory, now, { warn: (message) => void warnings.push(message), ...options.audit });
+  const stores = createSqliteStores({ path: options.databasePath ?? ':memory:', keys: dataKeys(TEST_DATA_KEY), now, seed: directory, audit: { notice: (message) => void warnings.push(message), ...options.audit } });
   if (options.storeLatency) {
     stores.directory = withLatency(stores.directory, options.storeHook);
     stores.ops.users = withLatency(stores.ops.users, options.storeHook);
@@ -182,6 +187,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     close: async () => {
       await app.close();
       await admin.close();
+      stores.close();
     },
   };
 }
@@ -189,3 +195,9 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
 export const AMIRA = 'amira@northfield.example';
 export const BEN = 'ben@castlebrook.example';
 export const DANA = 'dana@adviser.example';
+
+/** Every row of every table, as text: what someone holding the database file could read. */
+export function dumpDatabase(stores: SqliteStores): string {
+  const tables = stores.db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'");
+  return JSON.stringify(tables.map((table) => [table.name, stores.db.all(`SELECT * FROM ${table.name}`)]));
+}

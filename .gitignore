@@ -47,5 +47,5 @@ dist-demo/
 server/.env
 .env
 
-# local demo accounts (password hashes and authenticator keys in plain form)
+# local demo database (password hashes, encrypted authenticator keys) and its development key
 .demo-data/

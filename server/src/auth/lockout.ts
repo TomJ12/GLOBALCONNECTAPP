@@ -100,12 +100,13 @@ export class Lockout {
 
   async isLocked(subjects: string[]): Promise<boolean> {
     const now = this.now();
-    return (await this.attempts.count((record) => subjects.includes(record.subject) && record.lockedUntil > now)) > 0;
+    for (const subject of subjects) if ((await this.attempts.count({ subject }, (record) => record.lockedUntil > now)) > 0) return true;
+    return false;
   }
 
   /** Clears every counter for these subjects, from every source. */
-  unlock(subjects: string[]): Promise<void> {
-    return this.attempts.deleteWhere((record) => subjects.includes(record.subject));
+  async unlock(subjects: string[]): Promise<void> {
+    for (const subject of subjects) await this.attempts.deleteWhere({ subject });
   }
 }
 

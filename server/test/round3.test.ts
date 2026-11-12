@@ -12,14 +12,15 @@ import { loadConfig, secretProblem } from '../src/config';
 import { hashPassword, passwordWork } from '../src/crypto';
 import { activationMessage } from '../src/mailer';
 import { networkOf, sourceOf } from '../src/net';
-import { DEMO_STAFF, seedInvitations } from '../src/startup';
-import { createFileStores, DATA_FILE_VERSION } from '../src/store/file';
+import { createRuntime, DEMO_STAFF, seedInvitations } from '../src/startup';
+import { createSqliteStores, type SqliteStores } from '../src/store/sqlite';
+import { dataKeys } from '../src/store/sqlite/keys';
 import { seedDirectory } from '../src/store/seed';
 import type { OpsRole } from '../src/store/types';
 import { isEmail } from '../src/validate';
 import { AuthService } from '../src/auth/service';
 import { OpsAuthService } from '../src/ops/auth';
-import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, type Harness } from './helpers';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, dumpDatabase, harness, PASSWORD, TEST_DATA_KEY, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
@@ -93,27 +94,14 @@ async function approved(requester: Staff, approver: Staff, url: string, form: Re
   return idOf(asked.location);
 }
 
-// --- N1 (file-backed part) -------------------------------------------------------------------------
+// --- demo:reset --------------------------------------------------------------------------------------
 
-test('N1: with DATA_FILE a full audit segment goes to its own file, the main file never reloads "full", and demo:reset removes the archives', async () => {
-  const folder = mkdtempSync(path.join(tmpdir(), 'gc-audit-'));
-  const file = path.join(folder, 'accounts.json');
-  const warnings: string[] = [];
+test('demo:reset removes the database, its write-ahead files, its development key and any old JSON file', () => {
+  const folder = mkdtempSync(path.join(tmpdir(), 'gc-reset-'));
+  const database = path.join(folder, 'globalconnect.sqlite');
   try {
-    const stores = createFileStores(file, seedDirectory(), { development: true, auditSegment: 3, warn: (message) => void warnings.push(message) });
-    for (let n = 1; n <= 8; n += 1) await stores.audit.append({ at: n, actor: { type: 'system', id: null, label: 's' }, target: null, action: `e${n}`, outcome: 'success', source: '', detail: {} });
-    const archives = readdirSync(folder).filter((name) => name.startsWith('accounts.json.audit-')).sort();
-    assert.equal(archives.length, 2);
-    assert.deepEqual(archives.map((name) => (JSON.parse(readFileSync(path.join(folder, name), 'utf8')) as { action: string }[]).map((item) => item.action)), [['e1', 'e2', 'e3'], ['e4', 'e5', 'e6']]);
-    assert.equal(warnings.length, 2);
-    assert.match(warnings[0] ?? '', /AUDIT LOG ROTATED.*archived to .*accounts\.json\.audit-0001/);
-    // A restart loads only the working segment, and goes on recording.
-    const again = createFileStores(file, seedDirectory(), { development: true, auditSegment: 3 });
-    assert.deepEqual((await again.audit.query()).map((item) => item.action), ['e8', 'e7']);
-    await again.audit.append({ at: 9, actor: { type: 'system', id: null, label: 's' }, target: null, action: 'e9', outcome: 'success', source: '', detail: {} });
-    assert.deepEqual((await again.audit.query()).map((item) => item.action), ['e9', 'e8', 'e7']);
-    // demo:reset takes the archives with it.
-    const reset = spawnSync(process.execPath, [path.join(serverDir, '..', 'scripts', 'demo.mjs'), '--reset'], { env: { PATH: process.env.PATH ?? '', DATA_FILE: file }, encoding: 'utf8' });
+    for (const name of ['globalconnect.sqlite', 'globalconnect.sqlite-wal', 'globalconnect.sqlite-shm', 'globalconnect.sqlite.dev-key', 'accounts.json', 'accounts.json.audit-0001']) writeFileSync(path.join(folder, name), 'x');
+    const reset = spawnSync(process.execPath, [path.join(serverDir, '..', 'scripts', 'demo.mjs'), '--reset'], { env: { PATH: process.env.PATH ?? '', DATABASE_PATH: database, DATA_FILE: path.join(folder, 'accounts.json') }, encoding: 'utf8' });
     assert.equal(reset.status, 0);
     assert.deepEqual(readdirSync(folder), []);
   } finally {
@@ -354,10 +342,9 @@ test('N6: the pre-login anchor is signed, not stored: any number of sign-in page
   const anchor = real.cookies.get('gc_ops_pre') ?? '';
   assert.match(anchor, /^\d+\.[\w-]+\.[\w-]+$/);
   // ...then thousands of other requests for it arrive.
-  const rowsBefore = JSON.stringify(Object.keys(h.stores.ops));
+  const rowsBefore = dumpDatabase(h.stores);
   for (let index = 0; index < 3000; index += 1) await h.app.inject({ method: 'GET', url: '/ops/login' });
-  assert.equal(JSON.stringify(Object.keys(h.stores.ops)), rowsBefore);
-  assert.ok(!('preSessions' in h.stores.ops), 'nothing is stored per visitor');
+  assert.equal(dumpDatabase(h.stores), rowsBefore, 'nothing is stored per visitor');
   // The real one can still sign in with the page they already have.
   const first = await real.post('/ops/login', { email: admin.email, password: OPS_PASSWORD });
   assert.equal(first.status, 200);
@@ -440,12 +427,14 @@ test('N7: company names are unique whatever the case or spacing; a rename needs 
 
 test('N8: a restart never replaces a live invitation; it prints the same still-valid codes, and never touches accounts made in the console', async () => {
   const folder = mkdtempSync(path.join(tmpdir(), 'gc-seed-'));
-  const file = path.join(folder, 'accounts.json');
+  const file = path.join(folder, 'demo.sqlite');
   const config = { ...loadConfig({ APP_ENV: 'development' }), appUrl: 'http://localhost:3001' };
   let now = Date.UTC(2026, 10, 11, 10, 0, 0);
   const clock = () => now;
+  const held: { stores: SqliteStores | null } = { stores: null };
   const start = async () => {
-    const stores = createFileStores(file, seedDirectory(), { development: true, now: clock });
+    held.stores?.close();
+    const stores = (held.stores = createSqliteStores({ path: file, keys: dataKeys(TEST_DATA_KEY), seed: seedDirectory(), now: clock }));
     const auth = new AuthService(stores, config, clock);
     const opsAuth = new OpsAuthService(stores, config, clock);
     return { stores, auth, opsAuth, lines: await seedInvitations({ stores, seedCodes: stores.seedCodes }, auth, opsAuth, config, clock) };
@@ -461,7 +450,7 @@ test('N8: a restart never replaces a live invitation; it prints the same still-v
     await first.stores.directory.saveUser({ id: 'usr_console', email: 'new@client.example', name: 'New Client', passwordHash: null, totpSecret: null, lastTotpStep: 0, recoveryCodeHashes: [], activatedAt: null });
     const mailed = await first.auth.createInvite('new@client.example');
     const benMailed = await first.auth.createInvite(BEN);
-    const activations = await first.stores.auth.activations.count(() => true);
+    const activations = await first.stores.auth.activations.count({});
 
     // RESTART, an hour later.
     now += 60 * 60_000;
@@ -477,7 +466,7 @@ test('N8: a restart never replaces a live invitation; it prints the same still-v
     assert.equal((await second.auth.activationStart(benMailed.activationCode)).email, BEN);
     assert.match(second.lines.find((line) => line.includes(BEN)) ?? '', /has NOT been replaced/);
     assert.ok(!second.lines.some((line) => line.includes('new@client.example')), 'console-made accounts are never printed');
-    assert.equal(await second.stores.auth.activations.count(() => true), activations);
+    assert.equal(await second.stores.auth.activations.count({}), activations);
 
     // Only when nothing live is left (72 hours on) is a new code issued, for sample accounts only.
     now += 73 * 60 * 60_000;
@@ -487,28 +476,35 @@ test('N8: a restart never replaces a live invitation; it prints the same still-v
     assert.ok(renewed[BEN]);
     assert.ok(!third.lines.some((line) => line.includes('new@client.example')));
     await assert.rejects(third.auth.activationStart(mailed.activationCode));
+
+    // Outside development no readable code is ever written: the table of printed codes refuses.
+    held.stores?.close();
+    held.stores = null;
+    const strict = createRuntime({ ...loadConfig({ APP_ENV: 'development' }), development: false, strict: true, databasePath: path.join(folder, 'strict.sqlite'), dataEncryptionKey: TEST_DATA_KEY }, { mailer: { send: async () => {} }, transports: { currencycloud: { request: async () => ({ status: 500, body: null }) } as never, equals: { request: async () => ({ status: 500, body: null }) } as never } });
+    await assert.rejects(strict.seedCodes.put('k', { code: 'c', codeHash: 'h' }), /only in development mode/);
+    assert.equal(strict.stores.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM dev_seed_codes')?.n, 0);
+    assert.equal(strict.stores.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users')?.n, 0, 'no sample accounts outside development');
+    strict.stores.close();
   } finally {
+    held.stores?.close();
     rmSync(folder, { recursive: true, force: true });
   }
 });
 
-test('N8: npm run demo refuses a data file from an earlier version BEFORE building anything, and says exactly what to run', () => {
+test('npm run demo refuses to start beside an old JSON data file BEFORE building anything, and says exactly what to run', () => {
   const folder = mkdtempSync(path.join(tmpdir(), 'gc-demo-'));
   const file = path.join(folder, 'accounts.json');
   const script = path.join(serverDir, '..', 'scripts', 'demo.mjs');
   try {
-    assert.match(readFileSync(script, 'utf8'), new RegExp(`const DATA_FILE_VERSION = ${DATA_FILE_VERSION};`), 'scripts/demo.mjs and the file store must agree on the version');
-    for (const content of [JSON.stringify({ version: DATA_FILE_VERSION - 1, directory: {} }), '{"version":']) {
-      writeFileSync(file, content);
-      const started = Date.now();
-      const run = spawnSync(process.execPath, [script], { env: { PATH: process.env.PATH ?? '', DATA_FILE: file }, encoding: 'utf8', timeout: 20_000 });
-      assert.equal(run.status, 1, 'it must stop, not start the one-minute build');
-      assert.ok(Date.now() - started < 10_000);
-      assert.match(run.stderr, /npm run demo:reset/);
-      assert.match(run.stderr, /earlier version/);
-      assert.doesNotMatch(run.stdout + run.stderr, /Building the web app/);
-      assert.ok(!existsSync(path.join(serverDir, '..', 'dist-demo', '.just-built')));
-    }
+    writeFileSync(file, JSON.stringify({ version: 3, directory: {} }));
+    const started = Date.now();
+    const run = spawnSync(process.execPath, [script], { env: { PATH: process.env.PATH ?? '', DATA_FILE: file, DATABASE_PATH: path.join(folder, 'demo.sqlite') }, encoding: 'utf8', timeout: 20_000 });
+    assert.equal(run.status, 1, 'it must stop, not start the one-minute build');
+    assert.ok(Date.now() - started < 10_000);
+    assert.match(run.stderr, /npm run demo:reset/);
+    assert.match(run.stderr, /earlier version/);
+    assert.doesNotMatch(run.stdout + run.stderr, /Building the web app/);
+    assert.ok(!existsSync(path.join(folder, 'demo.sqlite')));
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }

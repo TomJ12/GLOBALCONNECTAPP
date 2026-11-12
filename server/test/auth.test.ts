@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { ADMIN_TOKEN, AMIRA, harness, PASSWORD, type Harness } from './helpers';
+import { ADMIN_TOKEN, AMIRA, dumpDatabase, harness, PASSWORD, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
@@ -268,11 +268,10 @@ test('tokens, passwords and recovery codes are stored only as hashes', async () 
   const token = (await h.login(AMIRA, secret)).json.token as string;
   const stepUpToken = await h.stepUp(token, secret, 'payment.approve', { paymentId: 'x' });
 
-  // Everything the in-memory stores hold, as text. (The authenticator key itself has to be
-  // readable by the server to check codes; a database must encrypt it at rest.)
-  const tables = h.stores.auth as unknown as Record<string, { rows: Map<string, unknown> }>;
-  const dump = JSON.stringify([await h.stores.directory.listUsers(), Object.values(tables).map((table) => [...table.rows.entries()])]);
-  for (const value of [PASSWORD, token, stepUpToken, challengeId, activationCode, activationCode.replace(/-/g, ''), ...recoveryCodes]) {
+  // Everything the database holds, as text. The authenticator key is there too, but encrypted.
+  const dump = dumpDatabase(h.stores);
+  assert.match(dump, /gcm1:/);
+  for (const value of [PASSWORD, secret, token, stepUpToken, challengeId, activationCode, activationCode.replace(/-/g, ''), ...recoveryCodes]) {
     assert.ok(!dump.includes(value), 'a secret was stored in the clear');
   }
   assert.ok(dump.includes('scrypt$'));

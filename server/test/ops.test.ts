@@ -1,12 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { afterEach, test } from 'node:test';
 
 import { assertStaffRemovalAllowed, OpsError } from '../src/ops/console';
-import { createFileStores } from '../src/store/file';
-import { seedDirectory } from '../src/store/seed';
 import type { OpsRole } from '../src/store/types';
 import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, type Harness } from './helpers';
 
@@ -924,62 +919,6 @@ test('bootstrap: the operator command creates ops admins only while fewer than t
   // A new member of staff is written where it is looked for.
   assert.deepEqual((await audit('ops.staff.new')).map((entry) => [entry.target?.label, entry.detail.role]).sort(), [['first.admin@globalconnect.example', 'ops_admin'], ['second@globalconnect.example', 'ops_admin']]);
   assert.match((await (await staff('viewer@globalconnect.example', 'ops')).browser.get('/ops/audit?action=ops.staff.new')).body, /<tr class="alert">/);
-});
-
-test('file store: accounts, requests and the audit log survive a restart; a damaged file is refused; development mode only', async () => {
-  const folder = mkdtempSync(path.join(tmpdir(), 'gc-store-'));
-  const file = path.join(folder, 'nested', 'accounts.json');
-  try {
-    const first = createFileStores(file, seedDirectory(), { development: true });
-    await first.directory.updateUser('usr_amira', (user) => ({ ...user, passwordHash: 'scrypt$demo', totpSecret: 'JBSWY3DPEHPK3PXP', activatedAt: 5, lastSignInAt: 6 }));
-    await first.directory.saveCompany({ id: 'co_new', name: 'New Ltd', providerKey: 'equals', providerAccountId: 'S9', providerContactId: '', deactivatedAt: null });
-    await first.directory.setMembership({ userId: 'usr_amira', companyId: 'co_new', role: 'approver' });
-    await first.directory.removeMembership('usr_dana', 'co_castlebrook');
-    await first.ops.users.save({ id: 'ops_1', email: 'a@globalconnect.example', name: 'A', role: 'ops_admin', passwordHash: 'scrypt$x', totpSecret: 'K', lastTotpStep: 3, recoveryCodeHashes: ['h'], activatedAt: 1, disabledAt: null, lastSignInAt: null });
-    await first.auth.activations.put('hash-1', { userId: 'usr_ben', expiresAt: 99, pendingPasswordHash: null, pendingTotpSecret: null });
-    await first.ops.approvals.put('req_1', { id: 'req_1', action: 'client.unlock', params: { id: 'usr_ben' }, summary: 's', warnings: ['w'], target: null, requestedBy: { id: 'ops_1', email: 'a@globalconnect.example' }, requestedAt: 1, expiresAt: 2, status: 'pending', decidedBy: null, decidedAt: null });
-    await first.providerKeys.put('co_new:key:k1', { orderId: 'o1', createdAt: 1 });
-    await first.auth.sessions.put('token-hash', { id: 's', userId: 'usr_amira', companyId: null, createdAt: 1, lastSeenAt: 1 });
-    await first.audit.append({ at: 7, actor: { type: 'system', id: null, label: 'test' }, target: null, action: 'test.event', outcome: 'success', source: '', detail: { a: 'b' } });
-
-    // An anonymous failed sign-in (attempt counter + anonymous audit entry) does not rewrite the file.
-    const written = readFileSync(file, 'utf8');
-    const modified = statSync(file).mtimeMs;
-    await first.auth.attempts.put('password:email:x|1.2.3.4', { failures: 2, lockedUntil: 0, locks: 0, subject: 'email:x', updatedAt: 1 });
-    await first.audit.append({ at: 8, actor: { type: 'client', id: null, label: 'x' }, target: null, action: 'client.sign_in', outcome: 'failure', source: '1.2.3.4', detail: {} });
-    assert.equal(readFileSync(file, 'utf8'), written);
-    assert.equal(statSync(file).mtimeMs, modified);
-
-    const second = createFileStores(file, seedDirectory(), { development: true });
-    const loaded = await second.directory.getUser('usr_amira');
-    assert.deepEqual([loaded?.passwordHash, loaded?.totpSecret, loaded?.activatedAt, loaded?.lastSignInAt], ['scrypt$demo', 'JBSWY3DPEHPK3PXP', 5, 6]);
-    assert.equal((await second.directory.getCompany('co_new'))?.name, 'New Ltd');
-    assert.deepEqual((await second.directory.membershipsOf('usr_amira')).map((item) => `${item.companyId}:${item.role}`).sort(), ['co_new:approver', 'co_northfield:admin']);
-    assert.deepEqual((await second.directory.membershipsOf('usr_dana')).map((item) => item.companyId), ['co_northfield']);
-    assert.equal((await second.ops.users.findByEmail('a@globalconnect.example'))?.lastTotpStep, 3);
-    assert.equal((await second.auth.activations.get('hash-1'))?.userId, 'usr_ben');
-    assert.equal((await second.ops.approvals.get('req_1'))?.warnings[0], 'w');
-    assert.equal((await second.providerKeys.get('co_new:key:k1'))?.orderId, 'o1');
-    assert.equal(await second.auth.sessions.get('token-hash'), null, 'sessions are not kept: a restart signs everyone out');
-    assert.deepEqual((await second.audit.query()).map((entry) => [entry.action, entry.detail]), [['test.event', { a: 'b' }]]);
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).version, 3);
-
-    // Anything that is not exactly the expected shape is refused, with the place named, rather than half-loaded.
-    const good = JSON.parse(readFileSync(file, 'utf8'));
-    for (const [damage, pattern] of [
-      [{ ...good, version: 2 }, /not a Global Connect demo data file of this version[^]*npm run demo:reset/],
-      [{ ...good, opsUsers: [{ id: 'ops_x', role: 'superuser' }] }, /problem at "opsUsers/],
-      [{ ...good, directory: { ...good.directory, users: [{ ...good.directory.users[0], passwordHash: 5 }] } }, /problem at "directory\.users\.0\.passwordHash"/],
-      [{ ...good, extra: true }, /not a Global Connect demo data file/],
-      ['{"version":2,', /not valid JSON/],
-    ] as const) {
-      writeFileSync(file, typeof damage === 'string' ? damage : JSON.stringify(damage));
-      assert.throws(() => createFileStores(file, seedDirectory(), { development: true }), pattern);
-    }
-    assert.throws(() => createFileStores(file, seedDirectory(), { development: false }), /local demonstrations only/);
-  } finally {
-    rmSync(folder, { recursive: true, force: true });
-  }
 });
 
 void DANA;

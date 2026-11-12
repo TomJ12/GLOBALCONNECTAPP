@@ -97,7 +97,7 @@ export class OpsAuthService {
     const user = await this.ops.users.get(userId);
     if (!user) throw new ApiError('not_found');
     if (user.activatedAt !== null || user.disabledAt !== null) throw new ApiError('validation');
-    await this.ops.activations.deleteWhere((record) => record.userId === user.id);
+    await this.ops.activations.deleteWhere({ userId: user.id });
     const activationCode = randomCode(4);
     const expiresAt = this.now() + this.config.activationTtlMs;
     await this.ops.activations.put(sha256(normaliseCode(activationCode)), { userId: user.id, expiresAt, pendingPasswordHash: null, pendingTotpSecret: null });
@@ -286,9 +286,9 @@ export class OpsAuthService {
   }
 
   async revokeAllSessions(userId: string): Promise<number> {
-    const total = await this.ops.sessions.count((session) => session.userId === userId);
-    await this.ops.sessions.deleteWhere((session) => session.userId === userId);
-    await this.ops.challenges.deleteWhere((record) => record.userId === userId);
+    const total = await this.ops.sessions.count({ userId });
+    await this.ops.sessions.deleteWhere({ userId });
+    await this.ops.challenges.deleteWhere({ userId });
     return total;
   }
 
@@ -296,7 +296,7 @@ export class OpsAuthService {
   async clearCredentials(userId: string): Promise<number> {
     const user = await this.ops.users.update(userId, (current) => ({ ...current, passwordHash: null, totpSecret: null, recoveryCodeHashes: [], activatedAt: null }));
     if (!user) throw new ApiError('not_found');
-    await this.ops.activations.deleteWhere((record) => record.userId === userId);
+    await this.ops.activations.deleteWhere({ userId });
     await this.lockout.unlock([`email:${user.email}`, `user:${user.id}`]);
     return this.revokeAllSessions(userId);
   }

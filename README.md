@@ -4,14 +4,14 @@ A mobile app for Global Connect business customers (multi-currency balances, acc
 details, payments with approval, spot and forward conversion, rates and rate alerts) and
 the Global Connect server it signs in to.
 
-**Nothing here is connected to a real provider or a real database. All data is sample
-data, the provider APIs are in-memory mocks and server storage is in memory (or, for
-the local demo only, one JSON file).** The server also serves an **ops console** for
+**Nothing here is connected to a real provider. All data is sample data and the
+provider APIs are in-memory mocks. The server keeps its own data (accounts, sessions,
+requests, the audit log) in a SQLite database; see "Database".** The server also serves an **ops console** for
 Global Connect staff under `/ops` (see "Ops console").
 
 **The server is strict by default and, as it stands, only runs in development mode.**
 Mock providers, sample data, printed activation codes, the console "outbox" that stands
-in for email, and the JSON file store exist only with `APP_ENV=development`, which
+in for email, and a generated encryption key exist only with `APP_ENV=development`, which
 `npm run demo` and `npm run server` set. Without it the server refuses to start on
 mocks or without a real mailer, and this repository has neither a live provider
 transport nor a real mailer yet. `NODE_ENV` decides nothing. Fees,
@@ -21,7 +21,8 @@ delivery times and regulatory wording are bracketed placeholders.
 - TanStack Query for server state, zustand for session and developer settings
 - big.js for all money and rate arithmetic (amounts are decimal strings, never floats)
 - zod validation of every backend response
-- Server (`server/`): Node 22, Fastify, TypeScript strict, node:crypto only (scrypt, HMAC)
+- Server (`server/`): Node 22.13 or newer, Fastify, TypeScript strict, node:crypto (scrypt,
+  HMAC, AES-256-GCM) and Node's built-in SQLite (`node:sqlite`); no native modules to compile
 
 The app has two backends, chosen at build time in `src/api/index.ts`:
 
@@ -94,22 +95,27 @@ console or the operator commands below) the whole message, link included, is pri
 the terminal the server runs in, marked `DEVELOPMENT OUTBOX`. That is the only place a
 link appears: it is never shown in the ops console and never returned over HTTP.
 
-**Demo accounts are kept between runs.** `npm run demo` sets `DATA_FILE` to
-`.demo-data/accounts.json` (git-ignored) and says so when it starts, so accounts you
-activate survive a restart. Wipe it with `npm run demo:reset`. That file holds password
-hashes, authenticator keys **in plain form**, unused activation records (kept, and
-honoured, across restarts), the activation codes the server itself printed for the
-sample accounts (in plain form, so the same code can be printed again), pending approval
-requests and the working segment of the audit log; full audit segments are written to
-their own files beside it. It is for a local demonstration only: the server refuses
-`DATA_FILE` unless `APP_ENV=development`, checks the file against a schema when it
-loads it and refuses one that does not fit. **After pulling a new version, run
-`npm run demo:reset`**: if the saved file is from an earlier version, `npm run demo`
-stops at once, before building anything, and tells you to. Sessions, lockout counters and the log of
-anonymous failures are not kept, so a restart signs everyone out and forgets lockouts,
-and a failed sign-in by a stranger never rewrites the file. Without `DATA_FILE` (for
-example `npm run server`) everything is in memory and a restart forgets the accounts and
+**Demo data is kept between runs.** `npm run demo` keeps everything in a SQLite
+database, `.demo-data/globalconnect.sqlite` (git-ignored), and says so when it starts:
+accounts you activate, sessions, lockouts, pending requests and the audit log all
+survive a restart. Wipe it with `npm run demo:reset`. Authenticator keys in it are
+encrypted with a development key that is generated once and kept in a file beside the
+database (`globalconnect.sqlite.dev-key`); that only happens with
+`APP_ENV=development`. The activation codes the server itself printed for the sample
+accounts are also kept, readable, in a development-only table so the same code can be
+printed again after a restart; outside development nothing is ever written there.
+**If you ran an earlier version**, `npm run demo` finds the old
+`.demo-data/accounts.json`, stops at once, before building anything, and tells you to
+run `npm run demo:reset` (the old file is not converted). Without `DATABASE_PATH` (for
+example `npm run server`) the database is in memory: a restart forgets everything and
 prints new codes.
+
+**Node.js 22.13 or newer is required** (`node --version`). `npm run demo` and the server
+check and say so plainly. The repository has a `.devcontainer` that asks GitHub
+Codespaces for a Node 22 image; a codespace created before it was added needs
+"Rebuild container", or `nvm install 22 && nvm use 22`. Node prints one
+`ExperimentalWarning: SQLite is an experimental feature` line at start-up; see
+"Database".
 
 **Operator commands.** Three commands talk to the running server; they stand in for
 tooling an operator with access to the machine would have:
@@ -177,7 +183,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 93 tests (about two minutes)
+npm test                 # node:test, 103 tests (about two minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -254,7 +260,10 @@ server/
     ops/            the ops console: auth.ts (staff accounts, sessions, step-up),
                     console.ts (every /ops route and page, approvals), html.ts, static/
     store/          types.ts (repository interfaces incl. OpsStore, AuditLog and the atomic
-                    operations), memory.ts, file.ts (local demo only), seed.ts  <- PLACEHOLDER
+                    operations), seed.ts (sample people, development only),
+                    sqlite/ (the only place with SQL: db.ts, migrations.ts, tables.ts,
+                    directory.ts, audit.ts, keys.ts)
+    cli/db.ts       audit:verify, db:backup, db:rotate-key
     providers/
       adapter.ts          ProviderAdapter (= the app's ProviderClient + capabilities), registry
       currencycloud.ts    provider A: reuses src/api/adapters/currencycloud
@@ -426,14 +435,17 @@ the invitation still being the same one).
   by sending `X-Forwarded-For`. A hop count is only right when the server cannot be
   reached except through that many proxies. When a limiter is tracking its maximum
   number of keys it refuses new ones until a window ends; it never resets anyone's
-  count. All of these are per process and in memory.
+  count. All of these are per process and in memory: the limiter's windows are the one
+  piece of security state that is NOT in the database, so a restart resets them (lockout
+  counters, which are in the database, are not reset).
 - **Sessions**: 15 minutes idle, 12 hours absolute, revoked by `POST /v1/auth/logout`.
   Membership is re-read on every request.
 - **Atomic state changes**: an invitation, a TOTP step, a recovery code, a sign-in
   challenge, a step-up permission and a session are each changed through the store's
   atomic operations (`Table.mutate`, `Table.take`, `Directory.updateUser`), never
-  read-then-write. The in-memory store makes these trivially atomic; a database must
-  implement them as transactions or compare-and-set.
+  read-then-write. In the SQLite store each is one transaction that takes the write
+  lock before it reads (`BEGIN IMMEDIATE`) or a single `DELETE ... RETURNING`; a test
+  runs them from three processes at once against one file.
 - **Logging**: method, path and status only. Query strings, bodies and headers are never
   logged. Activation codes travel in the link's fragment, not the path or query. (A
   search typed into the ops console is a query string: it reaches the server but not
@@ -724,30 +736,37 @@ It never contains a password, key, code or token (a test plants them and searche
 Failures by someone who has not been identified (a wrong password for any email,
 including a real one) go to a **separate stream**: the last 5,000 only, at most 20 a
 minute per source address, the typed email cut to 80 characters, held in memory and not
-written to the demo file. They can neither push anything out of the main log nor fill
-it. So a password-guessing run against an account is visible there only in part; the
-lockout it causes is in the same stream.
+written to the database (so they do not survive a restart). They can neither push
+anything out of the main log nor fill it. So a password-guessing run against an account
+is visible there only in part; the lockout it causes is in the same stream.
 
-**When the log fills up.** The main log is held in a working segment (100,000 entries
-in memory; 5,000 with the demo file). When a segment is full it is **rotated**: moved to
-the archive, a new segment started, and a warning printed in capitals on the server's
-error output. Appending never fails for lack of room, nothing is refused, and the
-newest entries are never the ones lost. With the demo file each full segment is written
-to its own file beside it (`accounts.json.audit-0001-…json`), so the main file stays
-small and a restart loads only the working segment. Without a file (plain
-`npm run server`) four rotated segments are kept in memory and still shown; after that
-the **oldest** is discarded, with a warning that says so. Archived files are not shown
-in the ops console. One signed-in client can write at most 60 entries a minute (see
-"Rate limits"), so filling a segment takes a single session over a day rather than
-under a minute; that is a bound, not a cure, and durable write-once storage with
-shipping and retention is still needed.
+**Append-only.** The log is a database table. The code has no statement that changes an
+entry, and database triggers reject every `UPDATE` and `DELETE` on it.
+
+**Tamper-evident.** Each entry stores a keyed hash (HMAC-SHA-256) over the entry before
+it and its own content; the key is derived from `DATA_ENCRYPTION_KEY`, which is not in
+the database. `npm run audit:verify` walks the whole chain, archive included, and exits
+non-zero naming the first entry that was changed, removed or inserted, or saying that
+the newest entries were cut off. Limits, plainly: this detects tampering by someone who
+has the database file but not the key. Someone with the key can rewrite the chain, and
+someone who restores a whole older copy of the file leaves a chain that verifies; only
+shipping entries to separate write-once storage addresses those, and that is not built.
+After a key rotation, keep the old key in `DATA_ENCRYPTION_KEY_PREVIOUS` for as long as
+entries written under it must verify.
+
+**When the log grows.** Nothing is dropped. When the live table passes 100,000 entries
+the older half is **moved**, in one transaction, to an archive table
+(`audit_archive`) in the same database, and a line on the server's error output says so.
+The ops console shows the live table; the archive is read with SQL and is covered by
+`audit:verify`. One signed-in client can write at most 60 entries a minute (see "Rate
+limits"). Retention and shipping off the machine are still to do.
 
 ### Still not production-ready (ops console)
 
 - **Email delivery:** there is a `Mailer` interface and no implementation that sends
   mail. The server will not start outside development without one.
-- **A real database:** staff accounts, approval requests, the audit log and everything
-  else are in memory (or the demo JSON file).
+- **The database is one SQLite file on the server's disk** (see "Database"): one server
+  instance, no replication.
 - **Who can reach `/ops`:** it is on the same port as the client API, open to anyone who
   can reach the server. It needs **IP allow-listing or a VPN, and staff SSO**.
 - **Four-eyes is as described above and no more:** two ops admins acting together can do
@@ -782,20 +801,85 @@ shipping and retention is still needed.
 - **Another provider**: implement `ProviderAdapter`, add its key to `ProviderKey` and a
   factory to the registry in `server/src/index.ts`.
 
-### A real database
+### Database
 
-Implement `Directory`, `AuthStore`, `OpsStore`, `AuditLog` and the provider-key table
-from `server/src/store/types.ts` and pass them to `buildApp`. (`store/file.ts` is not
-that: it is the in-memory store written to a JSON file for the local demo.) The
-interfaces include the atomic operations the security logic depends on
-(`Table.mutate`, `Table.take`, `Directory.updateUser`, `OpsDirectory.update`): they must
-be real transactions or compare-and-set, and attempt counters must be shared between
-server instances. Other things the in-memory version gets away with that a database
-must do properly: encrypt TOTP keys at rest; expire rows; move the issued-quote map
-(`http/app.ts`, in memory and capped at 20,000 quotes, oldest dropped) into it; share
-the rate-limit counters between server instances. Provider B's key→order map is already
-behind a store table (`stores.providerKeys`), kept per company and outside the adapter,
-so a booked conversion is still found by its key after the provider session is renewed.
+The server keeps its data in **SQLite**, through Node's built-in `node:sqlite` module:
+nothing to install or compile. That module is still marked experimental by Node (hence
+the one-line warning at start-up) and needs **Node.js 22.13 or newer**; the server
+checks before loading anything and says so.
+
+| Setting | Meaning |
+|---|---|
+| `DATABASE_PATH` | The database file. **Required** outside development. In development, unset = an in-memory database. |
+| `DATA_ENCRYPTION_KEY` | 32 random bytes in base64 (`openssl rand -base64 32`). **Required** outside development; refused if short or not random. Never stored in the database. |
+| `DATA_ENCRYPTION_KEY_PREVIOUS` | Older keys, comma-separated, still accepted for reading. |
+
+**What is in it:** client and staff accounts, companies and memberships, invitations,
+sign-in challenges, sessions, step-up permissions, lockout counters and known sources,
+approval requests, idempotency mappings, the audit log. **What is not:** rate-limit
+windows, the issued-quote map, the hash-pool accounting and the stream of anonymous
+sign-in failures; those are in the server process and a restart clears them.
+
+**How it is opened:** write-ahead logging (`journal_mode=WAL`), `synchronous=FULL`
+(every commit is flushed before it is acknowledged; set for the whole connection, so it
+covers the audit log and everything else), foreign keys on, a 5-second busy timeout.
+
+**Migrations** are numbered and forward-only (`server/src/store/sqlite/migrations.ts`).
+At start-up each one not yet applied runs in its own transaction and is recorded in
+`schema_version`. A database with a higher version than the code knows is refused: the
+server will not open a file written by a newer version of itself.
+
+**Transactions.** Every read-then-write of security state (setting a password on an
+invitation, counting an attempt, burning an authenticator step, using a recovery code,
+deciding a request) is one transaction that takes the write lock first; one-time things
+(an invitation, a step-up permission, a session being revoked, a sign-in challenge) are
+taken with a single `DELETE ... RETURNING`.
+
+**Encryption at rest.** Authenticator (TOTP) keys, including the pending one of a
+half-finished activation, are stored encrypted with AES-256-GCM under
+`DATA_ENCRYPTION_KEY`. Each ciphertext is bound to its row (copied to another row it
+does not decrypt) and names the key that made it. Passwords, recovery codes, tokens and
+activation codes are stored only as hashes, as before. Everything else (names, emails,
+the audit log) is not encrypted: the file needs disk encryption and access control like
+any database. The wrong key is refused at start-up, before anything is changed.
+
+**Rotating the key.**
+
+```bash
+# 1. In server/.env: the NEW key in DATA_ENCRYPTION_KEY, the old one in DATA_ENCRYPTION_KEY_PREVIOUS
+npm run db:rotate-key        # re-encrypts every stored authenticator key with the new key
+# 2. Restart the server. Keep the old key in DATA_ENCRYPTION_KEY_PREVIOUS while audit
+#    entries written under it must still pass audit:verify.
+```
+
+It can be run while the server is running, but the server only starts using the new key
+when it is restarted with it.
+
+**Backups.** Do not copy the file while the server is running: with write-ahead logging
+a plain copy can be inconsistent. Use
+
+```bash
+npm run db:backup -- /path/to/backup.sqlite     # refuses to overwrite an existing file
+```
+
+which takes a consistent snapshot with SQLite's `VACUUM INTO` while the server keeps
+running. The backup holds everything the database does; the encryption key is not in
+it and must be kept separately (and must be kept: without it the authenticator keys in
+the backup cannot be read and the audit chain cannot be verified). Scheduling, off-site
+copies and restore drills are not built.
+
+**Moving to PostgreSQL later.** All SQL is in `server/src/store/sqlite/`; services see
+only the interfaces in `server/src/store/types.ts` (`Directory`, `OpsDirectory`,
+`Table`, `AuditLog`), which carry no SQLite types. What is SQLite-specific and would be
+rewritten: `db.ts` (the synchronous connection, the PRAGMAs, `BEGIN IMMEDIATE` as the
+locking strategy, `VACUUM INTO` for backup); `migrations.ts` (`STRICT` tables,
+`AUTOINCREMENT`, `RAISE(ABORT)` triggers, `json_extract` expression indexes);
+`tables.ts` (small tables stored as one JSON document per key, with `json_extract` in
+lookups). In PostgreSQL the transactions would become `SELECT ... FOR UPDATE` or
+conditional `UPDATE`s, the documents `jsonb`, and the interfaces (already
+`Promise`-returning) would not change. SQLite also means **one server instance**: the
+in-memory rate limits and the issued-quote map (`http/app.ts`, capped at 20,000 quotes)
+would have to move to shared storage first.
 
 ## How closely the mocks follow the real APIs
 
@@ -867,8 +951,8 @@ the real product. No rate history is offered, so no trend line is drawn.
   is ever sent.
 - **App icon and splash**: the Expo template images.
 - **Developer panel**: shown whenever the mock backend is active. Hide it before release.
-- **Server storage**: in memory (optionally mirrored to a local JSON file for the demo),
-  with a seed directory of made-up people and companies.
+- **Sample people and companies**: a seed directory of made-up people and companies,
+  loaded into an empty database in development only.
 - **Both provider APIs**: in-memory mocks.
 - **The in-app demo sign-in**: accepts anything; code `000000`.
 
@@ -926,14 +1010,15 @@ Not built:
 - **Ops console gaps**: see "Still not production-ready (ops console)". The operator
   commands (`invite`, `create-ops-admin`, `break-glass`) are still guarded by one shared
   token, on a loopback-only listener.
-- **Audit log storage**: in memory, in bounded segments that are rotated to an archive
-  when full (files beside the demo data file; otherwise kept in memory, the oldest
-  eventually discarded with a warning). See "Audit log". Reads (who looked at which
-  balance) are not audited.
-- **Secrets management**: credentials are plain environment variables; TOTP keys are
-  held unencrypted in memory.
-- **Database**: see "A real database". Everything is lost on restart unless the demo
-  file store is on.
+- **Audit log storage**: an append-only, hash-chained table in the server's own
+  database, archived rather than dropped (see "Audit log"). It is not shipped anywhere
+  else, so whoever holds both the file and the key can rewrite it. Reads (who looked at
+  which balance) are not audited.
+- **Secrets management**: credentials and the data encryption key are plain environment
+  variables (in development the key is a file beside the database); there is no KMS or
+  HSM. TOTP keys are encrypted in the database and decrypted in memory when checked.
+- **Database**: SQLite, one file, one server instance; see "Database". No replication,
+  no scheduled backups, and `node:sqlite` is marked experimental by Node.
 - **Hosting**: no TLS termination, deployment, monitoring, backups or multi-instance
   support. Rate limits and lockouts are per process. Behind a proxy set `TRUST_PROXY` to
   the proxy's address or range (or a hop count), or every client shares one address for

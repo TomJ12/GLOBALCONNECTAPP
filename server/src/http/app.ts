@@ -210,7 +210,7 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
     }
     if (action === 'disable-staff') {
       await stores.ops.users.update(user.id, (current) => ({ ...current, disabledAt: current.disabledAt ?? now() }));
-      await stores.ops.activations.deleteWhere((item) => item.userId === user.id);
+      await stores.ops.activations.deleteWhere({ userId: user.id });
       const sessions = await opsAuth.revokeAllSessions(user.id);
       await record('success', { sessionsEnded: String(sessions) });
       return { done: 'disabled', staff: maskEmail(user.email) };

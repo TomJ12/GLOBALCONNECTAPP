@@ -3,12 +3,15 @@
  *
  * STRICT BY DEFAULT. Development conveniences (mock provider credentials,
  * activation codes printed to the console, the console outbox instead of a
- * mailer, the JSON file store, plain-http ops console) exist only when
+ * mailer, an in-memory database, a generated encryption key, plain-http ops
+ * console) exist only when
  * APP_ENV=development is set explicitly. `npm run demo` sets it. Leaving
  * NODE_ENV unset does NOT make the server lenient.
  */
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
+
+import { dataKeyProblem } from './store/sqlite/keys';
 
 export interface ProviderCredentials {
   currencycloud: { loginId: string; apiKey: string } | null;
@@ -26,8 +29,12 @@ export interface Config {
   appUrl: string;
   /** Public address of this server, where the ops console lives under /ops. */
   opsUrl: string;
-  /** LOCAL DEMO ONLY: keep accounts in this JSON file. Development mode only. */
-  dataFile: string | null;
+  /** The SQLite database file. Required outside development; in development, without one, the database is in memory and lost at exit. */
+  databasePath: string | null;
+  /** Base64 of 32 random bytes: encrypts authenticator keys at rest and chains the audit log. Required outside development. Never stored in the database. */
+  dataEncryptionKey: string | null;
+  /** Older keys, still able to decrypt and to verify, while a rotation is in progress. */
+  previousDataEncryptionKeys: string[];
   /** false, a number of proxy hops to trust, or the proxies' addresses / CIDR ranges. Never "trust everything". */
   trustProxy: false | number | string[];
   adminToken: string | null;
@@ -146,8 +153,12 @@ export function loadConfig(env: Env = process.env): Config {
   } else if (!providers.currencycloud || !providers.equals) {
     throw new Error('Provider credentials are missing. Set CURRENCYCLOUD_LOGIN_ID, CURRENCYCLOUD_API_KEY and EQUALS_API_KEY. (For a local demonstration with mock providers set APP_ENV=development.)');
   }
-  if (strict && env.DATA_FILE) {
-    throw new Error('DATA_FILE keeps password hashes and authenticator keys in a plain file. It is for local demonstrations only and is refused unless APP_ENV=development.');
+  if (env.DATA_FILE) throw new Error('DATA_FILE (the JSON demo file) is no longer used. Data is kept in a SQLite database: set DATABASE_PATH instead.');
+  if (strict && !env.DATABASE_PATH) throw new Error('DATABASE_PATH must be set to the SQLite database file. (Only in development may the database be in memory.)');
+  if (strict && !env.DATA_ENCRYPTION_KEY) throw new Error('DATA_ENCRYPTION_KEY must be set (openssl rand -base64 32): authenticator keys are encrypted at rest with it. Keep it outside the database and its backups.');
+  for (const [name, value] of [['DATA_ENCRYPTION_KEY', env.DATA_ENCRYPTION_KEY], ...(env.DATA_ENCRYPTION_KEY_PREVIOUS ?? '').split(',').filter(Boolean).map((item) => ['DATA_ENCRYPTION_KEY_PREVIOUS', item.trim()])] as [string, string | undefined][]) {
+    const problem = value ? dataKeyProblem(value) : null;
+    if (problem) throw new Error(`${name} is refused because ${problem}.`);
   }
   const fourEyes = env.FOUR_EYES !== 'off';
   if (strict && !fourEyes) throw new Error('FOUR_EYES=off is refused unless APP_ENV=development: sensitive ops actions must need a second staff member.');
@@ -186,7 +197,9 @@ export function loadConfig(env: Env = process.env): Config {
       .filter(Boolean),
     appUrl,
     opsUrl,
-    dataFile: env.DATA_FILE || null,
+    databasePath: env.DATABASE_PATH || null,
+    dataEncryptionKey: env.DATA_ENCRYPTION_KEY?.trim() || null,
+    previousDataEncryptionKeys: (env.DATA_ENCRYPTION_KEY_PREVIOUS ?? '').split(',').map((item) => item.trim()).filter(Boolean),
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
     adminToken: env.ADMIN_TOKEN || null,
     adminPort: Number(env.ADMIN_PORT ?? 3002) || 3002,

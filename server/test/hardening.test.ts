@@ -12,15 +12,16 @@ import { hashPassword, PASSWORD_COST, setPasswordCost, sha256, verifyPassword } 
 import { requestLogEntry } from '../src/http/app';
 import { wireAmount } from '../src/providers/equals/adapter';
 import { createRuntime } from '../src/startup';
-import { attemptsTable, MemoryAuditLog } from '../src/store/memory';
 import type { AuditEntry } from '../src/store/types';
-import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, TEST_PASSWORD_COST, type Harness } from './helpers';
+import { createSqliteStores } from '../src/store/sqlite';
+import { dataKeys } from '../src/store/sqlite/keys';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, TEST_DATA_KEY, TEST_PASSWORD_COST, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example' };
+const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/var/lib/globalconnect/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
 const from = (address: string) => ({ 'x-forwarded-for': address });
 const login = (email: string, password: string, address?: string) => h.call('POST', '/v1/auth/login', { body: { email, password }, headers: address ? from(address) : {} });
 async function signedIn(email: string) {
@@ -36,9 +37,13 @@ test('H3: strict by default. Only APP_ENV=development is lenient; NODE_ENV decid
   assert.throws(() => loadConfig({}), /Provider credentials are missing/);
   for (const NODE_ENV of [undefined, 'development', 'test', 'staging', 'production']) {
     const config = loadConfig({ ...LIVE, NODE_ENV });
-    assert.deepEqual([config.development, config.strict, config.fourEyes, config.dataFile], [false, true, true, null], String(NODE_ENV));
+    assert.deepEqual([config.development, config.strict, config.fourEyes, config.databasePath], [false, true, true, LIVE.DATABASE_PATH], String(NODE_ENV));
     // Everything that is a development convenience is refused.
-    assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_FILE: '/tmp/accounts.json' }), /refused unless APP_ENV=development/);
+    assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_FILE: '/tmp/accounts.json' }), /DATA_FILE \(the JSON demo file\) is no longer used/);
+    // The database file and the key that encrypts authenticator keys are required, and the key must be a real one.
+    assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATABASE_PATH: undefined }), /DATABASE_PATH must be set/);
+    assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_ENCRYPTION_KEY: undefined }), /DATA_ENCRYPTION_KEY must be set/);
+    for (const key of ['short', 'A'.repeat(43) + '=', Buffer.alloc(16, 7).toString('base64'), 'replace-with-openssl-rand-base64-32']) assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_ENCRYPTION_KEY: key }), /DATA_ENCRYPTION_KEY is refused/, key);
     assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, FOUR_EYES: 'off' }), /FOUR_EYES=off is refused/);
     assert.throws(() => loadConfig({ NODE_ENV, OPS_URL: LIVE.OPS_URL }), /Provider credentials are missing/);
   }
@@ -47,8 +52,8 @@ test('H3: strict by default. Only APP_ENV=development is lenient; NODE_ENV decid
   assert.throws(() => loadConfig({ APP_ENV: 'development', NODE_ENV: 'production' }), /cannot be combined/);
   assert.throws(() => loadConfig({ ...LIVE, APP_ENV: 'dev' }), /APP_ENV must be/);
 
-  const development = loadConfig({ APP_ENV: 'development', DATA_FILE: '/tmp/accounts.json', FOUR_EYES: 'off' });
-  assert.deepEqual([development.development, development.fourEyes, development.dataFile, development.opsUrl], [true, false, '/tmp/accounts.json', 'http://localhost:3001']);
+  const development = loadConfig({ APP_ENV: 'development', DATABASE_PATH: '/tmp/demo.sqlite', FOUR_EYES: 'off' });
+  assert.deepEqual([development.development, development.fourEyes, development.databasePath, development.opsUrl], [true, false, '/tmp/demo.sqlite', 'http://localhost:3001']);
   assert.ok(development.providers.currencycloud && development.providers.equals);
 });
 
@@ -282,7 +287,7 @@ test('M4: activation codes travel after "#", and no query string or code reaches
 // --- M5 ---------------------------------------------------------------------------------------
 
 test('M5: anonymous failures cannot push anything out of the audit log, are rate limited per source and truncated', async () => {
-  h = await harness({ trustProxy: 1 }, undefined, { audit: { limit: 1000, anonymousLimit: 25, anonymousPerMinute: 20 } });
+  h = await harness({ trustProxy: 1 }, undefined, { audit: { anonymousLimit: 25, anonymousPerMinute: 20 } });
   await h.activate(AMIRA);
   const first = (await h.stores.audit.query({ limit: 10_000 })).map((entry) => entry.id);
   assert.ok(first.length >= 1);
@@ -298,42 +303,33 @@ test('M5: anonymous failures cannot push anything out of the audit log, are rate
   assert.ok(anonymous.every((entry) => entry.actor.label.length <= 80 && entry.actor.id === null && entry.outcome === 'failure'));
   assert.equal(entries.length, first.length + 25);
   // One source alone is held to its rate: 300 more from a single address add at most 20 in that minute.
-  const log = h.stores.audit as MemoryAuditLog;
+  const log = h.stores.audit;
   const before = log.suppressed;
   for (let index = 0; index < 100; index += 1) await login(`again${index}@nowhere.example`, PASSWORD, '198.51.100.200');
   assert.equal(log.suppressed - before, 80);
 });
 
-test('N1: a full audit segment is rotated to the archive with a loud warning; nothing is refused and the newest entries are never the ones lost', async () => {
-  const archived: AuditEntry[][] = [];
-  const warnings: string[] = [];
+test('N1: a full live audit table is archived, never dropped: nothing is refused, nothing is lost, and the chain still verifies', async () => {
+  const notices: string[] = [];
   const entry = (n: number) => ({ at: n, actor: { type: 'system' as const, id: null, label: 's' }, target: null, action: `e${n}`, outcome: 'success' as const, source: '', detail: {} });
-  const log = new MemoryAuditLog([], () => {}, { limit: 3, warn: (message) => void warnings.push(message), archive: { write: async (segment) => (archived.push(segment), 'archive-1') } });
-  for (const n of [1, 2, 3, 4, 5]) await log.append(entry(n));
-  // The first three went to the archive, whole and in order; the newest are in the working segment.
-  assert.deepEqual(archived.map((segment) => segment.map((item) => item.action)), [['e1', 'e2', 'e3']]);
-  assert.deepEqual((await log.query()).map((item) => item.action), ['e5', 'e4']);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0] ?? '', /AUDIT LOG ROTATED.*3 entries.*archive-1/);
-
-  // An archive that fails loses nothing: the segment stays in memory, searchable, and the operator is told.
-  const broken = new MemoryAuditLog([], () => {}, { limit: 2, warn: (message) => void warnings.push(message), archive: { write: async () => Promise.reject(new Error('disk full')) } });
-  for (const n of [1, 2, 3]) await broken.append(entry(n));
-  assert.deepEqual((await broken.query()).map((item) => item.action), ['e3', 'e2', 'e1']);
-  assert.match(warnings.at(-1) ?? '', /AUDIT LOG ARCHIVE FAILED \(disk full\)/);
-
-  // With no archive at all (plain in-memory development) rotated segments are kept, a few; only then is the OLDEST discarded, loudly.
-  const bare = new MemoryAuditLog([], () => {}, { limit: 2, keptSegments: 1, warn: (message) => void warnings.push(message) });
-  for (const n of [1, 2, 3, 4, 5]) await bare.append(entry(n));
-  assert.deepEqual((await bare.query()).map((item) => item.action), ['e5', 'e4', 'e3']);
-  assert.equal(bare.discarded, 1);
-  assert.match(warnings.at(-1) ?? '', /OLDEST ENTRIES HAVE BEEN DISCARDED/);
+  const stores = createSqliteStores({ path: ':memory:', keys: dataKeys(TEST_DATA_KEY), audit: { liveLimit: 4, notice: (message) => void notices.push(message) } });
+  for (const n of [1, 2, 3, 4, 5]) await stores.audit.append(entry(n));
+  // The older entries moved to the archive table, whole and in order; the newest are in the live table.
+  assert.deepEqual(stores.db.all<{ action: string }>('SELECT action FROM audit_archive ORDER BY seq').map((row) => row.action), ['e1', 'e2', 'e3']);
+  assert.deepEqual((await stores.audit.query()).map((item) => item.action), ['e5', 'e4']);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0] ?? '', /3 older entries were moved to the archive table.*Nothing was removed/);
+  for (const n of [6, 7, 8, 9]) await stores.audit.append(entry(n));
+  // Every entry ever written is in one table or the other, exactly once, and the chain runs through both.
+  assert.deepEqual(stores.db.all<{ action: string }>('SELECT action FROM audit_archive UNION ALL SELECT action FROM audit_log').map((row) => row.action).sort(), [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `e${n}`));
+  assert.deepEqual(stores.verifyAudit(), { ok: true, entries: 9, archived: stores.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM audit_archive')?.n, problem: null });
+  stores.close();
 
   // Through the server, at capacity: sign-in, sign-out, a payment, staff sign-in and containment all still work.
-  h = await harness({}, undefined, { audit: { limit: 5 } });
+  h = await harness({}, undefined, { audit: { liveLimit: 5 } });
   const amira = await signedIn(AMIRA);
   for (let index = 0; index < 12; index += 1) assert.equal((await h.call('POST', '/v1/session/company', { token: amira.token, body: { companyId: 'co_castlebrook' } })).status, 404);
-  assert.ok(h.warnings.length >= 2 && h.warnings.every((message) => /AUDIT LOG/.test(message)));
+  assert.ok(h.warnings.length >= 2 && h.warnings.every((message) => /Audit log: \d+ older entries were moved/.test(message)));
   assert.equal((await h.call('POST', '/v1/session/company', { token: amira.token, body: { companyId: 'co_northfield' } })).status, 200);
   assert.equal((await h.call('POST', '/v1/auth/logout', { token: amira.token })).status, 200);
   assert.equal((await h.login(AMIRA, amira.secret)).status, 200);
@@ -425,25 +421,21 @@ test('M5: company selection and every money action are in the audit log, with am
 
 // --- M6 ---------------------------------------------------------------------------------------
 
-test('M6: a full attempts table drops expired counters, then idle ones, and never a live lock', async () => {
+test('M6: the sweep removes counters that are neither locked nor recent, and never a live lock', async () => {
   let now = 1_000_000;
-  const table = attemptsTable(() => now, { limit: 3 });
+  const stores = createSqliteStores({ path: ':memory:', keys: dataKeys(TEST_DATA_KEY), now: () => now });
+  const table = stores.auth.attempts;
   const record = (lockedUntil: number, updatedAt = now) => ({ failures: 5, lockedUntil, locks: 0, subject: 's', updatedAt });
-  await table.put('locked-1', record(now + 60_000));
-  await table.put('locked-2', record(now + 60_000));
+  await table.put('locked', record(now + 4 * 60 * 60_000));
   await table.put('counting', record(0));
-  // Full. A newcomer evicts the counter that is not a lock, never a lock.
-  await table.put('new-1', record(0));
-  assert.deepEqual([await table.get('locked-1'), await table.get('locked-2'), await table.get('counting')].map((row) => row !== null), [true, true, false]);
-  await table.put('locked-3', record(now + 60_000));
-  assert.equal(await table.get('new-1'), null);
-  // Full of live locks: a further row is refused rather than a lock forgotten.
-  await assert.rejects(table.put('new-2', record(0)), /full/);
-  assert.equal(await table.count((row) => row.lockedUntil > now), 3);
-  // Once locks have run out and gone idle they make room.
+  await table.put('ran-out', record(now + 60_000));
+  await stores.sweep(1, 1);
+  assert.equal(await table.count({}), 3, 'recent counters stay');
   now += 3 * 60 * 60_000;
-  await table.put('new-3', record(0));
-  assert.equal(await table.count(() => true), 1);
+  await stores.sweep(1, 1);
+  // The idle counter and the lock that ran out long ago are gone; the lock still running is not.
+  assert.deepEqual([await table.get('locked'), await table.get('counting'), await table.get('ran-out')].map((row) => row !== null), [true, false, false]);
+  stores.close();
 
   // Through the server: thousands of other attempts do not unlock a locked account.
   h = await harness();

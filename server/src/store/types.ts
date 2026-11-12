@@ -1,9 +1,9 @@
 /**
  * Storage contracts. The server only ever talks to these interfaces.
  *
- * PLACEHOLDER: the only implementation is in memory (memory.ts) with seed data
- * (seed.ts). Everything is lost on restart. A real deployment implements the
- * same interfaces over a database; see the README.
+ * The implementation is SQLite (store/sqlite/). Services import only these
+ * interfaces: no SQL and no SQLite type appears outside that folder, so moving
+ * to another database means writing that folder again.
  */
 import type { StepUpAction, UserRole } from '@/api/types';
 
@@ -15,7 +15,7 @@ export interface UserRecord {
   name: string;
   /** Null until the account is activated. */
   passwordHash: string | null;
-  /** Base32. PLACEHOLDER: a database must encrypt this at rest. */
+  /** Base32. The store encrypts it at rest (store/sqlite/keys.ts); services see it in plain form. */
   totpSecret: string | null;
   /** The newest TOTP time step already accepted, for replay protection. */
   lastTotpStep: number;
@@ -56,10 +56,10 @@ export interface Directory {
   getUser(id: string): Promise<UserRecord | null>;
   saveUser(user: UserRecord): Promise<void>;
   /**
-   * Atomic read-modify-write of one user. `change` returns the new record, or
-   * null to leave the user as it is (the condition did not hold). Returns the
-   * saved record, or null when nothing was written. A database implements
-   * this as a transaction or a compare-and-set loop.
+   * Atomic read-modify-write of one user, in one database transaction.
+   * `change` returns the new record, or null to leave the user as it is (the
+   * condition did not hold). Returns the saved record, or null when nothing
+   * was written.
    */
   updateUser(id: string, change: (user: UserRecord) => UserRecord | null): Promise<UserRecord | null>;
   listUsers(): Promise<UserRecord[]>;
@@ -122,23 +122,31 @@ export interface ProviderKeyRecord {
   createdAt: number;
 }
 
+/**
+ * Which rows: an object of fields that must be equal (the store can use an
+ * index for these), or, for tests and one-off administration only, a function
+ * (the store then reads every row).
+ */
+export type Where<T> = Partial<T> | ((row: T) => boolean);
+
 /** A small keyed table. Keys are always hashes or internal ids, never raw tokens. */
 export interface Table<T> {
   get(key: string): Promise<T | null>;
   put(key: string, value: T): Promise<void>;
   delete(key: string): Promise<void>;
-  /** Remove every row the predicate matches. */
-  deleteWhere(predicate: (value: T) => boolean): Promise<void>;
-  count(predicate: (value: T) => boolean): Promise<number>;
-  list(predicate?: (value: T) => boolean): Promise<T[]>;
+  /** Remove every row that matches (and, when given, passes `filter`). */
+  deleteWhere(where: Where<T>, filter?: (row: T) => boolean): Promise<void>;
+  count(where: Where<T>, filter?: (row: T) => boolean): Promise<number>;
+  list(where?: Where<T>, filter?: (row: T) => boolean): Promise<T[]>;
   /**
-   * Atomic read-modify-write. `change` gets the current row (or null) and
-   * returns the row to store, null to delete it, or undefined to leave it
+   * Atomic read-modify-write, in ONE database transaction that holds the
+   * write lock from before the read. `change` gets the current row (or null)
+   * and returns the row to store, null to delete it, or undefined to leave it
    * untouched. Returns what is stored afterwards. Every read-modify-write of
    * security state goes through this (or `take`), never get-then-put.
    */
   mutate(key: string, change: (current: T | null) => T | null | undefined): Promise<T | null>;
-  /** Atomic read-and-delete: of two simultaneous callers only one gets the row. */
+  /** Atomic read-and-delete: of two simultaneous callers, in this process or another, only one gets the row. */
   take(key: string): Promise<T | null>;
 }
 
@@ -160,7 +168,7 @@ export interface OpsUserRecord {
   name: string;
   role: OpsRole;
   passwordHash: string | null;
-  /** Base32. PLACEHOLDER: a database must encrypt this at rest. */
+  /** Base32. The store encrypts it at rest (store/sqlite/keys.ts); services see it in plain form. */
   totpSecret: string | null;
   lastTotpStep: number;
   recoveryCodeHashes: string[];

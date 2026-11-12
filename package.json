@@ -66,7 +66,10 @@
     "create-ops-admin": "npm --prefix server run create-ops-admin --",
     "postinstall": "npm --prefix server install --no-audit --no-fund",
     "invite": "npm --prefix server run invite --",
-    "break-glass": "npm --prefix server run break-glass --"
+    "break-glass": "npm --prefix server run break-glass --",
+    "audit:verify": "npm --prefix server run audit:verify",
+    "db:backup": "npm --prefix server run db:backup --",
+    "db:rotate-key": "npm --prefix server run db:rotate-key"
   },
   "private": true,
   "jest": {

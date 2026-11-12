@@ -103,7 +103,7 @@ export class AuthService {
     const user = await this.stores.directory.findUserByEmail(email);
     if (!user) throw new ApiError('not_found');
     if (user.activatedAt !== null || user.disabledAt) throw new ApiError('validation');
-    await this.stores.auth.activations.deleteWhere((record) => record.userId === user.id);
+    await this.stores.auth.activations.deleteWhere({ userId: user.id });
     const activationCode = randomCode(4);
     const expiresAt = this.now() + this.config.activationTtlMs;
     await this.stores.auth.activations.put(sha256(normaliseCode(activationCode)), {
@@ -358,14 +358,14 @@ export class AuthService {
     const session = await this.stores.auth.sessions.mutate(context.tokenHash, (current) => (current ? { ...current, companyId } : undefined));
     if (!session) throw new ApiError('unauthorized');
     // A permission granted for one company must not carry over to another.
-    await this.stores.auth.stepUps.deleteWhere((record) => record.sessionId === session.id);
+    await this.stores.auth.stepUps.deleteWhere({ sessionId: session.id });
     await this.record('client.company_select', 'success', partyOf(context.user), source, {}, { type: 'company', id: membership.company.id, label: membership.company.name });
     return { ...context, session, company: membership.company, role: membership.role };
   }
 
   private async revoke(tokenHash: string, sessionId: string): Promise<void> {
     await this.stores.auth.sessions.delete(tokenHash);
-    await this.stores.auth.stepUps.deleteWhere((record) => record.sessionId === sessionId);
+    await this.stores.auth.stepUps.deleteWhere({ sessionId });
   }
 
   async logout(token: string | undefined, source = ''): Promise<void> {
@@ -373,7 +373,7 @@ export class AuthService {
     const tokenHash = sha256(token);
     const session = await this.stores.auth.sessions.take(tokenHash);
     if (!session) return;
-    await this.stores.auth.stepUps.deleteWhere((record) => record.sessionId === session.id);
+    await this.stores.auth.stepUps.deleteWhere({ sessionId: session.id });
     const user = await this.stores.directory.getUser(session.userId);
     if (user) await this.record('client.sign_out', 'success', partyOf(user), source);
   }
@@ -382,17 +382,15 @@ export class AuthService {
 
   activeSessionCount(userId: string): Promise<number> {
     const now = this.now();
-    return this.stores.auth.sessions.count(
-      (session) => session.userId === userId && now - session.lastSeenAt <= this.config.sessionIdleMs && now - session.createdAt <= this.config.sessionAbsoluteMs,
-    );
+    return this.stores.auth.sessions.count({ userId }, (session) => now - session.lastSeenAt <= this.config.sessionIdleMs && now - session.createdAt <= this.config.sessionAbsoluteMs);
   }
 
   /** Ends every session of this person. Returns how many there were. */
   async revokeAllSessions(userId: string): Promise<number> {
-    const total = await this.stores.auth.sessions.count((session) => session.userId === userId);
-    await this.stores.auth.sessions.deleteWhere((session) => session.userId === userId);
-    await this.stores.auth.stepUps.deleteWhere((record) => record.userId === userId);
-    await this.stores.auth.challenges.deleteWhere((record) => record.userId === userId);
+    const total = await this.stores.auth.sessions.count({ userId });
+    await this.stores.auth.sessions.deleteWhere({ userId });
+    await this.stores.auth.stepUps.deleteWhere({ userId });
+    await this.stores.auth.challenges.deleteWhere({ userId });
     return total;
   }
 
@@ -416,7 +414,7 @@ export class AuthService {
   async clearCredentials(userId: string): Promise<number> {
     const user = await this.stores.directory.updateUser(userId, (current) => ({ ...current, passwordHash: null, totpSecret: null, recoveryCodeHashes: [], activatedAt: null }));
     if (!user) throw new ApiError('not_found');
-    await this.stores.auth.activations.deleteWhere((record) => record.userId === userId);
+    await this.stores.auth.activations.deleteWhere({ userId });
     await this.unlock(user);
     return this.revokeAllSessions(userId);
   }

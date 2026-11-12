@@ -595,7 +595,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       /** Marks requests past their 24 hours as expired, and records each one. */
       const expireApprovals = async (): Promise<void> => {
         const at = now();
-        for (const stale of await stores.ops.approvals.list((item) => item.status === 'pending' && item.expiresAt <= at)) {
+        for (const stale of await stores.ops.approvals.list({ status: 'pending' }, (item) => item.expiresAt <= at)) {
           let mine = false;
           await stores.ops.approvals.mutate(stale.id, (current) => {
             mine = current !== null && current.status === 'pending';
@@ -623,7 +623,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       /** How often this approver has been the one to approve this requester lately. Shown to the approver, and kept with the approval. */
       const pairHistory = async (requesterId: string, approverId: string): Promise<{ byRequester: number; byPair: number; flag: boolean }> => {
         const since = now() - 30 * 24 * 60 * 60_000;
-        const approved = await stores.ops.approvals.list((item) => item.status === 'approved' && item.requestedBy.id === requesterId && (item.decidedAt ?? 0) >= since);
+        const approved = await stores.ops.approvals.list({ status: 'approved' }, (item) => item.requestedBy.id === requesterId && (item.decidedAt ?? 0) >= since);
         const byPair = approved.filter((item) => item.decidedBy?.id === approverId).length;
         return { byRequester: approved.length, byPair, flag: byPair >= 5 && byPair * 5 >= approved.length * 4 };
       };
@@ -1112,7 +1112,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
       simple('revoke-sessions', 'client.revoke_sessions', 'revoked', async (user, { requester, source }) => ({ sessions: String(await revokeClientSessions(requester, user, source, 'revoked by ops')) }));
       simple('disable', 'client.disable', 'disabled', async (user, { requester, source }) => {
         await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: now() }));
-        await stores.auth.activations.deleteWhere((record) => record.userId === user.id);
+        await stores.auth.activations.deleteWhere({ userId: user.id });
         await revokeClientSessions(requester, user, source, 'user disabled');
       });
       // Re-enabling restores the person's old password and authenticator: a second person has to agree.
@@ -1262,7 +1262,7 @@ ${
         },
         async (user, _params, { requester, source }) => {
           await stores.ops.users.update(user.id, (current) => ({ ...current, disabledAt: now() }));
-          await stores.ops.activations.deleteWhere((record) => record.userId === user.id);
+          await stores.ops.activations.deleteWhere({ userId: user.id });
           const total = await opsAuth.revokeAllSessions(user.id);
           await append(opsParty(requester), 'ops.session_revoked', 'success', opsParty(user), source, { sessions: String(total), why: 'staff disabled' });
         },

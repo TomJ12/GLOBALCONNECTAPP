@@ -12,7 +12,10 @@
     "create-ops-admin": "tsx --env-file-if-exists=.env src/cli/create-ops-admin.ts",
     "break-glass": "tsx --env-file-if-exists=.env src/cli/break-glass.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "audit:verify": "tsx --env-file-if-exists=.env src/cli/db.ts audit-verify",
+    "db:backup": "tsx --env-file-if-exists=.env src/cli/db.ts backup",
+    "db:rotate-key": "tsx --env-file-if-exists=.env src/cli/db.ts rotate-key"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",
@@ -29,6 +32,6 @@
     "typescript": "~5.9.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   }
 }

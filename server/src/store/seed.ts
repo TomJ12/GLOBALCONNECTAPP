@@ -5,7 +5,7 @@
  */
 import type { UserRole } from '@/api/types';
 
-import type { DirectoryData } from './memory';
+import type { DirectoryData } from './sqlite';
 import type { UserRecord } from './types';
 
 function invited(id: string, email: string, name: string): UserRecord {
