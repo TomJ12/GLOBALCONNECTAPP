@@ -29,6 +29,8 @@ export interface Config {
   appUrl: string;
   /** Public address of this server, where the ops console lives under /ops. */
   opsUrl: string;
+  /** How long a payment waits for approval before it expires, in milliseconds (PAYMENT_APPROVAL_HOURS, default 48). */
+  paymentApprovalMs: number;
   /** The SQLite database file. Required outside development; in development, without one, the database is in memory and lost at exit. */
   databasePath: string | null;
   /** Base64 of 32 random bytes: encrypts authenticator keys at rest and chains the audit log. Required outside development. Never stored in the database. */
@@ -186,7 +188,11 @@ export function loadConfig(env: Env = process.env): Config {
   const opsUrl = (env.OPS_URL ?? (development ? (env.WEB_DIR ? appUrl : `http://localhost:${port}`) : '')).replace(/\/+$/, '');
   if (strict && !opsUrl.startsWith('https://')) throw new Error('OPS_URL must be set to the https:// address of this server (the ops console is served only over https outside development).');
 
+  const approvalHours = Number(env.PAYMENT_APPROVAL_HOURS ?? 48);
+  if (!(approvalHours > 0 && approvalHours <= 24 * 30)) throw new Error('PAYMENT_APPROVAL_HOURS must be a number of hours between 0 and 720 (default 48).');
+
   return {
+    paymentApprovalMs: Math.round(approvalHours * 60 * 60_000),
     port,
     host: env.HOST ?? '0.0.0.0',
     development,

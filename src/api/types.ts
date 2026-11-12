@@ -39,7 +39,7 @@ export interface Capabilities {
 }
 
 /** Actions that can need a fresh authenticator code. */
-export type StepUpAction = 'payment.create' | 'payment.approve' | 'payment.reject' | 'beneficiary.create' | 'conversion.book';
+export type StepUpAction = 'payment.create' | 'payment.approve' | 'payment.reject' | 'payment.cancel' | 'beneficiary.create' | 'conversion.book';
 
 /** A signed-in person acting for one company. */
 export interface Session {
@@ -292,6 +292,31 @@ export interface Payment {
   /** Null when the provider has not told us. Never guess one. */
   estimatedArrival: IsoDate | null;
   createdAt: IsoDateTime;
+  /**
+   * Present only on a payment that Global Connect is holding (or held) until
+   * the company's approvers have approved it. Such a payment has NOT been
+   * sent to the bank and no money is set aside for it.
+   */
+  held?: PaymentHold;
+}
+
+export type PaymentHoldState = 'awaiting_approval' | 'sending' | 'rejected' | 'cancelled' | 'expired' | 'payee_changed' | 'failed';
+
+export interface PaymentHold {
+  state: PaymentHoldState;
+  /** Display name of the person who created it. */
+  createdBy: string;
+  createdByYou: boolean;
+  approvalsRequired: number;
+  approvals: { by: string; at: IsoDateTime }[];
+  /** After this moment it can no longer be approved. */
+  expiresAt: IsoDateTime;
+  /** Whether the person asking may approve or reject it now. Never true for its creator. */
+  canApprove: boolean;
+  /** Whether the person asking may cancel it now. */
+  canCancel: boolean;
+  /** Display names of the people who could still approve it. Empty means nobody can: the company needs another approver. */
+  approvers: string[];
 }
 
 export interface NewPayment {
@@ -321,6 +346,12 @@ export interface ApprovalStep {
 
 export interface PendingApproval {
   payment: Payment;
+  /**
+   * True for a payment that is waiting for approval somewhere other than
+   * Global Connect (it was already pending there before approvals were held
+   * here). Approving it does not go through Global Connect's own rules.
+   */
+  external?: boolean;
   /** The payee's saved details. Null if they could not be found: such a payment must not be approved. */
   beneficiary: Beneficiary | null;
   /** Approvals still needed before the payment is released, including yours. */

@@ -16,22 +16,25 @@ import { SkeletonCard, SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { outcomeCheckTiming } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
-import { useApprovePayment, useBalances, usePendingApprovals, useRejectPayment } from '@/hooks/queries';
+import { useApprovePayment, useBalances, useCancelPayment, usePendingApprovals, useRejectPayment } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
 import { confirmAction } from '@/lib/confirmAction';
-import { formatDate, formatRelativeDay } from '@/lib/dates';
+import { formatDate, formatDateTime, formatRelativeDay } from '@/lib/dates';
 import { compareAmounts, formatMoney } from '@/lib/money';
 import { useIsOnline } from '@/lib/online';
 import { formatSortCode } from '@/lib/validation';
 import { colors, spacing } from '@/theme';
 
-import { describeBeneficiaryAccount, maskAccountIdentifier } from './shared';
+import { describeBeneficiaryAccount, listNames, maskAccountIdentifier } from './shared';
 
 export type ReviewOutcome =
   | { kind: 'approved'; amount: string; payee: string; result: ApprovalResult }
   | { kind: 'rejected'; amount: string; payee: string }
+  | { kind: 'cancelled'; amount: string; payee: string }
   /** We could not read the answer, and the payment has since left the pending list. We do not know why. */
-  | { kind: 'no_longer_pending'; attempted: 'approve' | 'reject'; amount: string; payee: string };
+  | { kind: 'no_longer_pending'; attempted: Decision; amount: string; payee: string };
+
+type Decision = 'approve' | 'reject' | 'cancel';
 
 /** Everything an approver is agreeing to. If any of it changes, the approval must be looked at again. */
 export function approvalSignature(approval: PendingApproval): string {
@@ -50,13 +53,15 @@ export function approvalSignature(approval: PendingApproval): string {
 }
 
 /** Truthful wording when the payment is simply gone from the pending list after an unread answer. */
-export function noLongerPendingCopy(attempted: 'approve' | 'reject'): { title: string; body: string } {
+export function noLongerPendingCopy(attempted: Decision): { title: string; body: string } {
   return {
     title: 'No longer waiting for approval',
     body:
       attempted === 'approve'
         ? 'We did not get a clear answer to your approval. This payment is no longer waiting, which may be because of your approval or because someone else approved or rejected it. Check Payments for its status.'
-        : 'We did not get a clear answer to your rejection. This payment is no longer waiting, which may be because of your rejection or because someone else approved or rejected it. Do not assume it was cancelled: check Payments for its status.',
+        : attempted === 'cancel'
+          ? 'We did not get a clear answer when you cancelled. This payment is no longer waiting, which may be because it was cancelled or because someone else approved or rejected it. Do not assume it was cancelled: check Payments for its status.'
+          : 'We did not get a clear answer to your rejection. This payment is no longer waiting, which may be because of your rejection or because someone else approved or rejected it. Do not assume it was cancelled: check Payments for its status.',
   };
 }
 
@@ -108,10 +113,15 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   const approvals = usePendingApprovals();
   const approve = useApprovePayment();
   const reject = useRejectPayment();
+  const cancel = useCancelPayment();
+  /** Set when Global Connect is holding this payment: who made it, who may act on it, until when. */
+  const hold = payment.held;
+  /** Its creator, and anyone who has already approved it, is not asked to approve it. */
+  const mayDecide = hold ? hold.canApprove : true;
   const online = useIsOnline();
   const [error, setError] = useState<string | null>(null);
   /** Set after an action whose outcome we could not establish. Nothing more is allowed until it is resolved. */
-  const [unresolved, setUnresolved] = useState<{ kind: 'approve' | 'reject'; startedAt: number } | null>(null);
+  const [unresolved, setUnresolved] = useState<{ kind: Decision; startedAt: number } | null>(null);
   const windowSeconds = Math.round(outcomeCheckTiming.windowMs / 1000);
   const { refetch } = approvals;
 
@@ -130,7 +140,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
    * a payment that is no longer waiting cannot be approved or rejected again.
    */
   const checkOutcome = useCallback(
-    async (pending: { kind: 'approve' | 'reject'; startedAt: number }) => {
+    async (pending: { kind: Decision; startedAt: number }) => {
       const fresh = await refetch();
       if (fresh.isError || !fresh.data) return; // Could not ask. Stay blocked and ask again.
       const current = fresh.data.find((item) => item.payment.id === payment.id);
@@ -161,7 +171,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   }, [unresolved, checkOutcome]);
 
   // One lock for both buttons: approving and rejecting can never overlap.
-  const action = useSingleFlight(async (kind: 'approve' | 'reject') => {
+  const action = useSingleFlight(async (kind: Decision) => {
     if (unresolved) return;
     setError(null);
 
@@ -190,7 +200,16 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
             confirmLabel: 'Approve payment',
             stepUp: { action: 'payment.approve', payload: { paymentId: payment.id } },
           })
-        : await confirmAction({
+        : kind === 'cancel'
+          ? await confirmAction({
+              title: 'Cancel this payment?',
+              message: `${details} It will not be sent. This cannot be undone.`,
+              confirmLabel: 'Cancel payment',
+              cancelLabel: 'Keep payment',
+              tone: 'danger',
+              stepUp: { action: 'payment.cancel', payload: { paymentId: payment.id } },
+            })
+          : await confirmAction({
             title: 'Reject this payment?',
             message: `${details} It will be cancelled. This cannot be undone.`,
             confirmLabel: 'Reject payment',
@@ -203,6 +222,9 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
     try {
       if (kind === 'approve') {
         onOutcome({ kind: 'approved', amount, payee, result: await approve.mutateAsync(payment.id) });
+      } else if (kind === 'cancel') {
+        await cancel.mutateAsync(payment.id);
+        onOutcome({ kind: 'cancelled', amount, payee });
       } else {
         await reject.mutateAsync(payment.id);
         onOutcome({ kind: 'rejected', amount, payee });
@@ -221,8 +243,10 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
       setError(
         providerError.kind === 'insufficient_funds'
           ? `There is not enough ${payment.currency} to send this payment.`
-          : providerError.kind === 'not_found' || providerError.kind === 'validation'
-            ? 'This payment has changed and can no longer be actioned here. Go back and refresh.'
+          : providerError.reason
+            ? providerError.userMessage
+            : providerError.kind === 'not_found' || providerError.kind === 'validation'
+              ? 'This payment has changed and can no longer be actioned here. Go back and refresh.'
             : providerError.userMessage,
       );
     }
@@ -233,7 +257,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   });
 
   const remaining = approval.approvalsRemaining;
-  const canApprove = beneficiary !== null && !insufficient && online && !unresolved;
+  const canApprove = mayDecide && beneficiary !== null && !insufficient && online && !unresolved;
 
   return (
     <>
@@ -306,6 +330,29 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
         <DetailRow label="Arrives" value={payment.estimatedArrival ? formatDate(payment.estimatedArrival) : disclosures.deliveryEstimate} />
       </Card>
 
+      {hold ? (
+        <Card style={{ gap: spacing.sm }}>
+          <AppText variant="title" accessibilityRole="header">
+            {hold.createdByYou ? 'Waiting for approval' : `Created by ${hold.createdBy}`}
+          </AppText>
+          <AppText>Global Connect is holding this payment. It has not been sent, and no money has been set aside for it.</AppText>
+          <AppText>
+            {hold.createdByYou
+              ? hold.approvers.length > 0
+                ? `You created it, so someone else has to approve it: ${listNames(hold.approvers)} can.`
+                : 'You created it, so someone else has to approve it, and nobody else on this account can approve payments yet. Ask Global Connect to add an approver.'
+              : mayDecide
+                ? 'Check where the money is going before you approve.'
+                : hold.approvers.length > 0
+                  ? `It is waiting for ${listNames(hold.approvers)}.`
+                  : 'Nobody else on this account can approve it yet. Ask Global Connect to add an approver.'}
+          </AppText>
+          <AppText tone="muted">{`If it is not approved by ${formatDateTime(hold.expiresAt)} it expires and is not sent.`}</AppText>
+        </Card>
+      ) : approval.external ? (
+        <InlineMessage tone="info">This payment was already waiting before Global Connect started holding payments for approval. It is not held by Global Connect, and it cannot be cancelled here.</InlineMessage>
+      ) : null}
+
       <Card style={{ gap: spacing.md }}>
         <AppText variant="title" accessibilityRole="header">
           {`Approval, ${remaining} more needed`}
@@ -315,7 +362,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
         ))}
       </Card>
 
-      {beneficiary === null ? (
+      {mayDecide && beneficiary === null ? (
         <InlineMessage tone="danger">
           We could not load this payee&apos;s bank details, so this payment cannot be approved here. You can still reject it.
         </InlineMessage>
@@ -329,15 +376,23 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
         <Button label="Check again" onPress={recheck.run} loading={recheck.busy} disabled={!online} testID="review-recheck" />
       ) : (
         <View style={{ gap: spacing.sm }}>
-          <Button
-            label="Approve payment"
-            icon={<Check color={canApprove ? colors.textOnDark : colors.disabledText} size={22} />}
-            onPress={() => action.run('approve')}
-            loading={action.busy}
-            disabled={!canApprove}
-            testID="approve-button"
-          />
-          <Button label="Reject payment" variant="danger" onPress={() => action.run('reject')} disabled={action.busy || !online} testID="reject-button" />
+          {/* Its creator is never offered Approve: the server would refuse, and offering it would mislead. */}
+          {mayDecide ? (
+            <>
+              <Button
+                label="Approve payment"
+                icon={<Check color={canApprove ? colors.textOnDark : colors.disabledText} size={22} />}
+                onPress={() => action.run('approve')}
+                loading={action.busy}
+                disabled={!canApprove}
+                testID="approve-button"
+              />
+              <Button label="Reject payment" variant="danger" onPress={() => action.run('reject')} disabled={action.busy || !online} testID="reject-button" />
+            </>
+          ) : null}
+          {hold?.canCancel ? (
+            <Button label="Cancel payment" variant="danger" onPress={() => action.run('cancel')} loading={!mayDecide && action.busy} disabled={action.busy || !online} testID="cancel-button" />
+          ) : null}
         </View>
       )}
     </>
@@ -361,9 +416,11 @@ export function PaymentReviewScreen() {
         ? approvalOutcomeCopy(outcome.result)
         : outcome.kind === 'no_longer_pending'
           ? { ...noLongerPendingCopy(outcome.attempted), tone: 'warning' as const }
-          : { title: 'Rejected', body: 'The payment was cancelled. No money has left your account.', tone: 'positive' as const };
+          : outcome.kind === 'cancelled'
+            ? { title: 'Cancelled', body: 'The payment was cancelled before it was sent. No money has left your account.', tone: 'positive' as const }
+            : { title: 'Rejected', body: 'The payment was cancelled. No money has left your account.', tone: 'positive' as const };
     const Icon = copy.tone === 'positive' ? CircleCheck : copy.tone === 'warning' ? Clock : CircleAlert;
-    const iconColor = outcome.kind === 'rejected' ? colors.textMuted : copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
+    const iconColor = outcome.kind === 'rejected' || outcome.kind === 'cancelled' ? colors.textMuted : copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
     return (
       <Screen header={<Header title={copy.title} leading="close" onLeadingPress={done} />} footer={<Button label="Done" onPress={done} />}>
         <Card style={styles.outcome}>

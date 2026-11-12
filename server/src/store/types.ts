@@ -5,7 +5,7 @@
  * interfaces: no SQL and no SQLite type appears outside that folder, so moving
  * to another database means writing that folder again.
  */
-import type { StepUpAction, UserRole } from '@/api/types';
+import type { Beneficiary, StepUpAction, UserRole } from '@/api/types';
 
 export type ProviderKey = 'currencycloud' | 'equals';
 
@@ -42,7 +42,16 @@ export interface CompanyRecord {
   /** The name before the last rename and when that was, so an approver is not misled by a fresh name. */
   previousName?: string | null;
   renamedAt?: number | null;
+  /**
+   * How many people other than the creator must approve a payment before the
+   * server sends it to the provider: 0, 1 or 2. Absent means 1 (the default
+   * for a new company). Changed only through the ops console.
+   */
+  approvalsRequired?: ApprovalsRequired;
 }
+
+export type ApprovalsRequired = 0 | 1 | 2;
+export const approvalsRequiredOf = (company: Pick<CompanyRecord, 'approvalsRequired'>): ApprovalsRequired => company.approvalsRequired ?? 1;
 
 export interface Membership {
   userId: string;
@@ -283,7 +292,67 @@ export interface AuditArchive {
   write(segment: AuditEntry[]): Promise<string>;
 }
 
+/**
+ * A payment the server is holding until enough people have approved it.
+ *  awaiting_approval -> sending -> sent | failed
+ *  awaiting_approval -> rejected | cancelled | expired | payee_changed   (all final)
+ * `sending` means the provider has been (or is about to be) asked to make the
+ * payment under `sendKey` and the answer is not yet known. Nothing else may
+ * happen to the payment until that is settled, and it is never sent under any
+ * other key.
+ */
+export type HeldPaymentStatus = 'awaiting_approval' | 'sending' | 'sent' | 'failed' | 'rejected' | 'cancelled' | 'expired' | 'payee_changed';
+
+export interface HeldPaymentRecord {
+  id: string;
+  companyId: string;
+  /** The creator's own idempotency key: the same key never makes a second held payment. */
+  idempotencyKey: string;
+  createdBy: string;
+  createdAt: number;
+  expiresAt: number;
+  amount: string;
+  currency: string;
+  reference: string;
+  reason: string;
+  /** The payee and their bank details exactly as they were when the payment was created. */
+  payee: Beneficiary;
+  /** The company's policy when the payment was created. A later change of policy does not alter it. */
+  approvalsRequired: 1 | 2;
+  approvals: { userId: string; at: number }[];
+  status: HeldPaymentStatus;
+  statusAt: number;
+  /** Who rejected or cancelled it; null for the system (expiry). */
+  closedBy: string | null;
+  note: string | null;
+  /** The idempotency key the provider is given, derived from `id`. Set when the last approval is recorded. */
+  sendKey: string | null;
+  providerPaymentId: string | null;
+}
+
+/** The people a decision depends on, read in the same transaction as the payment. */
+export interface HeldPaymentPeople {
+  /** Null when the person no longer exists. `role` is their role in the payment's company, null when they are not a member. */
+  get(userId: string): { user: UserRecord; role: UserRole | null } | null;
+}
+
+export interface HeldPaymentStore {
+  /** Stores the payment unless one with this company and idempotency key exists; returns whichever is stored. */
+  create(record: HeldPaymentRecord): Promise<{ record: HeldPaymentRecord; created: boolean }>;
+  get(id: string): Promise<HeldPaymentRecord | null>;
+  findByKey(companyId: string, idempotencyKey: string): Promise<HeldPaymentRecord | null>;
+  list(where: { companyId?: string; status?: HeldPaymentStatus }): Promise<HeldPaymentRecord[]>;
+  /**
+   * ATOMIC. Reads the payment and the named people (their accounts and their
+   * roles in the payment's company) in ONE transaction and stores what
+   * `change` returns; null leaves it as it is. Returns the stored record, or
+   * null when nothing was written.
+   */
+  update(id: string, userIds: string[], change: (current: HeldPaymentRecord, people: HeldPaymentPeople) => HeldPaymentRecord | null): Promise<HeldPaymentRecord | null>;
+}
+
 export interface Stores {
+  payments: HeldPaymentStore;
   directory: Directory;
   auth: AuthStore;
   ops: OpsStore;

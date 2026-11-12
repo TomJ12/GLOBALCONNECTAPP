@@ -72,8 +72,11 @@ test('capabilities: the second provider has no forwards or approvals, and the se
   const amira = await signedIn(AMIRA);
   const ben = await signedIn(BEN);
   assert.deepEqual(amira.session.capabilities, { forwardContracts: true, paymentApprovals: true });
-  assert.deepEqual(ben.session.capabilities, { forwardContracts: false, paymentApprovals: false });
-  assert.deepEqual(amira.session.stepUpActions, ['payment.create', 'payment.approve', 'payment.reject', 'beneficiary.create']);
+  // Approvals are the server's own: every company with a rule of 1 or more has them, whatever its provider can do.
+  assert.deepEqual(ben.session.capabilities, { forwardContracts: false, paymentApprovals: true });
+  await h.policy('co_castlebrook', 0);
+  assert.deepEqual((await h.login(BEN, ben.secret)).json.session.capabilities, { forwardContracts: false, paymentApprovals: false });
+  assert.deepEqual(amira.session.stepUpActions, ['payment.create', 'payment.approve', 'payment.reject', 'payment.cancel', 'beneficiary.create']);
 
   const forward = { kind: 'forward', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00', settlementDate: '2027-03-01' };
   assert.equal((await h.call('POST', '/v1/quotes', { token: amira.token, body: forward })).status, 200);
@@ -229,6 +232,7 @@ test('isolation: a company with no provider scope gets no provider call at all (
 
 test('step-up: a payment needs a token bound to this person, session, action and exact payload, once', async () => {
   h = await harness();
+  await h.policy('co_northfield', 0);
   const amira = await signedIn(AMIRA);
   const body = paymentBody();
   const send = (stepUp: string | undefined, key: string, sent: object = body, token = amira.token) =>
@@ -346,6 +350,8 @@ test('step-up: approve, reject and add payee need it; conversions do not unless 
 
 test('the second provider: payee, stepped-up payment, idempotent retry and a conversion', async () => {
   h = await harness();
+  // No approval rule: the payment goes straight to the provider, as it did before approvals existed.
+  await h.policy('co_castlebrook', 0);
   const ben = await signedIn(BEN);
   const payee = { name: 'Atelier Dubois SARL', entityType: 'company', currency: 'EUR', bankCountry: 'FR', iban: 'FR1420041010050500013M02606', bic: 'SMPLFRPP' };
   const created = await h.call('POST', '/v1/beneficiaries', {

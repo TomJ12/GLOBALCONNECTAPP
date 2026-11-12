@@ -70,9 +70,14 @@ for a sample account only when it has no live one.
 
 | User | Company | Held at |
 |---|---|---|
-| `amira@northfield.example` | Northfield Trading Ltd | provider A (forwards, approvals) |
-| `ben@castlebrook.example` | Castlebrook Imports Ltd | provider B (no forwards, no approvals) |
+| `amira@northfield.example` | Northfield Trading Ltd | provider A (forwards) |
+| `ben@castlebrook.example` | Castlebrook Imports Ltd | provider B (no forwards) |
 | `dana@adviser.example` | both | chooses a company after signing in |
+
+All three are admins of their companies, and **both companies need one approval for a
+payment** (see "Approvals"): a payment Amira creates is held until Dana approves it, and
+the other way round. To see a payment go through you therefore need **two activated
+people in the same company**, for example Amira and Dana for Northfield.
 
 To try it:
 
@@ -183,7 +188,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 103 tests (about two minutes)
+npm test                 # node:test, 131 tests (about three minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -257,6 +262,8 @@ server/
     crypto.ts       scrypt passwords and recovery codes, TOTP (RFC 6238), base32, tokens
     auth/service.ts invitations, activation, login, sessions, step-up (clients)
     auth/lockout.ts progressive lockout, shared by client and staff sign-in
+    payments/held.ts payments held for approval: create, approve, reject, cancel, expire,
+                    send once and settle (see "Approvals")
     ops/            the ops console: auth.ts (staff accounts, sessions, step-up),
                     console.ts (every /ops route and page, approvals), html.ts, static/
     store/          types.ts (repository interfaces incl. OpsStore, AuditLog and the atomic
@@ -301,7 +308,7 @@ Rules the code follows:
 
 ### Money-moving actions
 
-Send payment, approve, reject and convert all follow the same rules:
+Send payment, approve, reject, cancel and convert all follow the same rules:
 
 1. **Single flight.** The button goes through `useSingleFlight` (a ref lock, so a second
    tap in the same frame is ignored).
@@ -312,9 +319,10 @@ Send payment, approve, reject and convert all follow the same rules:
    The payment key is bound to payee + amount + currency + reference. The conversion key
    is bound to the conversion *intent* (currencies, side, amount, type, date), not to the
    quote, so a re-quote of the same conversion reuses it.
-   Approve and reject send **no** key: the provider's authorise and delete endpoints do
-   not accept one. They are safe to repeat because a payment that is no longer waiting
-   for approval cannot be approved or rejected again.
+   Approve, reject and cancel send **no** key. They are safe to repeat because a payment
+   that is no longer waiting for approval cannot be approved, rejected or cancelled
+   again, and the server sends an approved payment to the provider under one key of its
+   own (see "Approvals").
 4. **Recorded before sending.** For payments and conversions the idempotency key (with a
    signature of what is being sent, nothing else) is written to device storage *before*
    the request goes out (`src/lib/pendingOutcome.ts`) and removed only on a definite
@@ -453,7 +461,7 @@ the invitation still being the same one).
 
 ### Step-up on money actions
 
-Creating a payment, approving, rejecting and adding a payee need a fresh code. Booking a
+Creating a payment, approving, rejecting, cancelling and adding a payee need a fresh code. Booking a
 conversion between the client's own balances does not, unless `STEP_UP_CONVERSIONS=1`.
 
 1. `POST /v1/step-up {action, payload, code}` → a one-time token valid for 2 minutes,
@@ -471,6 +479,90 @@ the token only to the request whose payload matches exactly.
 
 With `STEP_UP_CONVERSIONS=1` the code has to be typed while the quote is still held
 (30 s on provider A's mock, 12 s on provider B's), which is tight. That is why it is off.
+
+### Approvals
+
+Payment approvals are enforced **by the Global Connect server**, the same way for every
+provider. The provider's own approval feature is not used for payments created through
+the server.
+
+**The rule.** Each company has `approvalsRequired`: 0, 1 or 2. A new company gets 1, and
+so do the two demo companies. It is changed in the ops console (company page, "Payment
+approvals") as a request that an **ops admin** must approve; the change is audited. A
+change applies to payments created afterwards: **payments already waiting keep the rule
+they were created under**, and the request says so.
+
+**Creating.** A `creator` or `admin` creates a payment with a fresh code, as before.
+With a rule of 0 it goes to the provider at once, exactly as it always did. With 1 or 2
+the server **holds** it as "waiting for approval" and sends nothing to the provider.
+**No money is reserved**: the balance is not touched and is only checked when the
+payment is about to be sent, so a held payment can later fail for lack of funds. The
+payee's bank details are copied into the held payment at that moment.
+
+**Approving.** An `approver` or `admin` approves with a fresh code. **The creator can
+never approve their own payment**, whatever their role. With 2 required, two different
+people must approve, neither of them the creator. Each approval is recorded with who and
+when. On the approval that completes the set the server checks, and only then sends:
+
+- the payment is still waiting and has not expired;
+- the payee still exists at the provider and their bank details are **identical** to the
+  copy taken at creation; if not, the approval is refused and the payment is closed as
+  "payee changed" for good (create it again);
+- the creator and the approver are still enabled members of the company with roles that
+  allow creating and approving;
+- the provider reports enough balance.
+
+The payment's state, the creator's and the approver's accounts and roles are read and
+the new state is written **in one database transaction**. The payee and the balance are
+the provider's, so they are checked immediately before that transaction, not inside it.
+
+**Sending exactly once.** In that transaction the payment moves to `sending` and gets an
+idempotency key derived from the held payment's id. The provider is then asked to make
+the payment with that key. If the answer is lost, the server crashes, or the request is
+retried, the payment stays `sending` and is **settled by that key before anything else
+can happen to it**: the server looks the key up at the provider; if the payment is
+there, it is marked sent; if not, the provider is asked again **with the same key**. It
+is never sent under a new key. This runs at start-up (before the server takes
+requests), once a minute, and whenever anyone tries to act on that payment. A plain
+refusal by the provider (not enough money, details not accepted) is final: the payment
+is marked failed and is not retried. This relies on the provider honouring the
+idempotency key; both mocks do, and it has to be confirmed with each real provider.
+
+**Reject, cancel, expire.** An `approver` or `admin` can reject (optionally with a
+reason, through the API; the app does not ask for one). The creator, or a company
+`admin`, can cancel while it is still waiting. Both need a fresh code and both are
+final. A held payment **cannot be edited**; cancel it and create another. A payment that
+has not been fully approved **48 hours after it was created** expires and is not sent;
+that is the product owner's decision, set by `PAYMENT_APPROVAL_HOURS` (default 48). The
+expiry is enforced when someone tries to approve and by a sweep once a minute, and the
+expiry time is shown to the creator and the approvers.
+
+**No silent deadlock.** If the only person who can approve is the creator, the payment
+would wait and expire. The create response lists who can approve (`held.approvers`); the
+app tells the creator "nobody else on this account can approve payments yet" when the
+list is empty (or shorter than the number needed), and the ops console warns on the
+company page, in the company list and on a rule-change request when a company does not
+have enough active approvers for its rule. Only activated, enabled people count.
+
+**What people see.** The creator sees "Waiting for approval", who can approve, when it
+expires, and can cancel; they are not offered Approve. An approver sees who created it,
+the payee's bank details masked, and the approvals so far. Payments that were already
+pending at the provider (the seeded sample on provider A) remain in the list and can be
+approved or rejected there as before; the API marks them `external` and the app says
+they are not held by Global Connect.
+
+**API.** `POST /v1/payments` (held → `status: "awaiting_approval"` and a `held` object),
+`GET /v1/approvals`, `POST /v1/payments/:id/approve|reject|cancel` (each with a
+step-up token bound to the payment id), `GET /v1/payments/by-key/:key` (finds the held
+payment, or the provider's payment once it has been sent). `capabilities.paymentApprovals`
+is true for every company with a rule of 1 or 2.
+
+**Limits to know about.** The mocks keep their data in memory, so after a server restart
+a payee you added in the demo no longer exists at the "provider", and a held payment to
+it is (correctly) blocked as "payee changed" when someone approves it; use the seeded
+payees on provider A to see a held payment survive a restart and go through. Listing
+who can approve reads every membership; fine at this size. There is no notification to
+approvers (no email or push): they see the payment when they open the app.
 
 ### Provider routing and isolation
 
@@ -495,9 +587,12 @@ With `STEP_UP_CONVERSIONS=1` the code has to be typed while the quote is still h
   else is refused, so nothing is rounded. Provider B's documented wire format is a JSON
   number: the string is converted at the last moment and only if the number says exactly
   the same thing.
-- `capabilities` (`forwardContracts`, `paymentApprovals`) come from the adapter and are
-  returned in the session. The app hides the Forward option, the forward list and the
-  approvals list when unsupported, and the server refuses them as well.
+- `capabilities` (`forwardContracts`, `paymentApprovals`) are returned in the session.
+  `forwardContracts` comes from the adapter. `paymentApprovals` is true for every
+  company whose approval rule is 1 or 2, whatever its provider can do, because the
+  server holds those payments itself (see "Approvals"). The app hides the Forward
+  option, the forward list and the approvals list when unsupported, and the server
+  refuses them as well.
 - Responses contain only neutral shapes. Errors are `{error: {kind, reason?, fields?}}`
   with the app's existing kinds; upstream error text is never forwarded and a provider
   refusing the server's credentials is reported as `server`, not as the customer's
@@ -658,7 +753,9 @@ form that makes the change** (step-up). A code works once, so two changes need t
 above.
 
 - **Companies:** list, search, view; rename, deactivate / reactivate; create and
-  re-point (ops admin, approval). The provider is chosen as "Provider A / Provider B"
+  re-point (ops admin, approval); **change how many approvals a payment needs** (0, 1
+  or 2; approval by an ops admin; see "Approvals"). The company page and the company
+  list warn when a company does not have enough approvers for its rule. The provider is chosen as "Provider A / Provider B"
   with its name beside it; provider names appear only here, never in anything the
   client app receives (tested). With the mock providers the accounts that exist are
   `sample-account-0001…0003` (contacts `sample-contact-0001…0003`) on A and
@@ -718,8 +815,14 @@ Recorded, each with time, actor, target, action, outcome and source address:
 - for clients and staff: activation, sign-in success and failure, lockout, step-up,
   sign-out, and sessions revoked by ops;
 - for clients: company selection and **every money action** (create payment, approve,
-  reject, add payee, book conversion), success and failure, with amount, currency, payee
-  id and a hash of the idempotency key;
+  reject, cancel, add payee, book conversion), success and failure, with amount,
+  currency, payee id and a hash of the idempotency key;
+- for held payments also what the server itself did: `client.payment.send` (the last
+  approval was recorded and the provider is being asked), `system.payment.send_outcome`
+  (`sent`, `failed` or `unknown`), `system.payment.expire`, `system.payment.blocked`
+  (the payee changed), each with the payment id, amount, currency and payee id; and
+  `ops.company.approvals` for a change of a company's rule, with the old and new value
+  and both staff members;
 - every ops action that reached the console with a valid session and CSRF field, success
   and failure, with its target when one was identified; approval requests and decisions
   with both people;
@@ -932,8 +1035,7 @@ invented**, and marked line by line in `server/src/providers/equals/raw.ts`:
 | `Authorization: ApiKey …`, amounts as JSON numbers, `YYYYMMDD` dates | idempotency (the docs read did not mention any; the mock treats a repeated order id / client reference as the same order) |
 
 Nothing was tested against a live or sandbox API. Provider B's capabilities here (no
-forwards, no payment approvals) are a choice made for the demo, not a statement about
-the real product. No rate history is offered, so no trend line is drawn.
+forwards) are a choice made for the demo, not a statement about the real product. No rate history is offered, so no trend line is drawn.
 
 ## What is placeholder
 
@@ -999,11 +1101,6 @@ Not built:
 - **Live providers.** There is no HTTPS transport for either provider. Outside
   development mode the server refuses to start on the mocks, so today it runs **only**
   with `APP_ENV=development`.
-- **Maker-checker for payments on the server.** The roles stop a `creator` approving and
-  an `approver` creating, but a company `admin` can create a payment and then approve
-  it, and the server does not check that the approver is a different person from the
-  creator. That is left to the provider's approval rules, which the mock does not have.
-  Whether and how to enforce it here is a product decision that has not been made.
 - **Self-service account recovery**: password change and reset, re-enrolling an
   authenticator and regenerating recovery codes by the client. The only recovery is an
   ops reset (see "Ops console"), which replaces everything.

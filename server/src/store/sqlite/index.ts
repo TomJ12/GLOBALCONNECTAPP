@@ -27,6 +27,7 @@ import { SqlAuditLog, type AuditOptions, type AuditVerification } from './audit'
 import { Db } from './db';
 import { SqlDirectory, SqlOpsDirectory } from './directory';
 import { open, seal, sealedKeyId, type DataKeys } from './keys';
+import { SqlHeldPayments } from './payments';
 import { SqlTable } from './tables';
 
 export interface DirectoryData {
@@ -110,6 +111,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const IDLE_COUNTER_MS = 2 * 60 * 60_000;
   return {
     db,
+    payments: new SqlHeldPayments(db, directory),
     directory,
     auth: { activations, challenges, sessions, stepUps, attempts },
     ops: { users: opsUsers, activations: opsActivations, challenges: opsChallenges, sessions: opsSessions, attempts: opsAttempts, approvals },

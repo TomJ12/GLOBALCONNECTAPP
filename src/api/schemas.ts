@@ -43,7 +43,7 @@ const fixedSide = z.enum(['sell', 'buy']);
 
 const user = z.object({ id: text, email: text, displayName: text });
 const company = z.object({ id: text, name: text });
-export const stepUpAction = z.enum(['payment.create', 'payment.approve', 'payment.reject', 'beneficiary.create', 'conversion.book']);
+export const stepUpAction = z.enum(['payment.create', 'payment.approve', 'payment.reject', 'payment.cancel', 'beneficiary.create', 'conversion.book']);
 export const capabilities = z.object({ forwardContracts: z.boolean(), paymentApprovals: z.boolean() });
 export const session: z.ZodType<Session> = z.object({
   user,
@@ -201,6 +201,19 @@ export const payment: z.ZodType<Payment> = z.object({
   fee: z.object({ amount: decimal, currency }).nullable(),
   estimatedArrival: isoDate.nullable(),
   createdAt: text,
+  held: z
+    .object({
+      state: z.enum(['awaiting_approval', 'sending', 'rejected', 'cancelled', 'expired', 'payee_changed', 'failed']),
+      createdBy: text,
+      createdByYou: z.boolean(),
+      approvalsRequired: z.number().int().min(1).max(2),
+      approvals: z.array(z.object({ by: text, at: text })),
+      expiresAt: text,
+      canApprove: z.boolean(),
+      canCancel: z.boolean(),
+      approvers: z.array(text),
+    })
+    .optional(),
 });
 /** A payment request body. The idempotency key travels in the Idempotency-Key header. */
 export const newPaymentBody = z.object({
@@ -214,6 +227,7 @@ export const idempotencyKey = z.string().regex(/^[\w-]{8,120}$/);
 export const approvalResult: z.ZodType<ApprovalResult> = z.object({ status: paymentStatus, approvalsRemaining: z.number().int().min(0) });
 export const pendingApproval: z.ZodType<PendingApproval> = z.object({
   payment,
+  external: z.boolean().optional(),
   beneficiary: beneficiary.nullable(),
   approvalsRemaining: z.number().int().min(0),
   steps: z.array(z.object({ label: text, status: z.enum(['done', 'waiting_for_you', 'waiting']), at: text.nullable() })),

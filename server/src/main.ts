@@ -6,7 +6,14 @@ import { createRuntime, seedInvitations } from './startup';
 const config = loadConfig();
 const runtime = createRuntime(config);
 const { stores, registry, mailer } = runtime;
-const { app, admin, auth, opsAuth } = await buildApp({ config, stores, registry, mailer });
+const { app, admin, auth, opsAuth, held } = await buildApp({ config, stores, registry, mailer });
+// Held payments: at start-up every send that a crash or restart left unfinished is settled (by its idempotency key)
+// before the server takes requests; after that, once a minute, payments that waited too long expire and any send
+// still unanswered is looked at again.
+const settle = (all: boolean) => held.sweep({ all }).catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'payment sweep failed'));
+await settle(true);
+setInterval(() => void settle(false), 60_000).unref();
+
 await app.listen({ port: config.port, host: config.host });
 // The operator commands are served on the loopback address ONLY, on their own port.
 if (admin) await admin.listen({ port: config.adminPort, host: '127.0.0.1' });
@@ -15,6 +22,7 @@ if (admin) await admin.listen({ port: config.adminPort, host: '127.0.0.1' });
 const sweep = () => stores.sweep(config.sessionAbsoluteMs, config.opsSessionAbsoluteMs).catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'sweep failed'));
 await sweep();
 setInterval(sweep, 5 * 60_000).unref();
+
 
 let closing = false;
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

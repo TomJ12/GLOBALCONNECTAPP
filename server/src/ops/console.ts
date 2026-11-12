@@ -37,7 +37,7 @@ import { ApiError } from '../errors';
 import { activationMessage, maskEmail, type Mailer } from '../mailer';
 import type { ProviderRegistry } from '../providers/adapter';
 import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate';
-import type { ApprovalRecord, AuditParty, CompanyRecord, OpsRole, OpsUserRecord, ProviderKey, Stores, UserRecord } from '../store/types';
+import { approvalsRequiredOf, type ApprovalRecord, type ApprovalsRequired, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { codeField, h, Html, layout, qrSvg, when } from './html';
 
@@ -770,17 +770,34 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         return users.filter((user): user is UserRecord => user !== null);
       };
 
+      /**
+       * Payment approvals. With N approvals required, a payment needs N people OTHER than its creator who are
+       * active and may approve. Returns what to warn about, or null: ops sees who could be stuck, never a payment.
+       */
+      const APPROVAL_LABELS: Record<number, string> = { 0: 'None: payments are sent as soon as they are created', 1: 'One other person must approve', 2: 'Two other people must approve' };
+      const approverGap = async (company: CompanyRecord, required = approvalsRequiredOf(company)): Promise<string | null> => {
+        if (required === 0) return null;
+        const memberships = (await stores.directory.listMemberships()).filter((item) => item.companyId === company.id);
+        const people = (await Promise.all(memberships.map(async (item) => ({ role: item.role, user: await stores.directory.getUser(item.userId) })))).filter(
+          (item): item is { role: UserRole; user: UserRecord } => item.user !== null && item.user.activatedAt !== null && !item.user.disabledAt,
+        );
+        const stuck = people.filter((creator) => (creator.role === 'creator' || creator.role === 'admin') && people.filter((other) => other.user.id !== creator.user.id && (other.role === 'approver' || other.role === 'admin')).length < required);
+        if (stuck.length === 0) return null;
+        return `NOT ENOUGH APPROVERS: with ${required} ${required === 1 ? 'approval' : 'approvals'} required, a payment created by ${stuck.map((item) => item.user.name).join(' or ')} could not be approved by anyone (it needs ${required} other active ${required === 1 ? 'person' : 'people'} with the approver or admin role). It would wait and then expire.`;
+      };
+
       page('/companies', {}, async (ctx, request, reply) => {
         const q = queryOf(request, 'q').toLowerCase();
         const companies = (await stores.directory.listCompanies()).filter((company) => !q || `${company.name} ${company.id} ${company.providerAccountId}`.toLowerCase().includes(q));
+        const gaps = new Map(await Promise.all(companies.map(async (company) => [company.id, company.deactivatedAt ? null : await approverGap(company)] as const)));
         return send(
           reply,
           200,
           layout(
             chromeOf(ctx, 'Companies', flashOf(request)),
             h`<div class="toolbar">${search('/ops/companies', q, 'Search name or id')}${ctx.user.role === 'ops_admin' && h`<a class="button" href="/ops/companies/new">New company</a>`}</div>
-<div class="card"><table><tr><th>Name</th><th>Provider</th><th>Provider account id</th><th>Status</th></tr>${companies.map(
-              (company) => h`<tr><td><a href="/ops/companies/${company.id}">${company.name}</a></td><td>${PROVIDERS[company.providerKey].label}</td><td>${company.providerAccountId}</td><td>${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</td></tr>`,
+<div class="card"><table><tr><th>Name</th><th>Provider</th><th>Provider account id</th><th>Payment approvals</th><th>Status</th></tr>${companies.map(
+              (company) => h`<tr><td><a href="/ops/companies/${company.id}">${company.name}</a></td><td>${PROVIDERS[company.providerKey].label}</td><td>${company.providerAccountId}</td><td>${approvalsRequiredOf(company)} required${gaps.get(company.id) ? h` ${tag(false, '', 'Not enough approvers')}` : ''}</td><td>${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</td></tr>`,
             )}</table>${companies.length === 0 && h`<p class="muted">No companies found.</p>`}</div>`,
           ),
         );
@@ -816,6 +833,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const company = await companyOf((request.params as { id: string }).id);
         const memberships = (await stores.directory.listMemberships()).filter((item) => item.companyId === company.id);
         const users = await Promise.all(memberships.map(async (item) => ({ role: item.role, user: await stores.directory.getUser(item.userId) })));
+        const gap = company.deactivatedAt ? null : await approverGap(company);
+        const required = approvalsRequiredOf(company);
         return send(
           reply,
           200,
@@ -823,6 +842,13 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             chromeOf(ctx, company.name, flashOf(request)),
             h`<div class="grid"><div class="card"><h2>Details ${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</h2><form method="post" action="/ops/companies/${company.id}">${csrfInput(ctx)}${companyFields(company)}<p class="muted">${config.fourEyes ? 'A rename needs approval by a second staff member. ' : ''}Changing the provider, account id or contact id needs an ops admin${config.fourEyes ? ' and approval by a second ops admin' : ''}, and ends the sessions of everyone attached to this company.${company.previousName && company.renamedAt ? ` Named “${company.previousName}” until ${when(company.renamedAt)}.` : ''}</p>${codeField}<button>${config.fourEyes ? 'Request: save changes' : 'Save changes'}</button></form></div>
 <div><div class="card"><h2>People</h2><table><tr><th>Name</th><th>Email</th><th>Role</th></tr>${users.map(({ role, user }) => user && h`<tr><td><a href="/ops/users/${user.id}">${user.name}</a></td><td>${user.email}</td><td>${role}</td></tr>`)}</table>${users.length === 0 && h`<p class="muted">Nobody yet. Attach people from their client user page.</p>`}</div>
+<div class="card"><h2>Payment approvals</h2><p>Now: <strong>${required} required</strong>. ${APPROVAL_LABELS[required] ?? ''}.</p>${gap ? h`<p class="warn">${gap}</p>` : ''}${form(
+              ctx,
+              `/ops/companies/${company.id}/approvals`,
+              h`<label>Approvals required before a payment is sent <select name="approvalsRequired">${[0, 1, 2].map((value) => h`<option value="${String(value)}"${value === required ? h` selected` : ''}>${String(value)}: ${APPROVAL_LABELS[value] ?? ''}</option>`)}</select></label><p class="muted">The creator of a payment can never approve it. A change applies to payments created afterwards; payments already waiting for approval keep the rule they were created under.${config.fourEyes ? ' Needs approval by an ops admin.' : ''}</p>`,
+              'Change payment approvals',
+              { request: true },
+            )}</div>
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
                 ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company', { request: true })
@@ -880,6 +906,37 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             detail.sessionsEnded = String(sessions);
           }
           return { target: companyParty({ id: company.id, name: mapping.name }), detail, redirect: `/ops/companies/${company.id}?done=saved` };
+        },
+      });
+      action('/companies/:id/approvals', {
+        name: 'company.approvals',
+        fourEyes: true,
+        // How many people stand between a payment and the bank is decided by two staff, the second an ops admin.
+        adminApproval: true,
+        async prepare({ form: input, params, aim }) {
+          const company = await companyOf(params.id);
+          aim(companyParty(company));
+          const wanted = Number(oneOf(text(input, 'approvalsRequired'), ['0', '1', '2'], 'number of approvals')) as ApprovalsRequired;
+          const current = approvalsRequiredOf(company);
+          if (wanted === current) throw new OpsError('That is already the rule for this company.');
+          const warnings: string[] = [];
+          if (wanted === 0) warnings.push('With 0 required, one person at the client can create a payment and it is sent at once, with no second person involved.');
+          const gap = await approverGap(company, wanted);
+          if (gap) warnings.push(gap);
+          return {
+            params: { id: company.id, approvalsRequired: String(wanted), from: String(current) },
+            summary: `Change payment approvals for company ${describe(company)} from ${current} to ${wanted} required. This applies to payments created from now on: payments already waiting for approval are NOT affected and keep the rule they were created under.`,
+            warnings,
+          };
+        },
+        async apply(params) {
+          const company = await companyOf(params.id);
+          const wanted = Number(oneOf(params.approvalsRequired ?? '', ['0', '1', '2'], 'number of approvals')) as ApprovalsRequired;
+          const from = approvalsRequiredOf(company);
+          // What was approved was a change FROM a particular rule. If the rule has moved since, it is asked for again.
+          if (String(from) !== params.from) throw new OpsError('The company’s approval rule changed since this was requested. Make the request again.', 409, 'stale');
+          await stores.directory.saveCompany({ ...company, approvalsRequired: wanted });
+          return { target: companyParty(company), detail: { from: String(from), to: String(wanted) }, redirect: `/ops/companies/${company.id}?done=saved` };
         },
       });
       for (const [verb, deactivate] of [['deactivate', true], ['reactivate', false]] as const) {

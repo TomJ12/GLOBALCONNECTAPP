@@ -14,6 +14,7 @@ import {
 
 import { getAlertsStore, type NewRateAlert } from '@/alerts';
 import { getAuthClient, getProviderClient } from '@/api';
+import { ProviderError } from '@/api/errors';
 import type { BookConversionRequest, CodeMethod, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
 import { useCapabilities, useSession } from '@/state/session';
 
@@ -246,6 +247,22 @@ export function useRejectPayment() {
   const client = useQueryClient();
   return useMutation({
     mutationFn: (paymentId: string) => getProviderClient().rejectPayment(paymentId),
+    onSettled: () => {
+      // Not awaited: the screen shows its result at once and the lists refresh behind it.
+      void invalidateMoney(client);
+    },
+  });
+}
+
+/** Withdraw a payment that is still waiting for approval. Only the Global Connect server holds payments, so only it can. */
+export function useCancelPayment() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (paymentId: string) => {
+      const backend = getProviderClient();
+      if (!backend.cancelPayment) throw new ProviderError('validation', { reason: 'not_supported' });
+      await backend.cancelPayment(paymentId);
+    },
     onSettled: () => {
       // Not awaited: the screen shows its result at once and the lists refresh behind it.
       void invalidateMoney(client);

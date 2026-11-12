@@ -3,6 +3,7 @@ import { Plus } from 'lucide-react-native';
 import { View } from 'react-native';
 
 import { userMessageFor } from '@/api/errors';
+import type { PendingApproval } from '@/api/types';
 import { SectionHeader } from '@/components/Bits';
 import { Button } from '@/components/Button';
 import { Card, Divider } from '@/components/Card';
@@ -16,7 +17,21 @@ import { useIsOnline } from '@/lib/online';
 import { useCapabilities } from '@/state/session';
 import { colors, spacing } from '@/theme';
 
-import { PaymentRow } from './shared';
+import { needsYourApproval, PaymentRow } from './shared';
+
+function ApprovalList({ approvals }: { approvals: PendingApproval[] }) {
+  const router = useRouter();
+  return (
+    <Card padded={false}>
+      {approvals.map((approval, index) => (
+        <View key={approval.payment.id}>
+          {index > 0 ? <Divider /> : null}
+          <PaymentRow payment={approval.payment} onPress={() => router.push({ pathname: '/payments/[id]', params: { id: approval.payment.id } })} />
+        </View>
+      ))}
+    </Card>
+  );
+}
 
 export function PaymentsScreen() {
   const router = useRouter();
@@ -47,23 +62,18 @@ export function PaymentsScreen() {
           <QueryState
             query={approvals}
             skeleton={<SkeletonList rows={1} label="Loading payments waiting for approval" />}
-            isEmpty={(data) => data.length === 0}
+            isEmpty={(data) => data.filter(needsYourApproval).length === 0}
             empty={<EmptyState title="Nothing to approve" body="Payments that need your approval will appear here." />}
           >
-            {(data) => (
-              <Card padded={false}>
-                {data.map((approval, index) => (
-                  <View key={approval.payment.id}>
-                    {index > 0 ? <Divider /> : null}
-                    <PaymentRow
-                      payment={approval.payment}
-                      onPress={() => router.push({ pathname: '/payments/[id]', params: { id: approval.payment.id } })}
-                    />
-                  </View>
-                ))}
-              </Card>
-            )}
+            {(data) => <ApprovalList approvals={data.filter(needsYourApproval)} />}
           </QueryState>
+          {/* Payments this person created (or has already approved) that are still waiting for somebody else. */}
+          {approvals.data && approvals.data.some((approval) => !needsYourApproval(approval)) ? (
+            <View style={{ marginTop: spacing.lg }}>
+              <SectionHeader title="Waiting for someone else" />
+              <ApprovalList approvals={approvals.data.filter((approval) => !needsYourApproval(approval))} />
+            </View>
+          ) : null}
         </View>
       ) : null}
 

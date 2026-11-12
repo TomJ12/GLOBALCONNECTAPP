@@ -63,7 +63,25 @@ export class MockCurrencycloudPlatform implements Transport {
     return held.mock.request({ ...request, params, token: held.token });
   }
 
+  /** TESTS ONLY: what happens to the NEXT request that creates a payment. `lost_response`: made, but the answer never arrives. `applied_late`: no answer, and the request only reaches the provider when `releaseLate` is called. `no_answer`: never made. */
+  paymentFault: 'lost_response' | 'applied_late' | 'no_answer' | null = null;
+  private readonly late: (() => Promise<unknown>)[] = [];
+  async releaseLate(): Promise<void> {
+    for (const run of this.late.splice(0)) await run();
+  }
+
   async request(request: TransportRequest): Promise<TransportResponse> {
+    if (this.paymentFault && request.method === 'POST' && request.path === '/v2/payments/create') {
+      const fault = this.paymentFault;
+      this.paymentFault = null;
+      if (fault === 'lost_response') await this.handle(request);
+      if (fault === 'applied_late') this.late.push(() => this.handle(request));
+      throw new TypeError('Network request failed');
+    }
+    return this.handle(request);
+  }
+
+  private async handle(request: TransportRequest): Promise<TransportResponse> {
     const first = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value);
     if (request.method === 'POST' && request.path === '/v2/authenticate/api') {
       if (!first(request.params?.login_id) || !first(request.params?.api_key)) return error(401, 'auth_failed');

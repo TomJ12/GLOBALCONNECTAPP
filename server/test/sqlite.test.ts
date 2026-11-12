@@ -126,7 +126,7 @@ async function race(mode: string, count: number, workers = 3): Promise<{ name: s
     };
   });
   await Promise.all(outputs.map((item) => item.ready));
-  writeFileSync(go, '');
+  writeFileSync(go, String(Date.now() + 150));
   return Promise.all(outputs.map((item) => item.done));
 }
 /** Every number 0..count-1 was won by exactly one worker, and more than one worker won something (they really did overlap). */

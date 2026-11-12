@@ -66,4 +66,6 @@ export interface ProviderClient {
    */
   approvePayment(paymentId: string): Promise<ApprovalResult>;
   rejectPayment(paymentId: string): Promise<void>;
+  /** Withdraw a payment that is still waiting for approval. Only a backend that holds payments itself has this. */
+  cancelPayment?(paymentId: string): Promise<void>;
 }

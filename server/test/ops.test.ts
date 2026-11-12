@@ -305,6 +305,7 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
     companyId: 'co_northfield',
     role: route.startsWith('/ops/staff') ? 'ops' : 'approver',
     verification: 'Called back on the number on file',
+    approvalsRequired: '2',
   });
   const state = async () =>
     JSON.stringify([
@@ -361,7 +362,7 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
     }
   }
   assert.deepEqual(viaApproval.sort(), [
-    'ops.client.activation_link', 'ops.client.create', 'ops.client.enable', 'ops.client.membership.set', 'ops.client.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.company.reactivate',
+    'ops.client.activation_link', 'ops.client.create', 'ops.client.enable', 'ops.client.membership.set', 'ops.client.reset_authenticator', 'ops.company.approvals', 'ops.company.create', 'ops.company.edit', 'ops.company.reactivate',
     'ops.staff.activation_link', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.invite', 'ops.staff.reset_authenticator', 'ops.staff.role', 'ops.staff.unlock',
   ]);
   const names = new Set((await audit()).map((entry) => entry.action));
@@ -919,6 +920,64 @@ test('bootstrap: the operator command creates ops admins only while fewer than t
   // A new member of staff is written where it is looked for.
   assert.deepEqual((await audit('ops.staff.new')).map((entry) => [entry.target?.label, entry.detail.role]).sort(), [['first.admin@globalconnect.example', 'ops_admin'], ['second@globalconnect.example', 'ops_admin']]);
   assert.match((await (await staff('viewer@globalconnect.example', 'ops')).browser.get('/ops/audit?action=ops.staff.new')).body, /<tr class="alert">/);
+});
+
+test('ops: a company\'s payment approval rule is changed by request, approved only by an ops admin, audited, and the console warns when nobody could approve', async () => {
+  h = await harness();
+  const admin = await staff();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  const pat = await staff('pat@globalconnect.example', 'ops');
+  await h.activate(AMIRA);
+  const rule = async () => (await h.stores.directory.getCompany('co_northfield'))?.approvalsRequired;
+  assert.deepEqual([await rule(), (await h.stores.directory.getCompany('co_castlebrook'))?.approvalsRequired], [1, 1], 'the two demo companies start with one approval');
+
+  // The page says what the rule is and warns: Amira is the only active person, so her payments could not be approved by anyone.
+  const page = await admin.browser.get('/ops/companies/co_northfield');
+  assert.match(page.body, /<h2>Payment approvals<\/h2><p>Now: <strong>1 required<\/strong>/);
+  assert.match(page.body, /<p class="warn">NOT ENOUGH APPROVERS: with 1 approval required, a payment created by Amira Shah could not be approved by anyone/);
+  assert.match((await admin.browser.get('/ops/companies')).body, /1 required <span class="tag[^"]*">Not enough approvers<\/span>/);
+  // With a second active approver the warning goes.
+  await h.activate(DANA);
+  assert.doesNotMatch((await admin.browser.get('/ops/companies/co_northfield')).body, /NOT ENOUGH APPROVERS/);
+  // (Castlebrook now has the gap instead: Dana is active there and Ben, the only other person, is not.)
+  assert.match((await admin.browser.get('/ops/companies')).body, /Northfield Trading Ltd<\/a><\/td><td>[^<]+<\/td><td>[^<]+<\/td><td>1 required<\/td>[^]*Castlebrook Imports Ltd[^]*1 required <span class="tag bad">Not enough approvers/);
+
+  // An ops user asks for two approvals. Nothing changes yet; the request says what it does and does not affect, and warns.
+  const asked = await olu.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '2' });
+  assert.equal(asked.status, 303, asked.body.slice(-300));
+  const id = idOf(asked.location);
+  assert.equal(await rule(), 1);
+  const request = await h.stores.ops.approvals.get(id);
+  assert.match(request?.summary ?? '', /Change payment approvals for company “Northfield Trading Ltd” \(co_northfield\) from 1 to 2 required\. .*payments already waiting for approval are NOT affected and keep the rule they were created under/);
+  assert.match(request?.warnings.join(' ') ?? '', /NOT ENOUGH APPROVERS: with 2 approvals required/);
+  assert.match((await admin.browser.get(`/ops/approvals/${id}`)).body, /NOT affected/);
+  // Another ops USER cannot approve it, nor can the requester; an ops admin can.
+  assert.equal((await pat.act(`/ops/approvals/${id}/approve`)).status, 403);
+  assert.equal((await olu.act(`/ops/approvals/${id}/approve`)).status, 403);
+  assert.equal(await rule(), 1);
+  assert.equal((await admin.act(`/ops/approvals/${id}/approve`)).status, 303);
+  assert.equal(await rule(), 2);
+  const entry = (await audit('ops.company.approvals')).find((item) => item.outcome === 'success');
+  assert.deepEqual([entry?.target?.id, entry?.detail.from, entry?.detail.to, entry?.detail.approvedBy, entry?.actor.label], ['co_northfield', '1', '2', admin.email, olu.email]);
+
+  // Asking for the rule it already has, or a number that is not 0, 1 or 2, is refused.
+  assert.equal((await olu.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '2' })).status, 400);
+  assert.equal((await olu.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '3' })).status, 400);
+  // Two requests made under the same rule: once one is carried out, the other is stale and changes nothing.
+  const toZero = idOf((await olu.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '0' })).location);
+  const toOne = idOf((await pat.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '1' })).location);
+  assert.match((await h.stores.ops.approvals.get(toZero))?.warnings.join(' ') ?? '', /With 0 required, one person at the client can create a payment and it is sent at once/);
+  assert.equal((await admin.act(`/ops/approvals/${toOne}/approve`)).status, 303);
+  assert.equal((await admin.act(`/ops/approvals/${toZero}/approve`)).status, 409);
+  assert.equal(await rule(), 1);
+  // A new company starts with one approval, and renaming or re-pointing a company leaves its rule alone.
+  await h.policy('co_castlebrook', 2);
+  const second = await staff('second@globalconnect.example', 'ops_admin');
+  await fourEyes(admin, second, '/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' });
+  await fourEyes(admin, second, '/ops/companies/co_castlebrook', { name: 'Castlebrook Imports (UK) Ltd', provider: 'provider-b', providerAccountId: 'S00003' });
+  const companies = await h.stores.directory.listCompanies();
+  assert.equal(companies.find((company) => company.name === 'Tideway Ltd')?.approvalsRequired, 1);
+  assert.deepEqual([companies.find((company) => company.id === 'co_castlebrook')?.providerAccountId, companies.find((company) => company.id === 'co_castlebrook')?.approvalsRequired], ['S00003', 2]);
 });
 
 void DANA;

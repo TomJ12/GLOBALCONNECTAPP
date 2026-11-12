@@ -1,7 +1,7 @@
 /** Users, companies, memberships and staff accounts over SQLite. Authenticator keys are encrypted at rest. */
 import type { UserRole } from '@/api/types';
 
-import type { CompanyRecord, Directory, Membership, OpsDirectory, OpsRole, OpsUserRecord, ProviderKey, UserRecord } from '../types';
+import { approvalsRequiredOf, type ApprovalsRequired, type CompanyRecord, type Directory, type Membership, type OpsDirectory, type OpsRole, type OpsUserRecord, type ProviderKey, type UserRecord } from '../types';
 import type { Db, Row } from './db';
 import { open, seal, sealedKeyId, type DataKeys } from './keys';
 
@@ -67,10 +67,10 @@ class Accounts {
   }
 }
 
-type CompanyRow = Row & { id: string; name: string; provider_key: string; provider_account_id: string; provider_contact_id: string; deactivated_at: number | null; previous_name: string | null; renamed_at: number | null };
+type CompanyRow = Row & { id: string; name: string; provider_key: string; provider_account_id: string; provider_contact_id: string; deactivated_at: number | null; previous_name: string | null; renamed_at: number | null; approvals_required: number };
 const company = (row: CompanyRow | undefined): CompanyRecord | null =>
   row
-    ? { id: row.id, name: row.name, providerKey: row.provider_key as ProviderKey, providerAccountId: row.provider_account_id, providerContactId: row.provider_contact_id, deactivatedAt: row.deactivated_at, previousName: row.previous_name, renamedAt: row.renamed_at }
+    ? { id: row.id, name: row.name, providerKey: row.provider_key as ProviderKey, providerAccountId: row.provider_account_id, providerContactId: row.provider_contact_id, deactivatedAt: row.deactivated_at, previousName: row.previous_name, renamedAt: row.renamed_at, approvalsRequired: row.approvals_required as ApprovalsRequired }
     : null;
 const membership = (row: Row): Membership => ({ userId: row.user_id as string, companyId: row.company_id as string, role: row.role as UserRole });
 
@@ -116,9 +116,10 @@ export class SqlDirectory implements Directory {
   }
   async saveCompany(record: CompanyRecord): Promise<void> {
     this.db.run(
-      `INSERT INTO companies (id, name, provider_key, provider_account_id, provider_contact_id, deactivated_at, previous_name, renamed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO companies (id, name, provider_key, provider_account_id, provider_contact_id, deactivated_at, previous_name, renamed_at, approvals_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET name = excluded.name, provider_key = excluded.provider_key, provider_account_id = excluded.provider_account_id,
-         provider_contact_id = excluded.provider_contact_id, deactivated_at = excluded.deactivated_at, previous_name = excluded.previous_name, renamed_at = excluded.renamed_at`,
+         provider_contact_id = excluded.provider_contact_id, deactivated_at = excluded.deactivated_at, previous_name = excluded.previous_name, renamed_at = excluded.renamed_at,
+         approvals_required = excluded.approvals_required`,
       record.id,
       record.name,
       record.providerKey,
@@ -127,7 +128,15 @@ export class SqlDirectory implements Directory {
       record.deactivatedAt ?? null,
       record.previousName ?? null,
       record.renamedAt ?? null,
+      approvalsRequiredOf(record),
     );
+  }
+  /** For the held-payment store: a person and their role in one company, read inside the caller's transaction. */
+  personIn(userId: string, companyId: string): { user: UserRecord; role: UserRole | null } | null {
+    const user = this.accounts.read(this.accounts.byId(userId));
+    if (!user) return null;
+    const row = this.db.get<{ role: string }>('SELECT role FROM memberships WHERE user_id = ? AND company_id = ?', userId, companyId);
+    return { user, role: (row?.role as UserRole | undefined) ?? null };
   }
   async listMemberships(): Promise<Membership[]> {
     return this.db.all('SELECT * FROM memberships ORDER BY rowid').map(membership);

@@ -6,10 +6,11 @@
  *
  *   tsx sqlite-worker.ts <database> <key> <mode> <name> <count> <go-file>
  *
- * Prints "ready", waits for <go-file> to exist (so every worker starts
- * together), does its work and prints one JSON line with what it won.
+ * Prints "ready", waits for <go-file> (which holds the moment to start, so
+ * every worker starts together), does its work and prints one JSON line with
+ * what it won.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 import { createSqliteStores } from '../../src/store/sqlite';
 import { dataKeys } from '../../src/store/sqlite/keys';
@@ -34,13 +35,17 @@ if (mode === 'crash') {
 }
 
 console.log('ready');
-while (!existsSync(goFile)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+while (!existsSync(goFile) || readFileSync(goFile, 'utf8') === '') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
 
-const pause = new Int32Array(new SharedArrayBuffer(4));
+// Every worker attempts item n at the same instant (the go-file names the start; each item has its own slot), so
+// they really do collide on each one. Without that, a waiting SQLite connection sleeps a millisecond or more
+// between tries and one worker would do all its work before the others got a turn.
+const startAt = Number(readFileSync(goFile, 'utf8'));
+const SLOT_MS = 3;
 for (let n = 0; n < count; n += 1) {
-  // A waiting SQLite connection sleeps a millisecond or more before it tries again, so a worker that never
-  // paused would do all its work before the others got a turn. A short pause lets them interleave.
-  Atomics.wait(pause, 0, 0, 1 + Math.random());
+  while (Date.now() < startAt + n * SLOT_MS) {
+    // Spin: sleeping would give up the precision this needs.
+  }
   if (mode === 'count') {
     // Attempt counting: read, add one, write.
     await stores.auth.attempts.mutate('counter', (current) => ({ failures: (current?.failures ?? 0) + 1, lockedUntil: 0, locks: 0, subject: 's', updatedAt: n }));

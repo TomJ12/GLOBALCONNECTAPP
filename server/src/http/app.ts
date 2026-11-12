@@ -28,6 +28,7 @@ import { networkOf, sourceOf } from '../net';
 import { emailDomain, hasControlCharacters, isEmail } from '../validate';
 import { isActiveStaff, OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
+import { HeldPayments, type HeldPaymentsDeps } from '../payments/held';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
 
@@ -43,6 +44,8 @@ export interface AppDeps {
   /** Most addresses the rate limiter tracks at once, and most quotes held (tests lower them). */
   maxRateWindows?: number;
   maxHeldQuotes?: number;
+  /** TESTS ONLY: see HeldPaymentsDeps.beforeSend. */
+  beforeSend?: HeldPaymentsDeps['beforeSend'];
 }
 
 /**
@@ -75,13 +78,15 @@ interface CompanyContext extends SessionContext {
   role: UserRole;
 }
 
-const BASE_STEP_UP: StepUpAction[] = ['payment.create', 'payment.approve', 'payment.reject', 'beneficiary.create'];
+const BASE_STEP_UP: StepUpAction[] = ['payment.create', 'payment.approve', 'payment.reject', 'payment.cancel', 'beneficiary.create'];
 const MAY: Record<StepUpAction, UserRole[]> = {
   'payment.create': ['creator', 'admin'],
   'beneficiary.create': ['creator', 'admin'],
   'conversion.book': ['creator', 'admin'],
   'payment.approve': ['approver', 'admin'],
   'payment.reject': ['approver', 'admin'],
+  // Its creator, or an administrator of the company (checked against the payment itself).
+  'payment.cancel': ['creator', 'admin'],
 };
 
 /** Parse with a schema from the shared file; a failure becomes a neutral `validation` error naming the fields. */
@@ -367,11 +372,28 @@ export async function buildApp(deps: AppDeps) {
     }
   };
 
+  /** Payments held for approval. It reaches a provider only through the company's own adapter. */
+  const held = new HeldPayments({
+    stores: deps.stores,
+    config,
+    now,
+    beforeSend: deps.beforeSend,
+    withProvider: async (company, run) => {
+      try {
+        return await run(await registry.forCompany(company));
+      } catch (error) {
+        if (isProviderError(error) && error.kind === 'unauthorized') registry.invalidate(company.id);
+        throw error;
+      }
+    },
+  });
+
   const sessionView = async (context: CompanyContext): Promise<Session> => ({
     user: { id: context.user.id, email: context.user.email, displayName: context.user.name },
     company: { id: context.company.id, name: context.company.name },
     role: context.role,
-    capabilities: (await providerOf(context)).capabilities,
+    // Approvals are available wherever this server holds the company's payments, whatever its provider can do.
+    capabilities: { ...(await providerOf(context)).capabilities, paymentApprovals: (await providerOf(context)).capabilities.paymentApprovals || held.holds(context.company) },
     stepUpActions,
   });
 
@@ -596,7 +618,10 @@ export async function buildApp(deps: AppDeps) {
       });
       api.get('/payments', async (request) => {
         const context = await companyOf(request);
-        return withProvider(context, (provider) => provider.listPayments(pageOf(request)));
+        const page = pageOf(request);
+        const sent = await withProvider(context, (provider) => provider.listPayments(page));
+        // Payments this server is holding (or closed without sending) are not in the provider's list: they lead the first page.
+        return page.page === 1 ? { ...sent, items: [...(await held.listPayments(context)), ...sent.items] } : sent;
       });
       api.post('/payments', async (request) => {
         const context = await companyOf(request);
@@ -611,26 +636,55 @@ export async function buildApp(deps: AppDeps) {
             assertAmount(input.amount, input.currency);
             await authorize(request, context, 'payment.create', { ...(request.body as object), idempotencyKey });
             await assertOwnPayee(context, input.beneficiaryId);
+            // With an approval policy the payment is HELD here: nothing is sent to the provider until it is approved.
+            if (held.holds(context.company)) return held.create(context, input, idempotencyKey);
             return withProvider(context, (provider) => provider.createPayment({ ...input, idempotencyKey }));
           },
-          (payment) => ({ payment: payment.id, status: payment.status }),
+          (payment) => ({ payment: payment.id, status: payment.status, ...(payment.held ? { held: 'yes', approvalsRequired: String(payment.held.approvalsRequired) } : {}) }),
         );
       });
       api.get('/payments/by-key/:key', async (request) => {
         const context = await companyOf(request);
         const key = parse(schemas.idempotencyKey, (request.params as { key: string }).key);
-        return withProvider(context, (provider) => provider.findPaymentByIdempotencyKey(key));
+        const mine = await held.findByKey(context, key);
+        return mine !== undefined ? mine : withProvider(context, (provider) => provider.findPaymentByIdempotencyKey(key));
       });
       api.get('/approvals', async (request) => {
         const context = await companyOf(request);
         const provider = await providerOf(context);
-        const items = provider.capabilities.paymentApprovals ? await withProvider(context, () => provider.listPendingApprovals()) : [];
+        // Held by this server (every provider), then any that were already pending at the provider before approvals moved here.
+        const elsewhere = provider.capabilities.paymentApprovals ? await withProvider(context, () => provider.listPendingApprovals()) : [];
+        // Where this server holds payments, anything still pending at the provider is marked as not held here.
+        const items = [...(await held.listAwaiting(context)), ...elsewhere.map((item) => (held.holds(context.company) ? { ...item, external: true } : item))];
         return { items, truncated: false };
       });
-      const decide = (action: 'payment.approve' | 'payment.reject') => async (request: FastifyRequest) => {
+      const decide = (action: 'payment.approve' | 'payment.reject' | 'payment.cancel') => async (request: FastifyRequest) => {
         const context = await companyOf(request);
         const paymentId = parse(z.string().min(1).max(120), (request.params as { id: string }).id);
+        const mine = await held.find(context.company.id, paymentId);
+        if (mine) {
+          // Held by this server. The entry says how much and to which payee, whatever the outcome.
+          const given = action === 'payment.reject' ? ((request.body as { reason?: unknown } | null)?.reason ?? null) : null;
+          if (given !== null && (typeof given !== 'string' || given.length > 200 || hasControlCharacters(given))) throw new ApiError('validation', { fields: ['reason'] });
+          const note = typeof given === 'string' && given.trim() ? given.trim() : null;
+          return audited(
+            request,
+            context,
+            action,
+            { ...held.detailOf(mine), ...(note ? { note } : {}) },
+            async () => {
+              await authorize(request, context, action, { paymentId });
+              if (action === 'payment.approve') return held.approve(context, paymentId, request.ip);
+              if (action === 'payment.reject') await held.reject(context, paymentId, note);
+              else await held.cancel(context, paymentId);
+              return { ok: true };
+            },
+            (result): Record<string, string> => ('approvalsRemaining' in result ? { approvalsRemaining: String(result.approvalsRemaining), status: result.status } : {}),
+          );
+        }
+        // Not held here: a payment that was already pending at the provider. It can be approved or rejected there, not cancelled.
         const provider = await providerOf(context);
+        if (action === 'payment.cancel') throw new ApiError('not_found');
         if (!provider.capabilities.paymentApprovals) throw new ApiError('validation', { reason: 'not_supported' });
         return audited(request, context, action, { payment: paymentId }, async () => {
           await authorize(request, context, action, { paymentId });
@@ -642,6 +696,7 @@ export async function buildApp(deps: AppDeps) {
       };
       api.post('/payments/:id/approve', decide('payment.approve'));
       api.post('/payments/:id/reject', decide('payment.reject'));
+      api.post('/payments/:id/cancel', decide('payment.cancel'));
     },
     { prefix: '/v1' },
   );
@@ -666,5 +721,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, admin, auth, opsAuth, opsRoutes };
+  return { app, admin, auth, opsAuth, opsRoutes, held };
 }

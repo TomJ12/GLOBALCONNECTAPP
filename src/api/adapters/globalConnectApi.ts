@@ -286,6 +286,11 @@ export class GlobalConnectApi implements ProviderClient, AuthClient {
       headers: this.stepUpHeader('payment.approve', { paymentId }),
     });
   }
+  async cancelPayment(paymentId: string): Promise<void> {
+    await this.call(schemas.ok, 'POST', `/payments/${encodeURIComponent(paymentId)}/cancel`, {
+      headers: this.stepUpHeader('payment.cancel', { paymentId }),
+    });
+  }
   async rejectPayment(paymentId: string): Promise<void> {
     await this.call(schemas.ok, 'POST', `/payments/${encodeURIComponent(paymentId)}/reject`, {
       headers: this.stepUpHeader('payment.reject', { paymentId }),

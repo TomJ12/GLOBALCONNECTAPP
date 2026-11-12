@@ -378,6 +378,8 @@ test('N1: one session cannot write audit entries without limit; choosing the com
 
 test('M5: company selection and every money action are in the audit log, with amount, currency, payee and a hash of the key', async () => {
   h = await harness();
+  // No approval rule here: the payment goes straight to the provider and the pending one is the provider's own sample.
+  await h.policy('co_northfield', 0);
   const amira = await signedIn(AMIRA);
   const key = 'key-audit-000001';
   const body = { beneficiaryId: 'sample-beneficiary-harbour', amount: '125.00', currency: 'GBP', reference: 'INV-1', reason: 'Invoice' };

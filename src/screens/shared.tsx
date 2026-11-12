@@ -2,7 +2,7 @@
 import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Receipt } from 'lucide-react-native';
 import { View } from 'react-native';
 
-import type { Beneficiary, Payment, PaymentStatus, Transaction } from '@/api/types';
+import type { Beneficiary, Payment, PaymentHoldState, PaymentStatus, PendingApproval, Transaction } from '@/api/types';
 import { AppText } from '@/components/AppText';
 import { IconCircle, ListRow, Pill, type PillTone } from '@/components/Bits';
 import { formatRelativeDay } from '@/lib/dates';
@@ -32,13 +32,34 @@ const STATUS_LABELS: Record<PaymentStatus, { label: string; tone: PillTone }> = 
   unknown: { label: 'Status unknown', tone: 'warning' },
 };
 
-export function PaymentStatusPill({ status }: { status: PaymentStatus }) {
-  const { label, tone } = STATUS_LABELS[status];
+/** Whether this person is being asked to approve it. A payment they created, or have already approved, is waiting for someone else. */
+export const needsYourApproval = (approval: PendingApproval): boolean => (approval.payment.held ? approval.payment.held.canApprove : true);
+
+/** "A", "A or B", "A, B or C". */
+export function listNames(names: string[]): string {
+  return names.length <= 1 ? (names[0] ?? '') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+}
+
+/** A payment Global Connect held for approval says more exactly what became of it. */
+const HOLD_LABELS: Record<PaymentHoldState, { label: string; tone: PillTone }> = {
+  awaiting_approval: { label: 'Waiting for approval', tone: 'warning' },
+  sending: { label: 'Approved, sending', tone: 'tint' },
+  rejected: { label: 'Rejected', tone: 'neutral' },
+  cancelled: { label: 'Cancelled', tone: 'neutral' },
+  expired: { label: 'Expired, not sent', tone: 'neutral' },
+  payee_changed: { label: 'Payee changed, not sent', tone: 'danger' },
+  failed: { label: 'Failed', tone: 'danger' },
+};
+const statusOf = (payment: Pick<Payment, 'status' | 'held'>) =>
+  payment.held ? (payment.held.state === 'awaiting_approval' && payment.held.canApprove ? STATUS_LABELS.awaiting_approval : HOLD_LABELS[payment.held.state]) : STATUS_LABELS[payment.status];
+
+export function PaymentStatusPill({ payment }: { payment: Pick<Payment, 'status' | 'held'> }) {
+  const { label, tone } = statusOf(payment);
   return <Pill label={label} tone={tone} />;
 }
 
-export function paymentStatusLabel(status: PaymentStatus): string {
-  return STATUS_LABELS[status].label;
+export function paymentStatusLabel(payment: Pick<Payment, 'status' | 'held'>): string {
+  return statusOf(payment).label;
 }
 
 export function TransactionRow({ transaction }: { transaction: Transaction }) {
@@ -82,12 +103,12 @@ export function PaymentRow({ payment, onPress }: { payment: Payment; onPress?: (
       subtitle={`${when} · ${payment.reference}`}
       onPress={onPress}
       showChevron={onPress !== undefined}
-      accessibilityLabel={`${amount} to ${payee}. ${paymentStatusLabel(payment.status)}. ${when}. Reference ${payment.reference}`}
+      accessibilityLabel={`${amount} to ${payee}. ${paymentStatusLabel(payment)}. ${when}. Reference ${payment.reference}`}
       accessibilityHint={onPress ? 'Opens the payment for review' : undefined}
       trailing={
         <View style={{ alignItems: 'flex-end', gap: 4 }}>
           <AppText variant="bodyStrong">{amount}</AppText>
-          <PaymentStatusPill status={payment.status} />
+          <PaymentStatusPill payment={payment} />
         </View>
       }
     />

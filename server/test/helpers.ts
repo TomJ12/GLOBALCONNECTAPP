@@ -44,6 +44,9 @@ export interface Harness {
   login: (email: string, secret: string, password?: string) => Promise<Reply>;
   /** Get a step-up token for an action. */
   stepUp: (token: string, secret: string, action: string, payload: unknown) => Promise<string>;
+  /** Sets a company's payment approval rule directly (the console does it through a request). */
+  policy: (companyId: string, approvalsRequired: 0 | 1 | 2) => Promise<void>;
+  held: Awaited<ReturnType<typeof buildApp>>['held'];
   close: () => Promise<void>;
   app: Awaited<ReturnType<typeof buildApp>>['app'];
   /** The loopback-only operator listener. */
@@ -72,6 +75,12 @@ export interface HarnessOptions {
   databasePath?: string;
   maxRateWindows?: number;
   maxHeldQuotes?: number;
+  /** Called after a held payment is marked `sending` and before the provider is asked; throwing is a crash at that moment. */
+  beforeSend?: Parameters<typeof buildApp>[0]['beforeSend'];
+  /** Use these provider mocks instead of new ones (a restart keeps the provider, not the server). */
+  providers?: { a: MockCurrencycloudPlatform; b: MockEqualsServer };
+  /** Continue this clock instead of starting a new one. */
+  clock?: Harness['clock'];
   /**
    * Every store operation takes a real turn of the event loop first, as a
    * database round trip would. In-memory operations otherwise finish within
@@ -99,7 +108,7 @@ function withLatency<T extends object>(target: T, hook?: (operation: string) => 
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory(), options: HarnessOptions = {}): Promise<Harness> {
   const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, ...overrides };
-  const clock = {
+  const clock = options.clock ?? {
     now: Date.UTC(2026, 10, 11, 10, 0, 0),
     advance(ms: number) {
       clock.now += ms;
@@ -110,21 +119,27 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
   const stores = createSqliteStores({ path: options.databasePath ?? ':memory:', keys: dataKeys(TEST_DATA_KEY), now, seed: directory, audit: { notice: (message) => void warnings.push(message), ...options.audit } });
   if (options.storeLatency) {
     stores.directory = withLatency(stores.directory, options.storeHook);
+    stores.payments = withLatency(stores.payments, options.storeHook);
     stores.ops.users = withLatency(stores.ops.users, options.storeHook);
     for (const group of [stores.auth, stores.ops] as unknown as Record<string, object>[]) {
       for (const name of Object.keys(group)) if (name !== 'users') group[name] = withLatency(group[name] as object, options.storeHook);
     }
   }
-  const providerA = new MockCurrencycloudPlatform({ now, enforceOwnership: options.enforceOwnership });
-  const providerB = new MockEqualsServer({ now, enforceOwnership: options.enforceOwnership });
+  const providerA = options.providers?.a ?? new MockCurrencycloudPlatform({ now, enforceOwnership: options.enforceOwnership });
+  const providerB = options.providers?.b ?? new MockEqualsServer({ now, enforceOwnership: options.enforceOwnership });
   const registry = new ProviderRegistry({
     currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: providerA, now }),
     equals: equalsFactory({ credentials: config.providers.equals, transport: providerB, keys: stores.providerKeys, now }),
   });
   const outbox = new ConsoleOutbox(() => {});
   const logs: string[] = [];
-  const built = await buildApp({ config, stores, registry, mailer: outbox, now, logStream: { write: (line) => void logs.push(line) }, maxRateWindows: options.maxRateWindows, maxHeldQuotes: options.maxHeldQuotes });
-  const { app, auth, opsAuth, opsRoutes } = built;
+  const built = await buildApp({ config, stores, registry, mailer: outbox, now, logStream: { write: (line) => void logs.push(line) }, maxRateWindows: options.maxRateWindows, maxHeldQuotes: options.maxHeldQuotes, beforeSend: options.beforeSend });
+  const { app, auth, opsAuth, opsRoutes, held } = built;
+  const policy: Harness['policy'] = async (companyId, approvalsRequired) => {
+    const company = await stores.directory.getCompany(companyId);
+    if (!company) throw new Error(`no company ${companyId}`);
+    await stores.directory.saveCompany({ ...company, approvalsRequired });
+  };
   const admin = built.admin as NonNullable<typeof built.admin>;
   const mailedCode = (email: string): string => {
     const message = [...outbox.sent].reverse().find((item) => item.to === email);
@@ -183,7 +198,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
+  return { policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
     close: async () => {
       await app.close();
       await admin.close();

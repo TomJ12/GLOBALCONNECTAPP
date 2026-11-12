@@ -80,6 +80,26 @@ describe('GlobalConnectApi', () => {
     expect(calls[4]?.headers['X-Step-Up-Token']).toBeUndefined();
   });
 
+  it('cancels a held payment with a code bound to that payment, and reads what the server says about a held payment', async () => {
+    const held = { ...PAYMENT, id: 'hp_1', status: 'awaiting_approval', held: { state: 'awaiting_approval', createdBy: 'Cara', createdByYou: true, approvalsRequired: 1, approvals: [], expiresAt: '2026-11-13T10:00:00.000Z', canApprove: false, canCancel: true, approvers: ['Abel'] } };
+    const { api, calls } = setup({
+      ...signedIn,
+      'POST /step-up': { body: { token: 's'.repeat(40), expiresInSeconds: 120 } },
+      'POST /payments': { body: held },
+      'POST /payments/hp_1/cancel': { body: { ok: true } },
+    });
+    await api.completeSignIn('c1', '123456', 'totp');
+    const created = await api.createPayment(input);
+    expect(created.held).toMatchObject({ createdByYou: true, canApprove: false, canCancel: true, approvers: ['Abel'] });
+    await api.authorizeAction('payment.cancel', { paymentId: 'hp_1' }, '654321');
+    // A permission for one payment is not sent with another.
+    await api.cancelPayment('hp_2').catch(() => undefined);
+    expect(calls.at(-1)?.headers['X-Step-Up-Token']).toBeUndefined();
+    await api.cancelPayment('hp_1');
+    expect(calls.at(-1)).toMatchObject({ url: 'https://api.test/v1/payments/hp_1/cancel', method: 'POST' });
+    expect(calls.at(-1)?.headers['X-Step-Up-Token']).toBe('s'.repeat(40));
+  });
+
   it('maps server errors to the neutral kinds and reasons, and bad responses to malformed_response', async () => {
     const { api } = setup({
       'POST /auth/login': { status: 429, body: { error: { kind: 'rate_limited', reason: 'locked', retryAfterSeconds: 120 } } },

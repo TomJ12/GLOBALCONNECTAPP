@@ -46,7 +46,13 @@ export type ProviderErrorReason =
   | 'step_up_required'
   | 'step_up_invalid'
   | 'company_not_selected'
-  | 'not_supported';
+  | 'not_supported'
+  | 'creator_cannot_approve'
+  | 'already_approved'
+  | 'payment_expired'
+  | 'payee_changed'
+  | 'not_awaiting_approval'
+  | 'creator_unavailable';
 
 const REASON_MESSAGES: Record<ProviderErrorReason, string> = {
   invalid_credentials: 'That email and password do not match an account. Check them and try again.',
@@ -60,6 +66,12 @@ const REASON_MESSAGES: Record<ProviderErrorReason, string> = {
   step_up_invalid: 'The code check for this action has expired or does not match. Try again.',
   company_not_selected: 'Choose a company to continue.',
   not_supported: 'This is not available on your account.',
+  creator_cannot_approve: 'You created this payment, so someone else has to approve it.',
+  already_approved: 'You have already approved this payment. Someone else has to give the next approval.',
+  payment_expired: 'This payment waited too long for approval and has expired. It was not sent. Create it again if it is still needed.',
+  payee_changed: 'The payee’s bank details changed after this payment was created, so it was not sent. Create the payment again.',
+  not_awaiting_approval: 'This payment is no longer waiting for approval.',
+  creator_unavailable: 'The person who created this payment can no longer make payments for this company, so it cannot be approved. Reject it instead.',
 };
 
 const REASONS = new Set<string>(Object.keys(REASON_MESSAGES));

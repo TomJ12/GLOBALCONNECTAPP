@@ -94,4 +94,14 @@ BEGIN SELECT RAISE(ABORT, 'audit_archive is append-only: entries cannot be chang
 CREATE TRIGGER audit_archive_no_delete BEFORE DELETE ON audit_archive
 BEGIN SELECT RAISE(ABORT, 'audit_archive is append-only: entries cannot be removed'); END;
 `,
+  // 2: payment approvals. The company's policy, and the payments the server holds until they are approved.
+  `
+ALTER TABLE companies ADD COLUMN approvals_required INTEGER NOT NULL DEFAULT 1 CHECK (approvals_required IN (0, 1, 2));
+-- One JSON document per held payment. The key is derived from the company and the creator's idempotency key,
+-- so the same request can never be stored twice.
+CREATE TABLE held_payments (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE UNIQUE INDEX held_payments_id ON held_payments (json_extract(data, '$.id'));
+CREATE INDEX held_payments_company ON held_payments (json_extract(data, '$.companyId'));
+CREATE INDEX held_payments_status ON held_payments (json_extract(data, '$.status'));
+`,
 ];
