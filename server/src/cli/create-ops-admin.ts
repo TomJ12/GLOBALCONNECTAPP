@@ -3,9 +3,10 @@
  *
  * Asks the RUNNING server to create an ops admin and email them an activation
  * link (in development mode the email is printed in the server console). The
- * link is not printed here. Works only while fewer than two active staff
- * exist: four-eyes approval needs two, and after that staff are invited from
- * the ops console. Talks to the server's loopback-only operator port and
+ * link is not printed here. Works only while fewer than two active ops admins
+ * exist (staff management needs one ops admin to ask and another to approve);
+ * after that staff are invited from the ops console. The address must be at a
+ * domain in STAFF_EMAIL_DOMAINS. Talks to the server's loopback-only operator port and
  * needs ADMIN_TOKEN (the same value the server was started with).
  */
 export {};
@@ -32,7 +33,7 @@ try {
   if (!response.ok) {
     const reasons: Record<number, string> = {
       400: 'The email or name was not accepted.',
-      403: 'Refused: two active staff already exist (invite further staff from the ops console), or that email belongs to an existing staff account.',
+      403: 'Refused. Either two active ops admins already exist (invite further staff from the ops console), or the address is not at a domain in STAFF_EMAIL_DOMAINS, or it belongs to an existing staff account.',
       404: 'ADMIN_TOKEN does not match the server.',
     };
     console.error(reasons[response.status] ?? `The server answered ${response.status}.`);

@@ -13,13 +13,14 @@ import { requestLogEntry } from '../src/http/app';
 import { wireAmount } from '../src/providers/equals/adapter';
 import { createRuntime } from '../src/startup';
 import { attemptsTable, MemoryAuditLog } from '../src/store/memory';
-import { ADMIN_TOKEN, AMIRA, BEN, harness, PASSWORD, TEST_PASSWORD_COST, type Harness } from './helpers';
+import type { AuditEntry } from '../src/store/types';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, TEST_PASSWORD_COST, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example' };
+const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example' };
 const from = (address: string) => ({ 'x-forwarded-for': address });
 const login = (email: string, password: string, address?: string) => h.call('POST', '/v1/auth/login', { body: { email, password }, headers: address ? from(address) : {} });
 async function signedIn(email: string) {
@@ -94,9 +95,10 @@ test('H3: the real process. Strict start exits without printing a code; in devel
   try {
     for (let waited = 0; !output.includes('Ops console:') && waited < 300; waited += 1) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.match(output, /DEVELOPMENT MODE \(APP_ENV=development\)/);
-    // The demo seed: three clients and two staff (an ops admin and an ops user), so four-eyes can be shown.
-    assert.equal((output.match(/\/activate#code=/g) ?? []).length, 5);
+    // The demo seed: three clients and three staff (two ops admins and an ops user), so admin-approved staff management can be shown.
+    assert.equal((output.match(/\/activate#code=/g) ?? []).length, 6);
     assert.match(output, /ops\.admin@globalconnect\.example .*\(staff: ops_admin\)/);
+    assert.match(output, /ops\.admin2@globalconnect\.example .*\(staff: ops_admin\)/);
     assert.match(output, /ops\.second@globalconnect\.example .*\(staff: ops\)/);
     const post = (base: string) => fetch(`${base}/admin/invites`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${ADMIN_TOKEN}` }, body: JSON.stringify({ email: AMIRA }) });
     assert.equal((await post('http://127.0.0.1:39411')).status, 404, 'the public listener has no /admin');
@@ -302,25 +304,80 @@ test('M5: anonymous failures cannot push anything out of the audit log, are rate
   assert.equal(log.suppressed - before, 80);
 });
 
-test('M5: when the audit log is full, changes are refused rather than made unrecorded or an old entry dropped', async () => {
-  const log = new MemoryAuditLog([], () => {}, { limit: 3 });
+test('N1: a full audit segment is rotated to the archive with a loud warning; nothing is refused and the newest entries are never the ones lost', async () => {
+  const archived: AuditEntry[][] = [];
+  const warnings: string[] = [];
   const entry = (n: number) => ({ at: n, actor: { type: 'system' as const, id: null, label: 's' }, target: null, action: `e${n}`, outcome: 'success' as const, source: '', detail: {} });
-  for (const n of [1, 2, 3]) await log.append(entry(n));
-  await assert.rejects(log.append(entry(4)), /audit log is full/);
-  await assert.rejects(log.assertCapacity(), /audit log is full/);
-  assert.deepEqual((await log.query()).map((item) => item.action), ['e3', 'e2', 'e1']);
-  // An anonymous failure is still taken (it lives elsewhere) and still does not displace anything.
-  await log.append({ ...entry(5), actor: { type: 'client', id: null, label: 'x' }, outcome: 'failure' });
-  assert.deepEqual((await log.query()).map((item) => item.action), ['e5', 'e3', 'e2', 'e1']);
+  const log = new MemoryAuditLog([], () => {}, { limit: 3, warn: (message) => void warnings.push(message), archive: { write: async (segment) => (archived.push(segment), 'archive-1') } });
+  for (const n of [1, 2, 3, 4, 5]) await log.append(entry(n));
+  // The first three went to the archive, whole and in order; the newest are in the working segment.
+  assert.deepEqual(archived.map((segment) => segment.map((item) => item.action)), [['e1', 'e2', 'e3']]);
+  assert.deepEqual((await log.query()).map((item) => item.action), ['e5', 'e4']);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] ?? '', /AUDIT LOG ROTATED.*3 entries.*archive-1/);
 
-  // Through the server: once full, a state-changing request is refused before anything happens.
-  h = await harness({}, undefined, { audit: { limit: 6 } });
+  // An archive that fails loses nothing: the segment stays in memory, searchable, and the operator is told.
+  const broken = new MemoryAuditLog([], () => {}, { limit: 2, warn: (message) => void warnings.push(message), archive: { write: async () => Promise.reject(new Error('disk full')) } });
+  for (const n of [1, 2, 3]) await broken.append(entry(n));
+  assert.deepEqual((await broken.query()).map((item) => item.action), ['e3', 'e2', 'e1']);
+  assert.match(warnings.at(-1) ?? '', /AUDIT LOG ARCHIVE FAILED \(disk full\)/);
+
+  // With no archive at all (plain in-memory development) rotated segments are kept, a few; only then is the OLDEST discarded, loudly.
+  const bare = new MemoryAuditLog([], () => {}, { limit: 2, keptSegments: 1, warn: (message) => void warnings.push(message) });
+  for (const n of [1, 2, 3, 4, 5]) await bare.append(entry(n));
+  assert.deepEqual((await bare.query()).map((item) => item.action), ['e5', 'e4', 'e3']);
+  assert.equal(bare.discarded, 1);
+  assert.match(warnings.at(-1) ?? '', /OLDEST ENTRIES HAVE BEEN DISCARDED/);
+
+  // Through the server, at capacity: sign-in, sign-out, a payment, staff sign-in and containment all still work.
+  h = await harness({}, undefined, { audit: { limit: 5 } });
   const amira = await signedIn(AMIRA);
-  while ((await h.stores.audit.query({ limit: 100 })).filter((item) => !item.anonymous).length < 6) await h.call('POST', '/v1/session/company', { token: amira.token, body: { companyId: 'co_northfield' } });
-  const refused = await h.call('POST', '/v1/session/company', { token: amira.token, body: { companyId: 'co_northfield' } });
-  assert.equal(refused.status, 500);
-  assert.equal((await h.call('POST', '/v1/auth/logout', { token: amira.token })).status, 500);
-  assert.equal((await h.call('GET', '/v1/balances', { token: amira.token })).status, 200, 'reading still works, and the session was not ended unrecorded');
+  for (let index = 0; index < 12; index += 1) assert.equal((await h.call('POST', '/v1/session/company', { token: amira.token, body: { companyId: 'co_castlebrook' } })).status, 404);
+  assert.ok(h.warnings.length >= 2 && h.warnings.every((message) => /AUDIT LOG/.test(message)));
+  assert.equal((await h.call('POST', '/v1/session/company', { token: amira.token, body: { companyId: 'co_northfield' } })).status, 200);
+  assert.equal((await h.call('POST', '/v1/auth/logout', { token: amira.token })).status, 200);
+  assert.equal((await h.login(AMIRA, amira.secret)).status, 200);
+  const staff = await h.opsAuth.createUser('s@globalconnect.example', 'S', 'ops_admin');
+  void staff;
+  assert.equal((await h.app.inject({ method: 'GET', url: '/ops/login' })).statusCode, 200);
+  assert.equal((await h.adminCall('/admin/break-glass', { action: 'disable-staff', email: 's@globalconnect.example', reason: 'testing at capacity' })).status, 200);
+  // The newest entry is there; nothing was refused with a 500.
+  assert.equal((await h.stores.audit.query({ limit: 1 }))[0]?.action, 'ops.break_glass.disable');
+});
+
+test('N1: one session cannot write audit entries without limit; choosing the company already chosen writes nothing; sign-out always works', async () => {
+  const { writeRequestsPerMinute } = loadConfig({ APP_ENV: 'development' });
+  assert.equal(writeRequestsPerMinute, 60);
+  h = await harness({ writeRequestsPerMinute });
+  const dana = await signedIn(DANA);
+  const count = async () => (await h.stores.audit.query({ actor: DANA, limit: 100_000 })).length;
+  const select = (companyId: string) => h.call('POST', '/v1/session/company', { token: dana.token, body: { companyId } });
+  assert.equal((await select('co_northfield')).status, 200);
+  assert.equal((await h.stores.audit.query({ action: 'client.company_select' }))[0]?.target?.id, 'co_northfield');
+  const before = await count();
+  // The same choice again, as fast as it can be sent: no entries, and soon no service either.
+  const statuses: number[] = [];
+  for (let index = 0; index < 200; index += 1) statuses.push((await select('co_northfield')).status);
+  assert.equal(await count(), before, 'a no-op selection is not audited');
+  assert.equal(statuses.filter((status) => status === 200).length, 59);
+  assert.equal(statuses.filter((status) => status === 429).length, 141);
+  // Real changes (and refused money actions, which are audited) share that allowance: nothing more is written this minute.
+  assert.equal((await select('co_castlebrook')).status, 429);
+  assert.equal((await h.call('POST', '/v1/payments', { token: dana.token, body: {}, headers: { 'idempotency-key': 'key-flood-000001' } })).status, 429);
+  assert.equal(await count(), before);
+  // A second session of the same person does not get a fresh allowance.
+  const again = await h.login(DANA, dana.secret);
+  assert.equal((await h.call('POST', '/v1/session/company', { token: again.json.token, body: { companyId: 'co_castlebrook' } })).status, 429);
+  // Reading and signing out are not limited.
+  assert.equal((await h.call('GET', '/v1/balances', { token: dana.token })).status, 200);
+  assert.equal((await h.call('POST', '/v1/auth/logout', { token: dana.token })).status, 200);
+  // A minute later the person can act again. Without a session nothing is written to the main log at all.
+  h.clock.advance(60_001);
+  const later = await h.login(DANA, dana.secret);
+  assert.equal((await h.call('POST', '/v1/session/company', { token: later.json.token, body: { companyId: 'co_castlebrook' } })).status, 200);
+  const main = (await h.stores.audit.query({ limit: 100_000 })).filter((item) => !item.anonymous).length;
+  for (let index = 0; index < 50; index += 1) await h.call('POST', '/v1/payments', { body: { amount: '1.00' }, headers: { 'idempotency-key': `key-anon-${index.toString().padStart(6, '0')}` } });
+  assert.equal((await h.stores.audit.query({ limit: 100_000 })).filter((item) => !item.anonymous).length, main);
 });
 
 test('M5: company selection and every money action are in the audit log, with amount, currency, payee and a hash of the key', async () => {
@@ -358,7 +415,8 @@ test('M5: company selection and every money action are in the audit log, with am
   assert.equal(of('client.payment.reject', 'failure')[0]?.detail.payment, pending);
   assert.equal(of('client.beneficiary.create', 'success')[0]?.detail.payee, created.json.id);
   assert.deepEqual([of('client.conversion.book', 'success')[0]?.detail.sell, of('client.conversion.book', 'success')[0]?.detail.conversion], ['100.00 GBP', booked.json.id]);
-  assert.equal(of('client.company_select', 'success')[0]?.target?.id, 'co_northfield');
+  // Amira has one company, already selected: choosing it again is not an event. (A real choice is: see the N1 test.)
+  assert.equal(of('client.company_select', 'success').length, 0);
   assert.equal(of('client.company_select', 'failure').length, 1);
   // Never the key itself, a token or a code.
   const dump = JSON.stringify(entries);
@@ -370,7 +428,7 @@ test('M5: company selection and every money action are in the audit log, with am
 test('M6: a full attempts table drops expired counters, then idle ones, and never a live lock', async () => {
   let now = 1_000_000;
   const table = attemptsTable(() => now, { limit: 3 });
-  const record = (lockedUntil: number, updatedAt = now) => ({ failures: 5, lockedUntil, subject: 's', updatedAt });
+  const record = (lockedUntil: number, updatedAt = now) => ({ failures: 5, lockedUntil, locks: 0, subject: 's', updatedAt });
   await table.put('locked-1', record(now + 60_000));
   await table.put('locked-2', record(now + 60_000));
   await table.put('counting', record(0));
@@ -391,7 +449,7 @@ test('M6: a full attempts table drops expired counters, then idle ones, and neve
   h = await harness();
   await h.activate(AMIRA);
   for (let index = 0; index < 5; index += 1) await login(AMIRA, 'wrong password here');
-  for (let index = 0; index < 300; index += 1) await h.stores.auth.attempts.put(`password:email:flood${index}|x`, { failures: 1, lockedUntil: 0, subject: `email:flood${index}`, updatedAt: h.clock.now });
+  for (let index = 0; index < 300; index += 1) await h.stores.auth.attempts.put(`password:email:flood${index}|x`, { failures: 1, lockedUntil: 0, locks: 0, subject: `email:flood${index}`, updatedAt: h.clock.now });
   assert.equal((await login(AMIRA, PASSWORD)).status, 429);
 });
 
@@ -491,7 +549,8 @@ test('L1: passwords are hashed at N=2^17, an older hash is replaced at the next 
   }
   // A burst cannot run unbounded hashes side by side: beyond the short queue the request is refused.
   const burst = await Promise.allSettled(Array.from({ length: 100 }, () => hashPassword('correct horse battery')));
-  assert.equal(burst.filter((result) => result.status === 'fulfilled').length, 66);
+  // The client pool: two at a time and thirty-two waiting.
+  assert.equal(burst.filter((result) => result.status === 'fulfilled').length, 34);
   assert.ok(burst.filter((result) => result.status === 'rejected').every((result) => (result as PromiseRejectedResult).reason.kind === 'rate_limited'));
 });
 

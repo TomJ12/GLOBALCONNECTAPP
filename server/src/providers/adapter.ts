@@ -33,14 +33,24 @@ export class ProviderRegistry {
 
   constructor(private readonly factories: Partial<Record<ProviderKey, ProviderFactory>>) {}
 
+  /**
+   * An adapter is remembered for a company AND the exact mapping it was built
+   * for. If the mapping changes, the old adapter is simply never found again:
+   * correctness does not depend on somebody calling `invalidate` in time.
+   */
+  private keyOf(company: CompanyRecord): string {
+    return JSON.stringify([company.id, company.providerKey, company.providerAccountId, company.providerContactId]);
+  }
+
   forCompany(company: CompanyRecord): Promise<ProviderAdapter> {
-    let adapter = this.adapters.get(company.id);
+    const key = this.keyOf(company);
+    let adapter = this.adapters.get(key);
     if (!adapter) {
       const factory = this.factories[company.providerKey];
       adapter = factory ? factory.forCompany(company) : Promise.reject(new Error('No adapter configured for this company'));
-      this.adapters.set(company.id, adapter);
+      this.adapters.set(key, adapter);
       // A failed sign-in must not be remembered.
-      adapter.catch(() => this.adapters.delete(company.id));
+      adapter.catch(() => this.adapters.delete(key));
     }
     return adapter;
   }
@@ -55,8 +65,9 @@ export class ProviderRegistry {
     return (Object.keys(this.factories) as ProviderKey[]).filter((key) => this.factories[key]?.mock);
   }
 
-  /** Forget a company's adapter, so the next request signs in to the provider again. */
+  /** Forget a company's adapters, so the next request signs in to the provider again. */
   invalidate(companyId: string): void {
-    this.adapters.delete(companyId);
+    const prefix = `${JSON.stringify([companyId]).slice(0, -1)},`;
+    for (const key of this.adapters.keys()) if (key.startsWith(prefix)) this.adapters.delete(key);
   }
 }

@@ -24,7 +24,9 @@ import { safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
 import { activationMessage, maskEmail, type Mailer } from '../mailer';
 import { assertAmount } from '../money';
-import { OpsAuthService } from '../ops/auth';
+import { networkOf, sourceOf } from '../net';
+import { emailDomain, hasControlCharacters, isEmail } from '../validate';
+import { isActiveStaff, OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
@@ -51,6 +53,13 @@ export interface AppDeps {
 export function requestLogEntry(request: { method?: string; url?: string; ip?: string }) {
   return { method: request.method, url: (request.url ?? '').split('?')[0], remoteAddress: request.ip };
 }
+
+/**
+ * The client web app (and, harmlessly, JSON) is served with this policy. Scripts and connections only from this origin;
+ * styles may be inline because the web build injects its style sheet at run time; no framing by anyone.
+ */
+const WEB_APP_CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
 
 /**
  * Most addresses the rate limiter tracks. When full, windows that have run out
@@ -101,22 +110,23 @@ function header(request: FastifyRequest, name: string): string | undefined {
 const SYSTEM = { type: 'system' as const, id: null, label: 'operator command' };
 
 /**
- * Bootstrap for `npm run create-ops-admin`. Four-eyes approval needs two staff
- * members, and the console cannot create the second without the first being
- * approved by someone, so this command may create ops admins while FEWER THAN
- * TWO active staff exist (or re-send the link of one of them that is not yet
- * activated). After that it refuses and staff are invited from the console.
- * The link goes to the mailer, never back to the caller.
+ * Bootstrap for `npm run create-ops-admin`. Staff management in the console
+ * needs an ops admin to ask and a DIFFERENT ops admin to approve, so this
+ * command may create ops admins while FEWER THAN TWO active ops admins exist
+ * (or re-send the link of one that is not yet activated). After that it
+ * refuses and staff are invited from the console. The address must be at an
+ * allowed staff domain. The link goes to the mailer, never back to the caller.
  */
-export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, mailer: Mailer, email: string, name: string, at: number, source: string) {
+export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, mailer: Mailer, config: Pick<Config, 'staffEmailDomains'>, email: string, name: string, at: number, source: string) {
+  if (!config.staffEmailDomains.includes(emailDomain(email))) return null;
   const staff = await stores.ops.users.list();
-  if (staff.filter((user) => user.activatedAt !== null && user.disabledAt === null).length >= 2) return null;
+  if (staff.filter((user) => user.role === 'ops_admin' && isActiveStaff(user)).length >= 2) return null;
   const existing = await stores.ops.users.findByEmail(email);
   if (existing && (existing.role !== 'ops_admin' || existing.disabledAt !== null || existing.activatedAt !== null)) return null;
   const user = existing ?? (await opsAuth.createUser(email, name, 'ops_admin'));
   const invite = await opsAuth.createInvite(user.id);
   await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
-  await stores.audit.append({ at, actor: SYSTEM, target: { type: 'ops', id: user.id, label: user.email }, action: 'ops.bootstrap_admin', outcome: 'success', source, detail: {} });
+  await stores.audit.append({ at, actor: SYSTEM, target: { type: 'ops', id: user.id, label: user.email }, action: existing ? 'ops.bootstrap_admin' : 'ops.staff.new', outcome: 'success', source, detail: { role: 'ops_admin', how: 'operator command (bootstrap)' } });
   return { sentTo: maskEmail(user.email), expiresAt: invite.expiresAt };
 }
 
@@ -162,14 +172,58 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
   admin.post('/admin/ops-admins', async (request) => {
     const email = stringField(request.body, 'email').toLowerCase();
     const name = stringField(request.body, 'name');
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new ApiError('validation', { fields: ['email'] });
-    if (!name || name.length > 120) throw new ApiError('validation', { fields: ['name'] });
-    const sent = await bootstrapOpsAdmin(stores, opsAuth, mailer, email, name, now(), request.ip);
+    if (!isEmail(email)) throw new ApiError('validation', { fields: ['email'] });
+    if (!name || name.length > 120 || hasControlCharacters(name)) throw new ApiError('validation', { fields: ['name'] });
+    const sent = await bootstrapOpsAdmin(stores, opsAuth, mailer, config, email, name, now(), request.ip);
     if (!sent) {
       await stores.audit.append({ at: now(), actor: SYSTEM, target: { type: 'ops', id: null, label: email.slice(0, 80) }, action: 'ops.bootstrap_admin', outcome: 'failure', source: request.ip, detail: { reason: 'refused' } });
       throw new ApiError('forbidden');
     }
     return { ...sent, expiresAt: new Date(sent.expiresAt).toISOString() };
+  });
+
+  /**
+   * BREAK-GLASS. For when the console cannot help: two staff who must approve
+   * each other, a locked-out or compromised staff member, a lost
+   * authenticator. Disables a staff member, resets their authenticator (the
+   * new link is emailed to them) or clears their lockout, without a second
+   * person. It needs the admin token, this machine, and a typed reason, and it
+   * is written to the audit log where it stands out.
+   */
+  admin.post('/admin/break-glass', async (request) => {
+    const action = stringField(request.body, 'action');
+    const email = stringField(request.body, 'email').toLowerCase();
+    const reason = stringField(request.body, 'reason');
+    if (!['disable-staff', 'reset-staff', 'unlock-staff'].includes(action)) throw new ApiError('validation', { fields: ['action'] });
+    if (reason.length < 10 || reason.length > 500 || hasControlCharacters(reason)) throw new ApiError('validation', { fields: ['reason'] });
+    const user = await stores.ops.users.findByEmail(email);
+    const record = (outcome: 'success' | 'failure', detail: Record<string, string>) =>
+      stores.audit.append({ at: now(), actor: SYSTEM, target: { type: 'ops', id: user?.id ?? null, label: (user?.email ?? email).slice(0, 80) }, action: `ops.break_glass.${action.replace('-staff', '')}`, outcome, source: request.ip, detail: { reason, ...detail } });
+    if (!user) {
+      await record('failure', { why: 'not_found' });
+      throw new ApiError('not_found');
+    }
+    if (action === 'unlock-staff') {
+      await opsAuth.unlock(user);
+      await record('success', {});
+      return { done: 'unlocked', staff: maskEmail(user.email) };
+    }
+    if (action === 'disable-staff') {
+      await stores.ops.users.update(user.id, (current) => ({ ...current, disabledAt: current.disabledAt ?? now() }));
+      await stores.ops.activations.deleteWhere((item) => item.userId === user.id);
+      const sessions = await opsAuth.revokeAllSessions(user.id);
+      await record('success', { sessionsEnded: String(sessions) });
+      return { done: 'disabled', staff: maskEmail(user.email) };
+    }
+    if (user.disabledAt !== null) {
+      await record('failure', { why: 'disabled' });
+      throw new ApiError('validation', { fields: ['email'] });
+    }
+    const sessions = await opsAuth.clearCredentials(user.id);
+    const invite = await opsAuth.createInvite(user.id);
+    await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
+    await record('success', { sessionsEnded: String(sessions), sentTo: maskEmail(user.email) });
+    return { done: 'reset', staff: maskEmail(user.email), expiresAt: new Date(invite.expiresAt).toISOString() };
   });
   return admin;
 }
@@ -190,11 +244,6 @@ export async function buildApp(deps: AppDeps) {
     logger: config.log || deps.logStream ? { level: 'info', serializers: { req: requestLogEntry }, ...(deps.logStream ? { stream: deps.logStream } : {}) } : false,
   });
 
-  // Fail safe: when the audit log cannot take another entry, no change is accepted (rather than made unrecorded).
-  app.addHook('preHandler', async (request) => {
-    if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS') await deps.stores.audit.assertCapacity();
-  });
-
   if (config.corsOrigins.length > 0) {
     await app.register(cors, {
       origin: config.corsOrigins,
@@ -207,6 +256,11 @@ export async function buildApp(deps: AppDeps) {
   app.addHook('onSend', async (_request, reply) => {
     reply.header('Cache-Control', 'no-store');
     reply.header('X-Content-Type-Options', 'nosniff');
+    // Nothing this server sends may be shown inside another site's frame: not the API, not the client web app.
+    // (The ops console replaces this policy with its own, stricter one.)
+    reply.header('X-Frame-Options', 'DENY');
+    reply.header('Content-Security-Policy', WEB_APP_CSP);
+    reply.header('Referrer-Policy', 'no-referrer');
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -228,29 +282,62 @@ export async function buildApp(deps: AppDeps) {
     return reply.status(apiError.status).send(apiError.body());
   });
 
-  // --- Per-address rate limit on the unauthenticated and code-checking routes ---
-  const windows = new Map<string, { startedAt: number; count: number }>();
-  const maxRateWindows = deps.maxRateWindows ?? MAX_RATE_WINDOWS;
-  const limitAttempts = async (request: FastifyRequest): Promise<void> => {
-    const at = now();
-    const entry = windows.get(request.ip);
-    if (!entry || at - entry.startedAt >= 60_000) {
-      windows.delete(request.ip);
-      if (windows.size >= maxRateWindows) {
-        // Make room without resetting anyone who is still inside their window.
-        for (const [address, window] of windows) if (at - window.startedAt >= 60_000) windows.delete(address);
-        if (windows.size >= maxRateWindows) throw new ApiError('rate_limited', { retryAfterSeconds: 60 });
+  // --- Rate limits ------------------------------------------------------------------
+  /**
+   * One counter per key per minute. When the table is tracking its maximum
+   * number of keys, windows that have run out are dropped; if every key is
+   * still inside its minute a NEW key is refused. Nobody's count is ever
+   * reset to make room.
+   */
+  const limiter = (max: number) => {
+    const windows = new Map<string, { startedAt: number; count: number }>();
+    return (key: string, allowed: number): void => {
+      const at = now();
+      const entry = windows.get(key);
+      if (!entry || at - entry.startedAt >= 60_000) {
+        windows.delete(key);
+        if (windows.size >= max) {
+          for (const [other, window] of windows) if (at - window.startedAt >= 60_000) windows.delete(other);
+          if (windows.size >= max) throw new ApiError('rate_limited', { retryAfterSeconds: 60 });
+        }
+        windows.set(key, { startedAt: at, count: 1 });
+        return;
       }
-      windows.set(request.ip, { startedAt: at, count: 1 });
-      return;
-    }
-    entry.count += 1;
-    if (entry.count > config.authRequestsPerMinute) {
-      throw new ApiError('rate_limited', { retryAfterSeconds: Math.ceil((entry.startedAt + 60_000 - at) / 1000) });
-    }
+      entry.count += 1;
+      if (entry.count > allowed) throw new ApiError('rate_limited', { retryAfterSeconds: Math.ceil((entry.startedAt + 60_000 - at) / 1000) });
+    };
+  };
+  const bySource = limiter(deps.maxRateWindows ?? MAX_RATE_WINDOWS);
+  const byNetwork = limiter(deps.maxRateWindows ?? MAX_RATE_WINDOWS);
+  const byAccount = limiter(MAX_RATE_WINDOWS);
+
+  /**
+   * Unauthenticated and code-checking routes. Counted per source (an IPv4
+   * address, or a whole IPv6 /64: one customer owns every address in it) and,
+   * with a larger allowance, per IPv4 /24, so hopping between neighbouring
+   * addresses does not multiply the allowance for long.
+   */
+  const limitAttempts = async (request: FastifyRequest): Promise<void> => {
+    const source = sourceOf(request.ip);
+    const network = networkOf(request.ip);
+    if (network !== source) byNetwork(network, config.authRequestsPerNetworkPerMinute);
+    bySource(source, config.authRequestsPerMinute);
   };
 
-  const sessionOf = (request: FastifyRequest): Promise<SessionContext> => auth.authenticate(bearer(request));
+  /**
+   * Every state-changing request of a signed-in client is counted, per person
+   * and per session. These are the requests that write audit entries, so one
+   * session cannot write them without limit. Sign-out does not come through
+   * here and always works.
+   */
+  const sessionOf = async (request: FastifyRequest): Promise<SessionContext> => {
+    const context = await auth.authenticate(bearer(request));
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      byAccount(`user:${context.user.id}`, config.writeRequestsPerMinute);
+      byAccount(`session:${context.session.id}`, config.writeRequestsPerMinute);
+    }
+    return context;
+  };
 
   const companyOf = async (request: FastifyRequest): Promise<CompanyContext> => {
     const context = await sessionOf(request);

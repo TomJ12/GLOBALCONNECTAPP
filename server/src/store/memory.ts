@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 
 import type {
   AttemptRecord,
+  AuditArchive,
   AuditEntry,
   AuditFilter,
   AuditLog,
@@ -226,8 +227,14 @@ export class MemoryOpsDirectory implements OpsDirectory {
 }
 
 export interface AuditOptions {
-  /** Most entries the main log holds. When reached, append and assertCapacity throw: nothing is dropped. */
+  /** Entries the working segment of the main log holds before it is moved to the archive. */
   limit?: number;
+  /** Where full segments go. Without one they are kept in memory, a few at most. */
+  archive?: AuditArchive;
+  /** Archived segments kept in memory (and searchable) when there is no archive, or when writing to it failed. */
+  keptSegments?: number;
+  /** Told, loudly, whenever a segment is rotated or (only without an archive) discarded. */
+  warn?: (message: string) => void;
   /** Size of the ring that holds failures by unidentified actors. */
   anonymousLimit?: number;
   /** Anonymous failures recorded per source address per minute; the rest are counted, not stored. */
@@ -238,34 +245,69 @@ const ANONYMOUS_LABEL_LENGTH = 80;
 
 /**
  * Append-only: the class has no method that changes or removes a main entry.
- * PLACEHOLDER: held in memory. A real deployment needs durable, write-once
- * storage with shipping and retention; this one stops accepting changes when
- * full instead of forgetting its oldest entries.
+ *
+ * PLACEHOLDER: held in memory. The working segment is bounded; when it is
+ * full it is ROTATED to the archive and a new one started, so appending never
+ * fails and the newest entries are never the ones lost. Nothing is refused
+ * because the log is "full". Without an archive (plain in-memory development
+ * runs) a few rotated segments are kept in memory and the oldest is discarded
+ * with a loud warning. A real deployment needs durable, write-once storage
+ * with shipping and retention.
  */
 export class MemoryAuditLog implements AuditLog {
-  private readonly entries: AuditEntry[];
+  private entries: AuditEntry[];
+  /** Rotated segments still held in memory, oldest first. */
+  private kept: AuditEntry[][] = [];
   /** Failures by nobody we can identify. A ring: bounded, and separate, so it can never evict or fill the main log. */
   private anonymous: AuditEntry[] = [];
   private readonly windows = new Map<string, { startedAt: number; count: number }>();
   /** Anonymous failures not stored because their source was over its rate. */
   suppressed = 0;
+  /** How many segments have been rotated out, and how many of those were discarded for want of an archive. */
+  rotations = 0;
+  discarded = 0;
   private readonly limit: number;
   private readonly anonymousLimit: number;
   private readonly anonymousPerMinute: number;
+  private readonly keptSegments: number;
+  private readonly warn: (message: string) => void;
 
   constructor(
     initial: AuditEntry[] = [],
     private readonly changed: Changed = nothing,
-    options: AuditOptions = {},
+    private readonly options: AuditOptions = {},
   ) {
     this.entries = structuredClone(initial);
     this.limit = options.limit ?? 100_000;
     this.anonymousLimit = options.anonymousLimit ?? 5_000;
     this.anonymousPerMinute = options.anonymousPerMinute ?? 20;
+    this.keptSegments = options.keptSegments ?? 4;
+    this.warn = options.warn ?? ((message) => console.error(message));
   }
 
-  async assertCapacity(): Promise<void> {
-    if (this.entries.length >= this.limit) throw new Error('The audit log is full. Changes are refused until it has been archived.');
+  /** Moves the full working segment out and starts a new one. Never throws: an entry is not lost because archiving failed. */
+  private async rotate(): Promise<void> {
+    const segment = this.entries;
+    this.entries = [];
+    this.rotations += 1;
+    const span = `${segment.length} entries, ${new Date(segment[0]?.at ?? 0).toISOString()} to ${new Date(segment.at(-1)?.at ?? 0).toISOString()}`;
+    if (this.options.archive) {
+      try {
+        const where = await this.options.archive.write(segment);
+        this.warn(`AUDIT LOG ROTATED: the working segment was full (${span}) and has been archived to ${where}. Recording continues. Archived segments are not shown in the ops console.`);
+        return;
+      } catch (error) {
+        this.warn(`AUDIT LOG ARCHIVE FAILED (${error instanceof Error ? error.message : 'unknown error'}): the segment (${span}) is being held in memory instead. FIX THE ARCHIVE.`);
+      }
+    }
+    this.kept.push(segment);
+    if (this.kept.length > this.keptSegments) {
+      const lost = this.kept.shift() as AuditEntry[];
+      this.discarded += 1;
+      this.warn(`AUDIT LOG: ${lost.length} OF THE OLDEST ENTRIES HAVE BEEN DISCARDED (up to ${new Date(lost.at(-1)?.at ?? 0).toISOString()}) because no archive is configured and the in-memory limit was reached. Configure an audit archive.`);
+    } else if (!this.options.archive) {
+      this.warn(`AUDIT LOG ROTATED: the working segment was full (${span}). No archive is configured, so it is kept in memory; the oldest segment is discarded after ${this.keptSegments}. Configure an audit archive.`);
+    }
   }
 
   async append(entry: Omit<AuditEntry, 'id' | 'anonymous'>): Promise<void> {
@@ -285,7 +327,7 @@ export class MemoryAuditLog implements AuditLog {
       // Not persisted: anonymous noise must not cause writes.
       return;
     }
-    await this.assertCapacity();
+    if (this.entries.length >= this.limit) await this.rotate();
     this.entries.push(structuredClone({ ...entry, id }));
     this.changed();
   }
@@ -293,7 +335,7 @@ export class MemoryAuditLog implements AuditLog {
   async query(filter: AuditFilter = {}): Promise<AuditEntry[]> {
     const has = (party: AuditEntry['actor'] | null, wanted: string | undefined) =>
       !wanted || (party !== null && `${party.label} ${party.id ?? ''}`.toLowerCase().includes(wanted.trim().toLowerCase()));
-    const all = [...this.entries, ...this.anonymous].sort((a, b) => a.at - b.at);
+    const all = [...this.kept.flat(), ...this.entries, ...this.anonymous].sort((a, b) => a.at - b.at);
     const out: AuditEntry[] = [];
     for (let index = all.length - 1; index >= 0 && out.length < (filter.limit ?? 500); index -= 1) {
       const entry = all[index] as AuditEntry;
@@ -305,7 +347,7 @@ export class MemoryAuditLog implements AuditLog {
     }
     return out;
   }
-  /** The main log only. */
+  /** The working segment of the main log only. */
   snapshot(): AuditEntry[] {
     return structuredClone(this.entries);
   }
@@ -339,7 +381,6 @@ export function createMemoryOpsStore(now: () => number = Date.now): OpsStore {
     sessions: new MemoryTable(),
     attempts: attemptsTable(now),
     approvals: new MemoryTable(),
-    preSessions: new MemoryTable({ limit: 50_000, expired: (row) => row.expiresAt <= now() }),
   };
 }
 

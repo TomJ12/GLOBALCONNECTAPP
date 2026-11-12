@@ -10,6 +10,7 @@
     "dev": "tsx watch --env-file=.env.development --env-file-if-exists=.env src/index.ts",
     "invite": "tsx --env-file-if-exists=.env src/cli/invite.ts",
     "create-ops-admin": "tsx --env-file-if-exists=.env src/cli/create-ops-admin.ts",
+    "break-glass": "tsx --env-file-if-exists=.env src/cli/break-glass.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"
   },

@@ -55,6 +55,8 @@ export interface Harness {
   providerA: MockCurrencycloudPlatform;
   providerB: MockEqualsServer;
   logs: string[];
+  /** What the server told the operator loudly (audit rotation). */
+  warnings: string[];
   opsAuth: Awaited<ReturnType<typeof buildApp>>['opsAuth'];
   opsRoutes: { method: string; url: string }[];
 }
@@ -72,15 +74,18 @@ export interface HarnessOptions {
    * race tests would then pass whatever the code did.
    */
   storeLatency?: boolean;
+  /** Called before each store operation when storeLatency is on (for example to move the clock in the middle of a request). */
+  storeHook?: (operation: string) => void;
 }
 
-function withLatency<T extends object>(target: T): T {
+function withLatency<T extends object>(target: T, hook?: (operation: string) => void): T {
   return new Proxy(target, {
     get(object, property, receiver) {
       const value = Reflect.get(object, property, receiver);
       if (typeof value !== 'function') return value;
       return async (...args: unknown[]) => {
         await new Promise((resolve) => setImmediate(resolve));
+        hook?.(String(property));
         return (value as (...inner: unknown[]) => unknown).apply(object, args);
       };
     },
@@ -88,7 +93,7 @@ function withLatency<T extends object>(target: T): T {
 }
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory(), options: HarnessOptions = {}): Promise<Harness> {
-  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, ...overrides };
+  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, ...overrides };
   const clock = {
     now: Date.UTC(2026, 10, 11, 10, 0, 0),
     advance(ms: number) {
@@ -96,12 +101,13 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     },
   };
   const now = () => clock.now;
-  const stores = createMemoryStores(directory, now, options.audit);
+  const warnings: string[] = [];
+  const stores = createMemoryStores(directory, now, { warn: (message) => void warnings.push(message), ...options.audit });
   if (options.storeLatency) {
-    stores.directory = withLatency(stores.directory);
-    stores.ops.users = withLatency(stores.ops.users);
+    stores.directory = withLatency(stores.directory, options.storeHook);
+    stores.ops.users = withLatency(stores.ops.users, options.storeHook);
     for (const group of [stores.auth, stores.ops] as unknown as Record<string, object>[]) {
-      for (const name of Object.keys(group)) if (name !== 'users') group[name] = withLatency(group[name] as object);
+      for (const name of Object.keys(group)) if (name !== 'users') group[name] = withLatency(group[name] as object, options.storeHook);
     }
   }
   const providerA = new MockCurrencycloudPlatform({ now, enforceOwnership: options.enforceOwnership });
@@ -172,7 +178,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs,
+  return { config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
     close: async () => {
       await app.close();
       await admin.close();

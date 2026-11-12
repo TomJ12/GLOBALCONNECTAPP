@@ -123,9 +123,13 @@ async function fourEyes(requester: Staff, approver: Staff, url: string, form: Re
   return { id, approved, record: await h.stores.ops.approvals.get(id) };
 }
 
-/** An ops admin and an ops user, both signed in. */
+/** Two ops admins, both signed in: between them they can ask for and approve anything. */
 async function pair(): Promise<{ admin: Staff; second: Staff }> {
-  return { admin: await staff(), second: await staff('second@globalconnect.example', 'ops') };
+  return { admin: await staff(), second: await staff('second@globalconnect.example', 'ops_admin') };
+}
+/** An ops admin and an ops USER. */
+async function adminAndOps(): Promise<{ admin: Staff; second: Staff }> {
+  return { admin: await staff(), second: await staff('olu@globalconnect.example', 'ops') };
 }
 
 test('ops: activation, sign-in, cookie and security headers, uniform errors, lockout, idle timeout', async () => {
@@ -187,7 +191,7 @@ test('ops cookie: over https it is __Host-, Secure, with HSTS; a recovery code s
     const browser = new Browser();
     const page = await browser.get('/ops/login');
     assert.equal(page.headers['strict-transport-security'], 'max-age=31536000');
-    assert.match(browser.setCookies[0] ?? '', /^__Host-gc_ops_pre=[\w-]+; Path=\/; HttpOnly; SameSite=Strict; Secure$/);
+    assert.match(browser.setCookies[0] ?? '', /^__Host-gc_ops_pre=[\w.-]+; Path=\/; HttpOnly; SameSite=Strict; Secure$/);
     const first = await browser.post('/ops/login', { email: account.email, password: OPS_PASSWORD });
     const challengeId = /name="challengeId" value="([^"]+)"/.exec(first.body)?.[1] ?? '';
     const reply = await browser.post('/ops/login/verify', { challengeId, code: account.recoveryCodes[0] as string, method: 'recovery' });
@@ -203,9 +207,9 @@ test('ops cookie: over https it is __Host-, Secure, with HSTS; a recovery code s
   assert.equal((await new Browser().get('/ops/login')).headers['strict-transport-security'], undefined);
 });
 
-test('ops: roles. ops manages clients but not staff or company mappings; ops_admin does', async () => {
+test('ops: roles. ops manages clients but not staff or company mappings, and cannot approve them; ops_admin does', async () => {
   h = await harness();
-  const { admin, second: olu } = await pair();
+  const { admin, second: olu } = await adminAndOps();
   assert.equal((await olu.browser.get('/ops/staff')).status, 403);
   assert.equal((await olu.browser.get(`/ops/staff/${admin.id}`)).status, 403);
   assert.equal((await olu.browser.get('/ops/companies/new')).status, 403);
@@ -232,13 +236,47 @@ test('ops: roles. ops manages clients but not staff or company mappings; ops_adm
   // A refused action is logged against what it was aimed at.
   assert.ok(refused.some((entry) => entry.action === 'ops.company.edit' && entry.target?.id === 'co_castlebrook'));
 
-  // The ops user can rename a company (no mapping change: no approval needed) and manage clients.
-  assert.equal((await olu.act('/ops/companies/co_castlebrook', { name: 'Castlebrook Imports Limited', provider: 'provider-b', providerAccountId: 'S00001', providerContactId: 'sample-person-0001' })).location, '/ops/companies/co_castlebrook?done=saved');
-  assert.equal((await h.stores.directory.getCompany('co_castlebrook'))?.name, 'Castlebrook Imports Limited');
-  assert.equal((await olu.act('/ops/users/usr_ben/disable')).status, 303);
-  // The admin creates the company, with the ops user as the second pair of eyes.
-  await fourEyes(admin, olu, '/ops/companies', newCompany);
+  // N3: an ops USER cannot be the second pair of eyes for staff management or for a company's mapping.
+  const boss = await staff('boss@globalconnect.example', 'ops_admin');
+  const requests: string[] = [];
+  for (const [url, form] of [
+    ['/ops/staff', { name: 'New Person', email: 'new.person@globalconnect.example', role: 'ops_admin' }],
+    [`/ops/staff/${boss.id}/role`, { role: 'ops' }],
+    [`/ops/staff/${boss.id}/disable`, {}],
+    [`/ops/staff/${boss.id}/reset-authenticator`, { verification: 'verified in person at the office' }],
+    [`/ops/staff/${boss.id}/unlock`, {}],
+    ['/ops/companies', newCompany],
+    ['/ops/companies/co_castlebrook', { name: 'Castlebrook Imports Ltd', provider: 'provider-b', providerAccountId: 'S00003' }],
+  ] as const) {
+    const asked = await admin.act(url, form);
+    assert.match(asked.location, /^\/ops\/approvals\//, url);
+    const id = idOf(asked.location);
+    requests.push(id);
+    const page = (await olu.browser.get(`/ops/approvals/${id}`)).body;
+    assert.match(page, /Only an ops admin can approve this kind of request/);
+    assert.doesNotMatch(page, new RegExp(`action="/ops/approvals/${id}/approve"`));
+    const tried = await olu.act(`/ops/approvals/${id}/approve`);
+    assert.equal(tried.status, 403, url);
+  }
+  assert.equal((await h.stores.ops.users.list()).length, 3);
+  assert.equal((await h.stores.ops.users.get(olu.id))?.role, 'ops');
+  assert.equal((await h.stores.ops.users.get(boss.id))?.disabledAt, null);
+  assert.equal((await h.stores.directory.listCompanies()).length, 2);
+  assert.equal((await h.stores.directory.getCompany('co_castlebrook'))?.providerAccountId, 'S00001');
+  assert.equal(h.outbox.sent.length, 0);
+  assert.equal((await audit('ops.approval.approve')).filter((entry) => entry.outcome === 'failure' && entry.detail.reason === 'admin_approval').length, 7);
+  // The other ops admin can. (boss cannot approve the two requests that are about boss.)
+  assert.equal((await boss.act(`/ops/approvals/${requests[5]}/approve`)).status, 303);
   assert.equal((await h.stores.directory.listCompanies()).length, 3);
+  assert.equal((await boss.act(`/ops/approvals/${requests[2]}/approve`)).status, 403);
+
+  // What an ops user CAN do: act on clients, and ask for a rename, which any other staff member may approve.
+  assert.equal((await olu.act('/ops/users/usr_ben/disable')).status, 303);
+  const rename = await olu.act('/ops/companies/co_northfield', { name: 'Northfield Trading Limited', provider: 'provider-a', providerAccountId: 'sample-account-0001', providerContactId: 'sample-contact-0001' });
+  assert.match(rename.location, /^\/ops\/approvals\//);
+  assert.equal((await h.stores.directory.getCompany('co_northfield'))?.name, 'Northfield Trading Ltd');
+  assert.equal((await admin.act(`/ops/approvals/${idOf(rename.location)}/approve`)).status, 303);
+  assert.equal((await h.stores.directory.getCompany('co_northfield'))?.name, 'Northfield Trading Limited');
 });
 
 test('ops: every action needs a fresh code and is written to the audit log', async () => {
@@ -256,14 +294,15 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
   assert.ok(toApprove && toReject && toCancel);
 
   const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate)/.test(route.url));
-  assert.ok(actions.length >= 22, `only ${actions.length} action routes`);
+  assert.ok(actions.length >= 23, `only ${actions.length} action routes`);
   const urlOf = (route: string) =>
     route.startsWith('/ops/approvals')
       ? route.replace(':id', route.endsWith('approve') ? toApprove : route.endsWith('reject') ? toReject : toCancel)
       : route.replace(':id', route.startsWith('/ops/companies') ? 'co_castlebrook' : route.startsWith('/ops/staff') ? (route.includes('reset') ? third.id : pending.id) : route.includes('reset') ? 'usr_amira' : ben);
   const formOf = (route: string, n: number): Record<string, string> => ({
     name: route === '/ops/companies/:id' ? 'Castlebrook Imports Ltd' : 'Tideway Ltd',
-    email: `person${n}@tideway.example`,
+    // Staff must be at an allowed staff domain; clients are wherever they are.
+    email: route === '/ops/staff' ? `person${n}@globalconnect.example` : `person${n}@tideway.example`,
     // Creating takes a free provider A account; editing re-points Castlebrook to a free provider B account.
     ...(route === '/ops/companies/:id' ? { provider: 'provider-b', providerAccountId: 'S00003' } : { provider: 'provider-a', providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0002' }),
     company1: 'co_northfield',
@@ -327,11 +366,11 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
     }
   }
   assert.deepEqual(viaApproval.sort(), [
-    'ops.client.activation_link', 'ops.client.create', 'ops.client.membership.set', 'ops.client.reset_authenticator', 'ops.company.create', 'ops.company.edit',
-    'ops.staff.activation_link', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.invite', 'ops.staff.reset_authenticator', 'ops.staff.role',
+    'ops.client.activation_link', 'ops.client.create', 'ops.client.enable', 'ops.client.membership.set', 'ops.client.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.company.reactivate',
+    'ops.staff.activation_link', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.invite', 'ops.staff.reset_authenticator', 'ops.staff.role', 'ops.staff.unlock',
   ]);
   const names = new Set((await audit()).map((entry) => entry.action));
-  for (const name of ['ops.company.deactivate', 'ops.company.reactivate', 'ops.client.membership.remove', 'ops.client.unlock', 'ops.client.revoke_sessions', 'ops.client.disable', 'ops.client.enable', 'ops.approval.reject', 'ops.approval.cancel', 'ops.step_up', 'client.session_revoked', 'ops.session_revoked']) {
+  for (const name of ['ops.company.deactivate', 'ops.client.membership.remove', 'ops.client.unlock', 'ops.client.revoke_sessions', 'ops.client.disable', 'ops.staff.new', 'ops.approval.reject', 'ops.approval.cancel', 'ops.step_up', 'client.session_revoked', 'ops.session_revoked']) {
     assert.ok(names.has(name), `no audit entry for ${name}`);
   }
   const reset = (await audit('ops.client.reset_authenticator')).find((entry) => entry.outcome === 'success');
@@ -418,7 +457,7 @@ test('separation: a client session never works on /ops and an ops session never 
 
 test('ops: an admin cannot demote, disable or reset themselves, and the last active admin cannot be removed', async () => {
   h = await harness();
-  const { admin, second } = await pair();
+  const { admin, second } = await adminAndOps();
   assert.equal((await admin.act(`/ops/staff/${admin.id}/role`, { role: 'ops' })).status, 403);
   assert.equal((await admin.act(`/ops/staff/${admin.id}/disable`)).status, 403);
   assert.equal((await admin.act(`/ops/staff/${admin.id}/reset-authenticator`, { verification: 'it is me, honestly' })).status, 403);
@@ -444,7 +483,10 @@ test('ops: an admin cannot demote, disable or reset themselves, and the last act
   assert.equal((await admin.act(`/ops/approvals/${request}/approve`)).status, 403);
   assert.equal((await boss.act(`/ops/approvals/${request}/approve`)).status, 403);
   assert.equal((await h.stores.ops.users.get(admin.id))?.disabledAt, null);
-  assert.equal((await second.act(`/ops/approvals/${request}/approve`)).status, 303);
+  // ...and nor can an ops user: disabling staff needs a second ops ADMIN.
+  assert.equal((await second.act(`/ops/approvals/${request}/approve`)).status, 403);
+  const fourth = await staff('fourth@globalconnect.example', 'ops_admin');
+  assert.equal((await fourth.act(`/ops/approvals/${request}/approve`)).status, 303);
   assert.equal((await admin.browser.get('/ops/staff')).status, 303, 'disabling ends the staff session');
   assert.equal((await signIn(new Browser(), admin.email, admin.secret)).status, 400, 'a disabled staff member cannot sign in');
   // Now boss is the last active admin: a request to demote boss cannot even be made by boss.
@@ -541,7 +583,12 @@ test('ops: disable ends sessions and blocks sign-in and activation; unlock and r
   const refused = await h.call('POST', '/v1/auth/login', { body: { email: AMIRA, password: PASSWORD } });
   const wrong = await h.call('POST', '/v1/auth/login', { body: { email: 'nobody@nowhere.example', password: PASSWORD } });
   assert.deepEqual([refused.status, refused.json], [wrong.status, wrong.json]);
-  assert.equal((await admin.act('/ops/users/usr_amira/enable')).status, 303);
+  // N7: re-enabling gives the old credentials back, so one staff member cannot do it alone.
+  const asked = await admin.act('/ops/users/usr_amira/enable');
+  assert.match(asked.location, /^\/ops\/approvals\//);
+  assert.equal((await h.call('POST', '/v1/auth/login', { body: { email: AMIRA, password: PASSWORD } })).status, 400, 'still disabled until a second person approves');
+  assert.equal((await admin.act(`/ops/approvals/${idOf(asked.location)}/approve`)).status, 403);
+  assert.equal((await second.act(`/ops/approvals/${idOf(asked.location)}/approve`)).status, 303);
   assert.equal((await h.login(AMIRA, secret)).status, 200);
 
   // A disabled person cannot use an activation link either: not one issued before, not a new one.
@@ -680,7 +727,8 @@ test('four-eyes can be switched off only in explicit development mode, and then 
 
 test('H2: a company can be mapped only by an ops admin, with approval, to a real provider account that no other company uses', async () => {
   h = await harness();
-  const { admin, second } = await pair();
+  const { admin, second } = await adminAndOps();
+  const boss = await staff('boss@globalconnect.example', 'ops_admin');
   const amira = await h.activate(AMIRA);
   const session = (await h.login(AMIRA, amira.secret)).json.token as string;
   const create = (who: Staff, form: Record<string, string>) => who.act('/ops/companies', { name: 'Shell Ltd', ...form });
@@ -711,17 +759,17 @@ test('H2: a company can be mapped only by an ops admin, with approval, to a real
   // A legitimate re-point: ops admin asks, the request says whose sessions will end, a second person approves, the sessions end.
   const asked = await edit(admin, 'co_northfield', { ...northfield, providerAccountId: 'sample-account-0003', providerContactId: 'sample-contact-0003' });
   assert.match(asked.location, /^\/ops\/approvals\//);
-  const detail = (await second.browser.get(asked.location)).body;
+  const detail = (await boss.browser.get(asked.location)).body;
   assert.match(detail, /re-points the company at a different provider account/);
   assert.match(detail, /2 people are attached to it; ALL of their sessions will be ended/);
   assert.equal((await h.call('GET', '/v1/balances', { token: session })).status, 200);
-  assert.equal((await second.act(`/ops/approvals/${idOf(asked.location)}/approve`)).status, 303);
+  assert.equal((await boss.act(`/ops/approvals/${idOf(asked.location)}/approve`)).status, 303);
   assert.equal((await h.stores.directory.getCompany('co_northfield'))?.providerAccountId, 'sample-account-0003');
   assert.equal((await h.call('GET', '/v1/balances', { token: session })).status, 401, 'sessions of the attached people are ended');
   const entry = (await audit('ops.company.edit')).find((item) => item.outcome === 'success');
-  assert.deepEqual([entry?.detail.mapping, entry?.detail.sessionsEnded, entry?.detail.approvedBy], ['changed', '1', second.email]);
+  assert.deepEqual([entry?.detail.mapping, entry?.detail.sessionsEnded, entry?.detail.approvedBy], ['changed', '1', boss.email]);
   // The freed account can now be used by a new company.
-  await fourEyes(admin, second, '/ops/companies', { ...northfield, name: 'New Ltd' });
+  await fourEyes(admin, boss, '/ops/companies', { ...northfield, name: 'New Ltd' });
 });
 
 test('audit log: records client and staff authentication, holds no secret, and cannot be changed over HTTP', async () => {
@@ -840,7 +888,7 @@ test('ops cannot: see credentials, balances or transactions, or move money', asy
   assert.equal(h.providerA.seen.length + h.providerB.seen.length, providerCalls);
 });
 
-test('bootstrap: the operator command creates ops admins only while fewer than two staff are active, and emails the link', async () => {
+test('bootstrap: the operator command creates ops admins only while fewer than two ops admins are active, and emails the link', async () => {
   h = await harness();
   const body = { email: 'First.Admin@globalconnect.example', name: 'First Admin' };
   assert.equal((await h.call('POST', '/admin/ops-admins', { token: ADMIN_TOKEN, body })).status, 404, 'not on the public listener');
@@ -860,15 +908,22 @@ test('bootstrap: the operator command creates ops admins only while fewer than t
   await visitor.get('/ops/activate');
   assert.equal((await visitor.post('/ops/activate', { activationCode: firstCode })).status, 400);
 
-  // A second admin can be bootstrapped (four-eyes needs two people); a third cannot.
+  // N4: it stays open until there are TWO active ops admins (staff management needs one to ask and another to approve).
   await staff('first.admin@globalconnect.example');
   assert.equal((await h.adminCall('/admin/ops-admins', body)).status, 403, 'an activated account is not re-invited');
-  assert.equal((await h.adminCall('/admin/ops-admins', { email: 'second@globalconnect.example', name: 'Second' })).status, 200);
+  await staff('helper@globalconnect.example', 'ops');
+  assert.equal((await h.adminCall('/admin/ops-admins', { email: 'second@globalconnect.example', name: 'Second' })).status, 200, 'two active staff, but only one ops admin');
+  // N3: only at an allowed staff domain, and only a clean name.
+  assert.equal((await h.adminCall('/admin/ops-admins', { email: 'me@evil.example', name: 'Me' })).status, 403);
+  assert.equal((await h.adminCall('/admin/ops-admins', { email: 'x\'"<b>@globalconnect.example', name: 'X' })).status, 400);
+  assert.equal((await h.adminCall('/admin/ops-admins', { email: 'third@globalconnect.example', name: 'Third\nBcc: everyone@evil.example' })).status, 400);
   await staff('second@globalconnect.example');
   const refused = await h.adminCall('/admin/ops-admins', { email: 'third@globalconnect.example', name: 'Third' });
   assert.equal(refused.status, 403);
-  assert.equal((await h.stores.ops.users.list()).length, 2);
-  assert.deepEqual((await audit('ops.bootstrap_admin')).map((entry) => entry.outcome).sort(), ['failure', 'failure', 'success', 'success', 'success']);
+  assert.equal((await h.stores.ops.users.list()).length, 3);
+  // A new member of staff is written where it is looked for.
+  assert.deepEqual((await audit('ops.staff.new')).map((entry) => [entry.target?.label, entry.detail.role]).sort(), [['first.admin@globalconnect.example', 'ops_admin'], ['second@globalconnect.example', 'ops_admin']]);
+  assert.match((await (await staff('viewer@globalconnect.example', 'ops')).browser.get('/ops/audit?action=ops.staff.new')).body, /<tr class="alert">/);
 });
 
 test('file store: accounts, requests and the audit log survive a restart; a damaged file is refused; development mode only', async () => {
@@ -890,7 +945,7 @@ test('file store: accounts, requests and the audit log survive a restart; a dama
     // An anonymous failed sign-in (attempt counter + anonymous audit entry) does not rewrite the file.
     const written = readFileSync(file, 'utf8');
     const modified = statSync(file).mtimeMs;
-    await first.auth.attempts.put('password:email:x|1.2.3.4', { failures: 2, lockedUntil: 0, subject: 'email:x', updatedAt: 1 });
+    await first.auth.attempts.put('password:email:x|1.2.3.4', { failures: 2, lockedUntil: 0, locks: 0, subject: 'email:x', updatedAt: 1 });
     await first.audit.append({ at: 8, actor: { type: 'client', id: null, label: 'x' }, target: null, action: 'client.sign_in', outcome: 'failure', source: '1.2.3.4', detail: {} });
     assert.equal(readFileSync(file, 'utf8'), written);
     assert.equal(statSync(file).mtimeMs, modified);
@@ -907,12 +962,12 @@ test('file store: accounts, requests and the audit log survive a restart; a dama
     assert.equal((await second.providerKeys.get('co_new:key:k1'))?.orderId, 'o1');
     assert.equal(await second.auth.sessions.get('token-hash'), null, 'sessions are not kept: a restart signs everyone out');
     assert.deepEqual((await second.audit.query()).map((entry) => [entry.action, entry.detail]), [['test.event', { a: 'b' }]]);
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).version, 2);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).version, 3);
 
     // Anything that is not exactly the expected shape is refused, with the place named, rather than half-loaded.
     const good = JSON.parse(readFileSync(file, 'utf8'));
     for (const [damage, pattern] of [
-      [{ ...good, version: 1 }, /not a Global Connect demo data file/],
+      [{ ...good, version: 2 }, /not a Global Connect demo data file of this version[^]*npm run demo:reset/],
       [{ ...good, opsUsers: [{ id: 'ops_x', role: 'superuser' }] }, /problem at "opsUsers/],
       [{ ...good, directory: { ...good.directory, users: [{ ...good.directory.users[0], passwordHash: 5 }] } }, /problem at "directory\.users\.0\.passwordHash"/],
       [{ ...good, extra: true }, /not a Global Connect demo data file/],

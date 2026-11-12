@@ -18,6 +18,7 @@ import type { CodeMethod, CompanyOption, SessionUser, StepUpAction, UserRole } f
 import type { Config } from '../config';
 import {
   checkTotp,
+  decoyVerify,
   hashPassword,
   hashRecoveryCodes,
   matchRecoveryCode,
@@ -36,7 +37,7 @@ import {
 } from '../crypto';
 import { ApiError } from '../errors';
 import type { AuditParty, CompanyRecord, SessionRecord, Stores, UserRecord } from '../store/types';
-import { Lockout, type Attempt, type LockScope } from './lockout';
+import { isKnownSource, Lockout, withKnownSource, type Attempt, type LockScope } from './lockout';
 
 const ISSUER = 'Global Connect';
 const RECOVERY_CODE_COUNT = 10;
@@ -71,8 +72,6 @@ export interface SignedIn {
 }
 
 export class AuthService {
-  /** Verified against when the email is unknown, so both paths cost one scrypt. */
-  private dummyHash: Promise<string> | null = null;
   private readonly lockout: Lockout;
 
   constructor(
@@ -88,8 +87,8 @@ export class AuthService {
     return this.stores.audit.append({ at: this.now(), actor, target, action, outcome, source, detail });
   }
 
-  private async begin(scope: LockScope, subject: string, source: string): Promise<Attempt> {
-    return this.lockout.begin(scope, subject, source);
+  private async begin(scope: LockScope, subject: string, source: string, trusted = false): Promise<Attempt> {
+    return this.lockout.begin(scope, subject, source, trusted);
   }
 
   // --- Invitations and activation ---------------------------------------------
@@ -193,11 +192,12 @@ export class AuthService {
 
   private async checkPassword(address: string, password: string, who: AuditParty, source: string): Promise<{ challengeId: string }> {
     // Counted before the password is looked at, so simultaneous guesses cannot outrun the lock.
-    const attempt = await this.begin('password', `email:${address}`, source);
     const user = await this.stores.directory.findUserByEmail(address);
-    this.dummyHash ??= hashPassword(randomToken());
+    // From a network this account has fully signed in from before, strangers' guesses elsewhere do not count against it.
+    const attempt = await this.begin('password', `email:${address}`, source, isKnownSource(user, source));
     const usable = user !== null && user.passwordHash !== null && user.activatedAt !== null && !user.disabledAt;
-    const matches = await verifyPassword(password, usable ? (user.passwordHash as string) : await this.dummyHash);
+    // No usable account: the same answer after comparable work, from a budget that cannot starve real sign-ins.
+    const matches = usable ? await verifyPassword(password, user.passwordHash as string) : await decoyVerify(password);
     if (!usable || !matches) {
       if (attempt.locked) await this.record('client.lockout', 'failure', who, source, { guarded: 'password' });
       throw new ApiError('validation', { reason: 'invalid_credentials' });
@@ -223,7 +223,7 @@ export class AuthService {
    * stolen session cannot lock the owner out of signing in.
    */
   private async verifyUserTotp(user: UserRecord, code: string, scope: 'code' | 'stepup', source: string): Promise<UserRecord> {
-    const attempt = await this.begin(scope, `user:${user.id}`, source);
+    const attempt = await this.begin(scope, `user:${user.id}`, source, isKnownSource(user, source));
     const check = user.totpSecret ? checkTotp(user.totpSecret, code, this.now(), user.lastTotpStep) : ({ ok: false, reason: 'invalid' } as const);
     const reused = async (): Promise<never> => {
       // A correct code that was already used is not a guess: it does not count toward a lock.
@@ -245,7 +245,7 @@ export class AuthService {
   }
 
   private async verifyRecoveryCode(user: UserRecord, code: string, source: string): Promise<UserRecord> {
-    const attempt = await this.begin('code', `user:${user.id}`, source);
+    const attempt = await this.begin('code', `user:${user.id}`, source, isKnownSource(user, source));
     const match = await matchRecoveryCode(code, user.recoveryCodeHashes);
     // Atomic: a recovery code is removed by exactly one request.
     const updated = match
@@ -284,7 +284,8 @@ export class AuthService {
     }
     // One challenge makes one session.
     if (!(await this.stores.auth.challenges.take(challengeKey))) throw new ApiError('validation', { reason: 'challenge_expired' });
-    user = (await this.stores.directory.updateUser(user.id, (current) => ({ ...current, lastSignInAt: this.now() }))) ?? user;
+    // A full sign-in (password and code) from here: remember the network.
+    user = (await this.stores.directory.updateUser(user.id, (current) => ({ ...current, lastSignInAt: this.now(), knownSources: withKnownSource(current.knownSources, source) }))) ?? user;
     await this.record('client.sign_in', 'success', partyOf(user), source, { method });
 
     const companies = await this.companiesOf(user.id);
@@ -352,6 +353,8 @@ export class AuthService {
       await this.record('client.company_select', 'failure', partyOf(context.user), source, { reason: 'not_found' });
       throw new ApiError('not_found');
     }
+    // Choosing the company that is already chosen changes nothing, so it is neither written nor audited.
+    if (context.session.companyId === companyId) return { ...context, company: membership.company, role: membership.role };
     const session = await this.stores.auth.sessions.mutate(context.tokenHash, (current) => (current ? { ...current, companyId } : undefined));
     if (!session) throw new ApiError('unauthorized');
     // A permission granted for one company must not carry over to another.
@@ -436,6 +439,8 @@ export class AuthService {
     await this.stores.auth.stepUps.put(sha256(token), {
       userId: context.user.id,
       sessionId: context.session.id,
+      // Bound to the company it was asked for: it is worth nothing in another, whatever happens to the session meanwhile.
+      companyId: context.company?.id ?? null,
       action,
       payloadHash: sha256(canonicalJson(payload)),
       expiresAt: this.now() + this.config.stepUpTtlMs,
@@ -453,6 +458,7 @@ export class AuthService {
       record.expiresAt > this.now() &&
       record.userId === context.user.id &&
       record.sessionId === context.session.id &&
+      record.companyId === (context.company?.id ?? null) &&
       record.action === action &&
       record.payloadHash === sha256(canonicalJson(payload));
     if (!valid) throw new ApiError('forbidden', { reason: 'step_up_invalid' });

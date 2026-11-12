@@ -55,10 +55,17 @@ tab. The port can stay private. Activation links use that address, the ops cooki
 (Not run in a Codespace by us: see "Not production-ready and not verified".)
 
 At start-up, in development mode only, the server prints an activation code and link
-for each account that is not activated yet: the three sample clients and two demo staff
-for the ops console (`ops.admin@globalconnect.example`, an ops admin, and
-`ops.second@globalconnect.example`, an ops user: two, because sensitive ops actions need
-a second person).
+for each **sample** account that is not activated yet: the three sample clients and
+three demo staff for the ops console (`ops.admin@globalconnect.example` and
+`ops.admin2@globalconnect.example`, ops admins, and `ops.second@globalconnect.example`,
+an ops user). Three, because sensitive ops actions need a second person, and staff
+management and company mappings need a second ops **admin**.
+
+**A restart does not replace codes.** A code printed on an earlier start is printed
+again, marked "still valid", for its 72 hours; a link emailed from the ops console
+since then is left alone (the start-up output says so instead of printing a new code);
+accounts created in the ops console are never touched at start-up. A new code is made
+for a sample account only when it has no live one.
 
 | User | Company | Held at |
 |---|---|---|
@@ -90,28 +97,46 @@ link appears: it is never shown in the ops console and never returned over HTTP.
 **Demo accounts are kept between runs.** `npm run demo` sets `DATA_FILE` to
 `.demo-data/accounts.json` (git-ignored) and says so when it starts, so accounts you
 activate survive a restart. Wipe it with `npm run demo:reset`. That file holds password
-hashes, authenticator keys **in plain form**, unused activation records, pending
-approval requests and the audit log. It is for a local demonstration only: the server
-refuses `DATA_FILE` unless `APP_ENV=development`, checks the file against a schema when
-it loads it and refuses one that does not fit. Sessions, lockout counters and the log of
+hashes, authenticator keys **in plain form**, unused activation records (kept, and
+honoured, across restarts), the activation codes the server itself printed for the
+sample accounts (in plain form, so the same code can be printed again), pending approval
+requests and the working segment of the audit log; full audit segments are written to
+their own files beside it. It is for a local demonstration only: the server refuses
+`DATA_FILE` unless `APP_ENV=development`, checks the file against a schema when it
+loads it and refuses one that does not fit. **After pulling a new version, run
+`npm run demo:reset`**: if the saved file is from an earlier version, `npm run demo`
+stops at once, before building anything, and tells you to. Sessions, lockout counters and the log of
 anonymous failures are not kept, so a restart signs everyone out and forgets lockouts,
 and a failed sign-in by a stranger never rewrites the file. Without `DATA_FILE` (for
 example `npm run server`) everything is in memory and a restart forgets the accounts and
 prints new codes.
 
-**Operator commands.** Two commands talk to the running server; they stand in for
+**Operator commands.** Three commands talk to the running server; they stand in for
 tooling an operator with access to the machine would have:
 
 ```bash
 npm run invite -- amira@northfield.example          # email a new activation link to a client
 npm run create-ops-admin -- jo@example.com "Jo Smith"   # see "Ops console"
+npm run break-glass -- unlock-staff jo@example.com "why"   # see "Break-glass"
 ```
 
 They need `ADMIN_TOKEN` in `server/.env` (generate one with `openssl rand -base64 32`;
 the server refuses placeholders and short or repetitive values) and they reach the
 server on a **separate listener bound to 127.0.0.1 only** (`ADMIN_PORT`, default 3002).
-The public port has no `/admin` route. Neither command prints a link: the link is
+The public port has no `/admin` route. No command prints a link: the link is
 emailed (in development: printed in the server's terminal).
+
+**Running in GitHub Codespaces: if something does not work**
+
+- Use only the links printed by the **latest** start, and open them in a normal browser
+  tab. The editor's built-in preview shows pages inside a frame, and both the ops
+  console and the client app refuse to be framed.
+- After pulling a new version run `npm run demo:reset`, then `npm run demo`. Activation
+  links from before the reset no longer work.
+- If the activation code field is empty after opening a link, type the code printed
+  next to the link (it is also the part of the link after `#code=`).
+- An "email" from the ops console is not sent anywhere: look in the terminal where
+  `npm run demo` is running for `DEVELOPMENT OUTBOX`.
 
 ### Developing with live reload (two terminals)
 
@@ -152,7 +177,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 69 tests (about 90 seconds)
+npm test                 # node:test, 93 tests (about two minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -338,9 +363,19 @@ address bar once read. A step that was already in progress on an old link when a
 was issued cannot complete or bring the old invitation back (the write is conditional on
 the invitation still being the same one).
 
-- **Passwords**: scrypt, N=2^17, r=8, p=1 (about 128 MiB per hash). At most two hashes
-  run at once and 64 wait; beyond that a request gets 429 rather than more memory. A
-  hash made with a lower cost is replaced at the next successful sign-in.
+- **Passwords**: scrypt, N=2^17, r=8, p=1 (about 128 MiB per hash). A hash made with a
+  lower cost is replaced at the next successful sign-in. Hashing is rationed in three
+  separate pools so that the cheapest work to abuse cannot crowd out real people:
+  *client* (2 at once, 32 waiting) for real, usable client accounts, whose attempts the
+  lockout bounds; *staff* (1 at once, 16 waiting), which client traffic cannot touch;
+  and *decoy* (1 at once, 2 waiting) for sign-in attempts on emails with no usable
+  account. When the decoy pool is busy such an attempt is answered after a wait of about
+  one hash instead of a hash, and is never refused. **The trade-off:** the answer is
+  identical either way, and off-peak the timing is too (a real hash). During a flood,
+  though, the wait follows the recent average while a real account's hash may be
+  queued behind others, so someone who floods *and* times responses could tell known
+  emails from unknown ones. That was chosen over letting anyone starve real sign-ins
+  with made-up emails. A full client or staff queue answers 429.
 - **Recovery codes**: 100 random bits each, stored salted and scrypt-hashed.
 
 ### Login
@@ -362,26 +397,36 @@ the invitation still being the same one).
   burns it: the refusal (`code_reused`) carries the seconds until the authenticator
   shows its next code, and a reused code does **not** count toward a lockout.
 - **Lockout**: each attempt is counted *before* the credential is checked, in one atomic
-  store operation, so simultaneous requests get exactly the allowed number of checks.
-  Counters are kept per **account and source address**: 5 failures from one address
-  against one account lock that address out of that account for 1 minute, doubling with
-  each further failure up to 1 hour. Someone else's wrong guesses, from another address,
-  do not lock the owner out. A second counter per account across **all** addresses locks
-  it for everyone at 50 failures. Password, sign-in code, step-up code and activation
-  are counted separately, so wrong step-up codes in a stolen session cannot lock
-  sign-in. Whether the account exists plays no part; success clears the counts. A
-  challenge is spent after 5 wrong codes or 5 minutes. A live lock is never evicted to
-  make room for other counters. Limits of this: an attacker behind the same address as
-  the owner (an office, a carrier NAT) still locks them out, and 50 guesses spread over
-  50 addresses lock the account for everyone for up to an hour.
-- **Rate limit**: on top of that, each address gets 30 requests a minute on the sign-in,
-  activation, step-up and ops-action routes. "Address" is the connection's address, or,
-  behind a reverse proxy, what `TRUST_PROXY` says: the proxies' own addresses or CIDR
-  ranges (preferred) or a number of hops. `true` is not accepted, so a client cannot
-  pick its own address by sending `X-Forwarded-For`. A hop count is only right when the
-  server cannot be reached except through that many proxies. When the limiter is
-  tracking its maximum number of addresses it refuses new ones until a window ends; it
-  never resets anyone's count.
+  store operation, so simultaneous requests get exactly the allowed number of checks
+  (and of hashes). Counters are kept per **account and source** (an IPv4 address, or a
+  whole IPv6 /64): 5 failures from one source against one account lock that source out
+  of that account for 1 minute. A lock that has run out starts the count again: the
+  next lock needs five **new** failures and is then twice as long, up to 1 hour, so one
+  guess per expiry neither renews a lock nor lengthens it. A second counter per account
+  across **all** sources locks it at 50 failures, but **not for a network (IPv4 /24,
+  IPv6 /64) the account has completed a full sign-in from before** (the last eight are
+  kept on the account): the owner, where they usually are, is not locked out by
+  strangers elsewhere. Password, sign-in code, step-up code and activation are counted
+  separately, so wrong step-up codes in a stolen session cannot lock sign-in. Whether
+  the account exists plays no part; success clears the counts. A challenge is spent
+  after 5 wrong codes or 5 minutes. A live lock is never evicted to make room for other
+  counters. Limits of this: an attacker on the owner's own network still locks that
+  network out for a while; an owner signing in from somewhere new during an attack is
+  locked out with everyone else; "has signed in from here before" is a network address,
+  not a device, so it is only as good as the address. Ops can unlock a client; a staff
+  member is unlocked by a second ops admin's approval or by break-glass.
+- **Rate limits**: each source (an IPv4 address or an IPv6 /64) gets 30 requests a
+  minute on the sign-in, activation and step-up routes and the ops console's sign-in
+  pages and actions, and each IPv4 /24 gets 90 between its addresses. A signed-in
+  client gets 60 state-changing requests a minute, counted per person and per session
+  (sign-out is exempt), which is also what bounds how fast one session can write audit
+  entries. "Address" is the connection's address, or, behind a reverse proxy, what
+  `TRUST_PROXY` says: the proxies' own addresses or CIDR ranges (preferred) or a number
+  of hops, at most 3. `true` is not accepted, so a client cannot pick its own address
+  by sending `X-Forwarded-For`. A hop count is only right when the server cannot be
+  reached except through that many proxies. When a limiter is tracking its maximum
+  number of keys it refuses new ones until a window ends; it never resets anyone's
+  count. All of these are per process and in memory.
 - **Sessions**: 15 minutes idle, 12 hours absolute, revoked by `POST /v1/auth/logout`.
   Membership is re-read on every request.
 - **Atomic state changes**: an invitation, a TOTP step, a recovery code, a sign-in
@@ -479,12 +524,17 @@ cookie.
    terminal; outside development the server will not start without a real mailer.)
 2. **Four-eyes approval.** These actions only create a *request*: reset a client's
    authenticator; create a client user; attach a client to a company or change their
-   role; issue or re-issue an activation link; create a company or change its provider,
-   account id or contact id; and all staff management (invite, role change, disable,
-   re-enable, re-issue a staff link, reset a staff authenticator). A **different**,
-   active staff member must approve the request with their own fresh authenticator code
-   before anything changes. The requester cannot approve their own request, and nor can
-   the staff member a request is about. Requests expire after 24 hours and can be
+   role; issue or re-issue an activation link; **re-enable** a disabled client (it gives
+   back their old password and authenticator); create, **rename**, re-point or
+   **reactivate** a company; and all staff management (invite, role change, disable,
+   re-enable, unlock, re-issue a staff link, reset a staff authenticator). A
+   **different**, active staff member must approve the request with their own fresh
+   authenticator code before anything changes. The requester cannot approve their own
+   request, and nor can the staff member a request is about. **Staff management and
+   creating or re-pointing a company can be approved only by an ops admin**: an ops user
+   cannot wave through who is staff or where a company's money is. The approver is shown
+   how many of this requester's requests they have approved in the last 30 days, and is
+   warned when it is nearly always them. Requests expire after 24 hours and can be
    cancelled (by the requester) or rejected (by anyone else). Request, approval,
    rejection, cancellation and expiry are audited, and the entry for the change itself
    names both people. `FOUR_EYES=off` is accepted only with `APP_ENV=development`.
@@ -493,22 +543,61 @@ cookie.
    provider A the contact id) must be one the provider confirms exists, and no two
    companies, active or deactivated, can point at the same account. Re-pointing a
    company ends the sessions of everyone attached to it, and the approval request says
-   how many people that is. Any staff member can rename a company.
+   how many people that is. No two companies can have the same name, however it is
+   capitalised or spaced. Every request names a company with its id, and with its
+   previous name if it was renamed in the last 30 days, so a fresh name cannot mislead
+   an approver.
+4. **Who can become staff.** A staff account can only be created for an address at a
+   domain in `STAFF_EMAIL_DOMAINS` (the demo uses `globalconnect.example`), checked when
+   it is asked for and again when it is approved, and only with a second ops admin's
+   approval. Each new member of staff is written to the audit log as `ops.staff.new`,
+   highlighted, with who asked and who approved.
+5. **Whose client it is.** A request to create a client, or attach one to a company,
+   shows the person's email domain beside the domains of the people already in that
+   company and flags a mismatch.
 
-What this does not cover: two staff members acting together; a staff member who can
-read the client's mailbox; a staff member with access to the server or its storage. The
-approver may be an `ops` user approving an ops admin's request: the check is "a second
-person", not "a more senior one".
+**The staff-invite risk, and what limits it now.** Before this round an ops admin could
+ask for a staff account at an address they controlled and have an ops user approve it;
+the pair of accounts then passed everything else between themselves. Now that needs a
+second ops *admin* to approve, an address at an allowed staff domain, and it leaves a
+highlighted entry. What remains: two ops admins acting together can do anything the
+console can do; an ops admin who controls a mailbox at the staff domain and has one
+co-operating (or careless) ops admin can still create a second identity; a staff member
+who can read a client's mailbox, or has access to the server or its storage, is outside
+all of this. Staff SSO and a review of approvals after the fact are the real answers and
+are not built.
 
-Take effect at once, with a fresh code and an audit entry, because they give nobody
-access: unlock, revoke sessions, disable / re-enable a client, remove a client from a
-company, deactivate / reactivate a company, rename a company.
+Take effect at once, with a fresh code and an audit entry, because they only take
+access away or change nothing a client can use: unlock a client, revoke sessions,
+disable a client, remove a client from a company, deactivate a company.
+
+### Break-glass
+
+With exactly two staff, neither can disable or reset the other through the console (a
+request about you is not yours to approve), and a lost authenticator or a compromised
+account cannot wait for a second ops admin who may not exist. For that there is an
+operator command, run on the server's own machine:
+
+```bash
+npm run break-glass -- disable-staff jo@example.com "Laptop stolen, reported by phone"
+npm run break-glass -- reset-staff   jo@example.com "Lost phone and codes, identity checked in person"
+npm run break-glass -- unlock-staff  jo@example.com "Locked out by guessing, verified by phone"
+```
+
+It acts on **one staff account** without a second person: disable (sessions end), reset
+(password, authenticator and recovery codes removed, sessions ended, a new activation
+link emailed to that person, never printed) or unlock. It needs `ADMIN_TOKEN`, reaches
+the server only on its loopback listener, requires a reason of at least 10 characters,
+and is written to the audit log as `ops.break_glass.*`, highlighted, with the reason.
+It cannot touch client accounts. Whoever has the admin token and a shell on the server
+can use it: that is the trust it rests on.
 
 ### Create the first staff
 
-- **Demo / development:** the server creates `ops.admin@globalconnect.example` (ops
-  admin) and `ops.second@globalconnect.example` (ops) and prints their activation links
-  beside the client codes. Open each link, choose a password, scan the QR code with an
+- **Demo / development:** the server creates `ops.admin@globalconnect.example` and
+  `ops.admin2@globalconnect.example` (ops admins) and `ops.second@globalconnect.example`
+  (ops) and prints their activation links beside the client codes. Activate at least
+  the two admins to try staff management and company changes; any two for the rest. Open each link, choose a password, scan the QR code with an
   authenticator app, confirm with a code and save the recovery codes. This happens only
   with `APP_ENV=development`.
 - **Otherwise:** set `ADMIN_TOKEN`, start the server, then on the same machine
@@ -518,9 +607,12 @@ company, deactivate / reactivate a company, rename a company.
   ```
 
   It emails that person an activation link valid for 72 hours (and prints only the
-  masked address). It works while **fewer than two** active staff exist, because
-  approval needs two people; run it twice, for two different people. After that it
-  refuses and staff are invited from **Ops staff** in the console.
+  masked address). The address must be at a domain in `STAFF_EMAIL_DOMAINS`. It works
+  while **fewer than two active ops admins** exist, because staff management needs one
+  ops admin to ask and another to approve; run it twice, for two different people.
+  After that it refuses and staff are invited from **Ops staff** in the console. If the
+  number of active ops admins later falls below two (break-glass, for instance) it
+  works again.
 
 Staff activation links carry the code after `#` (`/ops/activate#code=…`); the script
 copies it into the form. Without JavaScript, type the code.
@@ -539,8 +631,10 @@ HttpOnly, SameSite=Strict, and over https `__Host-gc_ops_session` with `Secure` 
 plain http, which is allowed only in development, it is `gc_ops_session` with
 `Path=/ops`. Outside development `OPS_URL` must be https. The session ends after
 **10 minutes** idle or 8 hours. Every form carries a CSRF field bound to that session;
-before sign-in the field is bound to a cookie value the server issued and remembers for
-30 minutes; requests a browser marks as coming from another site are refused. `/ops`
+before sign-in the field is bound to a cookie value the server signed (HMAC with
+`SERVER_SECRET`, valid for 30 minutes), so nothing is stored per visitor and a flood of
+requests for the sign-in page cannot push out a real visitor's; that page is rate
+limited like the rest. Requests a browser marks as coming from another site are refused. `/ops`
 responses carry a CSP without inline script or style, `frame-ancestors 'none'` and
 `no-store`. Lockout and uniform errors work as for clients.
 
@@ -604,8 +698,8 @@ check that the verification really happened.
 
 ### Audit log
 
-`AuditLog` (`server/src/store/types.ts`) has `append`, `query` and `assertCapacity` and
-nothing that changes or removes an entry.
+`AuditLog` (`server/src/store/types.ts`) has `append` and `query` and nothing that
+changes or removes an entry.
 
 Recorded, each with time, actor, target, action, outcome and source address:
 
@@ -617,10 +711,13 @@ Recorded, each with time, actor, target, action, outcome and source address:
 - every ops action that reached the console with a valid session and CSRF field, success
   and failure, with its target when one was identified; approval requests and decisions
   with both people;
-- the operator commands (`invite`, `create-ops-admin`).
+- the operator commands (`invite`, `create-ops-admin`, `break-glass`);
+- a new member of staff (`ops.staff.new`) and every break-glass use, both highlighted on
+  the audit page.
 
 Not recorded: requests refused before that point (no session, wrong CSRF field, rate
-limit), page views, expired sessions, and attempts with an unknown activation code.
+limit), page views, expired sessions, attempts with an unknown activation code, and a
+client choosing the company that is already chosen (it changes nothing).
 
 It never contains a password, key, code or token (a test plants them and searches it).
 
@@ -631,11 +728,19 @@ written to the demo file. They can neither push anything out of the main log nor
 it. So a password-guessing run against an account is visible there only in part; the
 lockout it causes is in the same stream.
 
-The main log does not drop entries. When it is full (100,000 entries in memory) the
-server **refuses every state-changing request**, client and staff alike, until it is
-restarted; reads keep working. That is the fail-safe choice and it is also a way to
-stop the service, which is why a real deployment needs durable, write-once storage
-with shipping and retention instead.
+**When the log fills up.** The main log is held in a working segment (100,000 entries
+in memory; 5,000 with the demo file). When a segment is full it is **rotated**: moved to
+the archive, a new segment started, and a warning printed in capitals on the server's
+error output. Appending never fails for lack of room, nothing is refused, and the
+newest entries are never the ones lost. With the demo file each full segment is written
+to its own file beside it (`accounts.json.audit-0001-…json`), so the main file stays
+small and a restart loads only the working segment. Without a file (plain
+`npm run server`) four rotated segments are kept in memory and still shown; after that
+the **oldest** is discarded, with a warning that says so. Archived files are not shown
+in the ops console. One signed-in client can write at most 60 entries a minute (see
+"Rate limits"), so filling a segment takes a single session over a day rather than
+under a minute; that is a bound, not a cure, and durable write-once storage with
+shipping and retention is still needed.
 
 ### Still not production-ready (ops console)
 
@@ -645,14 +750,16 @@ with shipping and retention instead.
   else are in memory (or the demo JSON file).
 - **Who can reach `/ops`:** it is on the same port as the client API, open to anyone who
   can reach the server. It needs **IP allow-listing or a VPN, and staff SSO**.
-- **Four-eyes is as described above and no more:** any second staff member can approve,
-  there is no limit on how many requests one pair can pass, and no review of approvals
-  after the fact.
-- **Break-glass:** once two staff are active the bootstrap command refuses. If the last
-  ops admin, or all staff but one, lose access, the only way back is editing storage.
-- **Penetration testing:** an independent review found the issues fixed in this round;
-  the fixes have tests but have not been re-reviewed or attacked.
-- `ADMIN_TOKEN` is still one shared secret, now reachable only from the machine itself.
+- **Four-eyes is as described above and no more:** two ops admins acting together can do
+  anything; the pair-history line warns an approver but stops nobody; there is no review
+  of approvals after the fact.
+- **Break-glass and bootstrap rest on `ADMIN_TOKEN`**, one shared secret reachable only
+  from the server's own machine. Anyone with both can disable or reset any staff member
+  and, when fewer than two ops admins are active, create one.
+- **Penetration testing:** two independent reviews found the issues fixed so far; the
+  latest fixes have tests (each confirmed to fail with its fix reverted) but have not
+  been re-reviewed or attacked.
+- **Rate limits, lockouts and hash pools are per process and in memory.**
 
 ## Replacing the placeholders
 
@@ -765,6 +872,19 @@ the real product. No rate history is offered, so no trend line is drawn.
 - **Both provider APIs**: in-memory mocks.
 - **The in-app demo sign-in**: accepts anything; code `000000`.
 
+### The web app's response headers
+
+When the server serves the client web app (the demo), every response carries
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and a content security policy:
+scripts, connections, fonts and images from the same origin only (plus `data:`/`blob:`
+images), `object-src 'none'`, `frame-ancestors 'none'`, and inline **styles** allowed
+because the web build injects its style sheet at run time. The policy was checked
+against the built files (no inline scripts in `index.html`; route bundles are loaded
+with `<script src>` from the same origin; the one `new Function` in the bundle is a
+feature probe inside a try/catch) and in tests. **It has not been tried in a browser**,
+where a too-strict policy would show as a blank page. If that
+happens, the policy is `WEB_APP_CSP` in `server/src/http/app.ts`.
+
 ## Compliance guards
 
 `src/test/compliance.test.ts` scans every UI folder (`app`, `components`, `screens`,
@@ -804,10 +924,12 @@ Not built:
   authenticator and regenerating recovery codes by the client. The only recovery is an
   ops reset (see "Ops console"), which replaces everything.
 - **Ops console gaps**: see "Still not production-ready (ops console)". The operator
-  commands (`invite`, `create-ops-admin`) are still guarded by one shared token, on a
-  loopback-only listener.
-- **Audit log storage**: in memory, bounded, refusing changes when full. See "Audit log".
-  Reads (who looked at which balance) are not audited.
+  commands (`invite`, `create-ops-admin`, `break-glass`) are still guarded by one shared
+  token, on a loopback-only listener.
+- **Audit log storage**: in memory, in bounded segments that are rotated to an archive
+  when full (files beside the demo data file; otherwise kept in memory, the oldest
+  eventually discarded with a warning). See "Audit log". Reads (who looked at which
+  balance) are not audited.
 - **Secrets management**: credentials are plain environment variables; TOTP keys are
   held unencrypted in memory.
 - **Database**: see "A real database". Everything is lost on restart unless the demo
@@ -816,12 +938,26 @@ Not built:
   support. Rate limits and lockouts are per process. Behind a proxy set `TRUST_PROXY` to
   the proxy's address or range (or a hop count), or every client shares one address for
   rate limiting and lockout.
-- **Penetration testing**: none. One independent code review was done and its findings
-  fixed with regression tests (each confirmed to fail with its fix reverted); the fixes
-  have not been re-reviewed. Response *content* is uniform across known and unknown
-  emails and both paths do one scrypt verification, but timing was not measured. Someone
-  who shares the owner's address, or who spreads 50 guesses over 50 addresses, can still
-  lock an account for a while (see "Lockout").
+- **Penetration testing**: none in the formal sense. Two independent reviews (the second
+  with probes against a running server) were done and their findings fixed with
+  regression tests, each confirmed to fail with its fix reverted; the latest fixes have
+  not been re-reviewed. Response *content* is uniform across known and unknown emails.
+  Timing was not measured, and during a flood of sign-in attempts it can differ between
+  known and unknown emails (see "Passwords"). Someone on the owner's own network can
+  still lock that network out of the account for a while, and an owner signing in from a
+  new network during an attack is locked out with everyone else (see "Lockout").
+- **Dependency advisories.** `npm audit` in `server/` reports none. `npm audit` in the
+  repository root reports **31** (30 moderate, 1 low; 22 with `--omit=dev`), all of them
+  three packages and whatever depends on them: `glob` (cancellation bypass allows
+  filesystem traversal after a timeout), `minimatch` (denial of service from crafted
+  patterns) and `deepmerge` (prototype poisoning of returned objects). They arrive
+  through Jest (`jest`, `jest-expo`, `babel-jest` and their parts), ESLint
+  (`eslint-config-expo`, `@typescript-eslint/*`) and Expo's command-line tooling
+  (`@expo/cli` and one other Expo build package, which `expo` depends on, hence the 22). That is
+  test, lint and build tooling run on a developer's machine: by npm's dependency tree
+  none of it is imported by the server or bundled into the app, but we did not verify
+  that independently, and `npm audit fix --force` would change major versions, so
+  nothing was changed.
 - **Tenant isolation at the real providers**: the server scopes every call and checks
   ids itself, but this has only ever run against the mocks.
 - **Provider approval**: no provider has reviewed or approved this flow, the step-up as

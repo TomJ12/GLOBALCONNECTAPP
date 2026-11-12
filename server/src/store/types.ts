@@ -25,6 +25,8 @@ export interface UserRecord {
   /** Set by operations. A disabled person cannot sign in and has no sessions. */
   disabledAt?: number | null;
   lastSignInAt?: number | null;
+  /** Networks (IPv4 /24, IPv6 /64) this person has completed a full sign-in from. A few, newest last. Not a secret. */
+  knownSources?: string[];
 }
 
 export interface CompanyRecord {
@@ -37,6 +39,9 @@ export interface CompanyRecord {
   providerContactId: string;
   /** Set by operations. A deactivated company cannot be selected or used by anyone. */
   deactivatedAt?: number | null;
+  /** The name before the last rename and when that was, so an approver is not misled by a fresh name. */
+  previousName?: string | null;
+  renamedAt?: number | null;
 }
 
 export interface Membership {
@@ -94,6 +99,8 @@ export interface SessionRecord {
 export interface StepUpRecord {
   userId: string;
   sessionId: string;
+  /** The company the permission was given for. It is good for that company only. */
+  companyId: string | null;
   action: StepUpAction;
   payloadHash: string;
   expiresAt: number;
@@ -102,6 +109,8 @@ export interface StepUpRecord {
 export interface AttemptRecord {
   failures: number;
   lockedUntil: number;
+  /** How many locks this counter has started; the next one is that many times doubled. */
+  locks: number;
   /** Whose credential is being guessed, e.g. `email:a@b.example` or `user:usr_1`; lets operations find and clear locks. */
   subject: string;
   updatedAt: number;
@@ -158,6 +167,8 @@ export interface OpsUserRecord {
   activatedAt: number | null;
   disabledAt: number | null;
   lastSignInAt: number | null;
+  /** See UserRecord.knownSources. */
+  knownSources?: string[];
 }
 
 export interface OpsDirectory {
@@ -203,8 +214,6 @@ export interface OpsStore {
   sessions: Table<OpsSessionRecord>;
   attempts: Table<AttemptRecord>;
   approvals: Table<ApprovalRecord>;
-  /** CSRF anchors handed to browsers before sign-in, by SHA-256. */
-  preSessions: Table<{ expiresAt: number }>;
 }
 
 // --- Audit log -----------------------------------------------------------------
@@ -242,20 +251,28 @@ export interface AuditFilter {
   limit?: number;
 }
 
-/** Append-only by contract: there is no way to change or remove an entry. */
+/**
+ * Append-only by contract: there is no way to change or remove an entry.
+ *
+ * `append` must not fail because the log is "full". An implementation with a
+ * bounded working set moves a full segment to an archive (AuditArchive) and
+ * carries on, telling the operator loudly; it never refuses the entry and
+ * never drops the newest ones. A database implementation simply inserts.
+ */
 export interface AuditLog {
   /**
    * A failure by a person nobody has identified (`actor.id === null`) goes to a
    * separate, bounded, rate-limited stream with a truncated label, so that
-   * anonymous noise can never push out or fill the main log. Everything else
-   * goes to the main log; when that cannot take the entry, append THROWS
-   * rather than drop it or an older one.
+   * anonymous noise can never push out or fill the main log.
    */
   append(entry: Omit<AuditEntry, 'id' | 'anonymous'>): Promise<void>;
-  /** Throws when the main log cannot take another entry, so a change is refused BEFORE it is made rather than made unrecorded. */
-  assertCapacity(): Promise<void>;
   /** Newest first. */
   query(filter?: AuditFilter): Promise<AuditEntry[]>;
+}
+
+/** Where a full segment of the main log goes. Durable in a real deployment. */
+export interface AuditArchive {
+  write(segment: AuditEntry[]): Promise<string>;
 }
 
 export interface Stores {

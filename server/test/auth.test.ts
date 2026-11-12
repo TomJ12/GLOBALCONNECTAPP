@@ -122,8 +122,11 @@ test('sign-in: password lockout is progressive and behaves the same for an unkno
     assert.equal(locked.headers['retry-after'], '60');
 
     h.clock.advance(61_000);
-    // One more failure after the first lock doubles it.
+    // N5: one more failure after the lock has run out does NOT lock again, let alone for longer...
     assert.equal((await attempt('wrong wrong wrong')).json.error.reason, 'invalid_credentials');
+    assert.equal((await attempt('wrong wrong wrong')).json.error.reason, 'invalid_credentials');
+    // ...it takes a full five new failures, and then the lock is twice as long.
+    for (let i = 0; i < 3; i += 1) assert.equal((await attempt('wrong wrong wrong')).json.error.reason, 'invalid_credentials');
     assert.equal((await attempt(PASSWORD)).json.error.retryAfterSeconds, 120);
     h.clock.advance(121_000);
   }

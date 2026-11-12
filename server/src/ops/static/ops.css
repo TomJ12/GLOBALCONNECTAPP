@@ -50,3 +50,4 @@ form + form, .card form { margin-top: 12px; }
 .toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin-bottom: 16px; }
 .toolbar form { display: flex; gap: 8px; align-items: flex-end; margin: 0; }
 .toolbar label { margin: 0; }
+tr.alert td { background: #FEF3C7; font-weight: 600; }

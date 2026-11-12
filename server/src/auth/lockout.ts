@@ -7,10 +7,19 @@
  * number of checks. A success clears the count.
  *
  * Two counters guard each credential:
- *  - per account AND source address, with the low threshold. Somebody else's
- *    wrong guesses, from somewhere else, do not lock the owner out.
+ *  - per account AND source (an IPv4 address, or an IPv6 /64), with the low
+ *    threshold. Somebody else's wrong guesses, from somewhere else, do not
+ *    lock the owner out.
  *  - per account across all sources, with a much higher ceiling, so that a
- *    guesser who changes address is still stopped.
+ *    guesser who keeps changing address is still stopped. This one is NOT
+ *    applied to a network the account has completed a full sign-in from
+ *    before (`trusted`): the owner, where they usually are, is not locked out
+ *    by strangers elsewhere. An attacker on that same network still meets the
+ *    per-source counter.
+ *
+ * A lock grows only when a full threshold of new failures follows it. After a
+ * lock runs out the count starts again from nothing, so one guess per expiry
+ * cannot keep an account locked or make the lock longer.
  *
  * The scope (`password`, `code`, `stepup`, `activation`) is part of the key:
  * failed step-up codes in a stolen session cannot lock sign-in.
@@ -20,6 +29,7 @@
  */
 import type { Config } from '../config';
 import { ApiError } from '../errors';
+import { networkOf, sourceOf } from '../net';
 import type { AttemptRecord, Table } from '../store/types';
 
 export type LockScope = 'password' | 'code' | 'stepup' | 'activation';
@@ -39,12 +49,14 @@ export class Lockout {
     private readonly now: () => number,
   ) {}
 
-  /** Counts one attempt against both counters. Throws `locked` (and counts nothing more) while a lock is running. */
-  async begin(scope: LockScope, subject: string, source: string): Promise<Attempt> {
-    const guards: [key: string, threshold: number][] = [
-      [`${scope}:${subject}|${source}`, this.config.lockoutThreshold],
-      [`${scope}:${subject}`, this.config.lockoutAccountThreshold],
-    ];
+  /**
+   * Counts one attempt. Throws `locked` (and counts nothing more) while a lock
+   * is running. `trusted`: the request comes from a network this account has
+   * fully signed in from before, so only the per-source counter applies.
+   */
+  async begin(scope: LockScope, subject: string, source: string, trusted = false): Promise<Attempt> {
+    const guards: [key: string, threshold: number][] = [[`${scope}:${subject}|${sourceOf(source)}`, this.config.lockoutThreshold]];
+    if (!trusted) guards.push([`${scope}:${subject}`, this.config.lockoutAccountThreshold]);
     const attempt: Attempt = { keys: [], locked: false, before: [] };
     for (const [key, threshold] of guards) {
       let retryAfterMs = 0;
@@ -56,16 +68,14 @@ export class Lockout {
           retryAfterMs = current.lockedUntil - now;
           return undefined;
         }
-        // An old count that never reached a lock is forgotten after the longest lock length.
-        const failures = (current && now - current.updatedAt <= this.config.lockoutMaxMs ? current.failures : 0) + 1;
-        const over = failures - threshold;
-        if (over >= 0) attempt.locked = true;
-        return {
-          failures,
-          lockedUntil: over >= 0 ? now + Math.min(this.config.lockoutBaseMs * 2 ** Math.min(over, 30), this.config.lockoutMaxMs) : 0,
-          subject,
-          updatedAt: now,
-        };
+        // Everything is forgotten after a quiet period as long as the longest lock.
+        const live = current && now - current.updatedAt <= this.config.lockoutMaxMs ? current : null;
+        // A lock that has run out starts the count again: the next lock needs a full threshold of new failures.
+        const failures = (live && live.lockedUntil === 0 ? live.failures : 0) + 1;
+        const locks = live?.locks ?? 0;
+        if (failures < threshold) return { failures, lockedUntil: 0, locks, subject, updatedAt: now };
+        attempt.locked = true;
+        return { failures, lockedUntil: now + Math.min(this.config.lockoutBaseMs * 2 ** Math.min(locks, 30), this.config.lockoutMaxMs), locks: locks + 1, subject, updatedAt: now };
       });
       if (retryAfterMs > 0) throw new ApiError('rate_limited', { reason: 'locked', retryAfterSeconds: Math.ceil(retryAfterMs / 1000) });
       attempt.keys.push(key);
@@ -97,4 +107,17 @@ export class Lockout {
   unlock(subjects: string[]): Promise<void> {
     return this.attempts.deleteWhere((record) => subjects.includes(record.subject));
   }
+}
+
+const KNOWN_SOURCES = 8;
+
+/** Has this account completed a full sign-in from this network before? */
+export function isKnownSource(account: { knownSources?: string[] } | null, source: string): boolean {
+  return account?.knownSources?.includes(networkOf(source)) ?? false;
+}
+
+/** The account's known networks with this one added (newest last, a few at most). */
+export function withKnownSource(known: string[] | undefined, source: string): string[] {
+  const network = networkOf(source);
+  return [...(known ?? []).filter((item) => item !== network), network].slice(-KNOWN_SOURCES);
 }

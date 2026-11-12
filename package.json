@@ -65,7 +65,8 @@
     "demo:reset": "node scripts/demo.mjs --reset",
     "create-ops-admin": "npm --prefix server run create-ops-admin --",
     "postinstall": "npm --prefix server install --no-audit --no-fund",
-    "invite": "npm --prefix server run invite --"
+    "invite": "npm --prefix server run invite --",
+    "break-glass": "npm --prefix server run break-glass --"
   },
   "private": true,
   "jest": {

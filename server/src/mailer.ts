@@ -7,6 +7,8 @@
  * how the demo is used. Outside development the server refuses to start
  * until a real implementation of `Mailer` is supplied (see startup.ts).
  */
+import { singleLine } from './validate';
+
 export interface MailMessage {
   to: string;
   subject: string;
@@ -40,7 +42,8 @@ export function activationMessage(invite: { activationLink: string; expiresAt: n
     to,
     subject: kind === 'staff' ? 'Activate your Global Connect staff account' : 'Activate your Global Connect account',
     text: [
-      `Hello ${name},`,
+      // A name can never start a new line of the message.
+      `Hello ${singleLine(name)},`,
       '',
       'Use this link to set your password and add your authenticator app:',
       invite.activationLink,

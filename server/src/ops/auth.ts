@@ -12,9 +12,10 @@
  */
 import type { Config } from '../config';
 import { reasonOf, secondsToNextCode, type Invitation } from '../auth/service';
-import { Lockout } from '../auth/lockout';
+import { isKnownSource, Lockout, withKnownSource } from '../auth/lockout';
 import {
   checkTotp,
+  decoyVerify,
   hashPassword,
   hashRecoveryCodes,
   matchRecoveryCode,
@@ -50,7 +51,6 @@ export const opsParty = (user: OpsUserRecord): AuditParty => ({ type: 'ops', id:
 export const isActiveStaff = (user: OpsUserRecord): boolean => user.activatedAt !== null && user.disabledAt === null;
 
 export class OpsAuthService {
-  private dummyHash: Promise<string> | null = null;
   private readonly lockout: Lockout;
 
   constructor(
@@ -120,7 +120,7 @@ export class OpsAuthService {
   async activationPassword(activationCode: string, password: string) {
     const { key, user } = await this.activation(activationCode);
     if (passwordProblem(password) !== null) throw new ApiError('validation', { reason: 'weak_password', fields: ['password'] });
-    const pendingPasswordHash = await hashPassword(password);
+    const pendingPasswordHash = await hashPassword(password, 'staff');
     const pendingTotpSecret = newTotpSecret();
     // Written only onto the same, still-live invitation: one replaced during the hash is not brought back.
     const stored = await this.ops.activations.mutate(key, (current) =>
@@ -152,7 +152,7 @@ export class OpsAuthService {
       throw new ApiError('validation', { reason: 'activation_invalid' });
     }
     const recoveryCodes = Array.from({ length: RECOVERY_CODE_COUNT }, () => randomCode(RECOVERY_CODE_GROUPS));
-    const recoveryCodeHashes = await hashRecoveryCodes(recoveryCodes);
+    const recoveryCodeHashes = await hashRecoveryCodes(recoveryCodes, 'staff');
     const saved = await this.ops.users.update(user.id, (current) =>
       current.activatedAt !== null || current.disabledAt !== null
         ? null
@@ -171,18 +171,18 @@ export class OpsAuthService {
     const address = email.trim().toLowerCase();
     const who: AuditParty = { type: 'ops', id: null, label: address };
     try {
-      const attempt = await this.lockout.begin('password', `email:${address}`, source);
       const user = await this.ops.users.findByEmail(address);
-      this.dummyHash ??= hashPassword(randomToken());
+      const attempt = await this.lockout.begin('password', `email:${address}`, source, isKnownSource(user, source));
       const usable = user !== null && user.passwordHash !== null && isActiveStaff(user);
-      const matches = await verifyPassword(password, usable ? (user.passwordHash as string) : await this.dummyHash);
+      // Staff hashes have their own reserved capacity; attempts on addresses with no usable account do not use it.
+      const matches = usable ? await verifyPassword(password, user.passwordHash as string, 'staff') : await decoyVerify(password);
       if (!usable || !matches) {
         if (attempt.locked) await this.log('ops.lockout', 'failure', who, source, { guarded: 'password' });
         throw new ApiError('validation', { reason: 'invalid_credentials' });
       }
       await this.lockout.succeed(attempt);
       if (passwordNeedsRehash(user.passwordHash as string)) {
-        const stronger = await hashPassword(password);
+        const stronger = await hashPassword(password, 'staff');
         await this.ops.users.update(user.id, (current) => (current.passwordHash === user.passwordHash ? { ...current, passwordHash: stronger } : null));
       }
       const challengeId = randomToken();
@@ -195,7 +195,7 @@ export class OpsAuthService {
   }
 
   private async verifyTotp(user: OpsUserRecord, code: string, scope: 'code' | 'stepup', source: string): Promise<OpsUserRecord> {
-    const attempt = await this.lockout.begin(scope, `user:${user.id}`, source);
+    const attempt = await this.lockout.begin(scope, `user:${user.id}`, source, isKnownSource(user, source));
     const check = user.totpSecret ? checkTotp(user.totpSecret, code, this.now(), user.lastTotpStep) : ({ ok: false, reason: 'invalid' } as const);
     const reused = async (): Promise<never> => {
       await this.lockout.forgive(attempt);
@@ -215,8 +215,8 @@ export class OpsAuthService {
   }
 
   private async verifyRecoveryCode(user: OpsUserRecord, code: string, source: string): Promise<OpsUserRecord> {
-    const attempt = await this.lockout.begin('code', `user:${user.id}`, source);
-    const match = await matchRecoveryCode(code, user.recoveryCodeHashes);
+    const attempt = await this.lockout.begin('code', `user:${user.id}`, source, isKnownSource(user, source));
+    const match = await matchRecoveryCode(code, user.recoveryCodeHashes, 'staff');
     const updated = match
       ? await this.ops.users.update(user.id, (current) =>
           current.recoveryCodeHashes.includes(match) ? { ...current, recoveryCodeHashes: current.recoveryCodeHashes.filter((item) => item !== match) } : null,
@@ -251,7 +251,7 @@ export class OpsAuthService {
       throw error;
     }
     if (!(await this.ops.challenges.take(challengeKey))) throw new ApiError('validation', { reason: 'challenge_expired' });
-    user = (await this.ops.users.update(user.id, (current) => ({ ...current, lastSignInAt: this.now() }))) ?? user;
+    user = (await this.ops.users.update(user.id, (current) => ({ ...current, lastSignInAt: this.now(), knownSources: withKnownSource(current.knownSources, source) }))) ?? user;
     const token = randomToken();
     await this.ops.sessions.put(sha256(token), { id: randomToken(), userId: user.id, createdAt: this.now(), lastSeenAt: this.now() });
     await this.log('ops.sign_in', 'success', opsParty(user), source, { method });
@@ -299,6 +299,19 @@ export class OpsAuthService {
     await this.ops.activations.deleteWhere((record) => record.userId === userId);
     await this.lockout.unlock([`email:${user.email}`, `user:${user.id}`]);
     return this.revokeAllSessions(userId);
+  }
+
+  private subjectsOf(user: OpsUserRecord): string[] {
+    return [`email:${user.email}`, `user:${user.id}`];
+  }
+
+  isLocked(user: OpsUserRecord): Promise<boolean> {
+    return this.lockout.isLocked(this.subjectsOf(user));
+  }
+
+  /** Clears every failed-attempt counter of this staff member, from every source. */
+  unlock(user: OpsUserRecord): Promise<void> {
+    return this.lockout.unlock(this.subjectsOf(user));
   }
 
   // --- Step-up -------------------------------------------------------------------

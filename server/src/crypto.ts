@@ -74,61 +74,118 @@ const SCRYPT = { N: PASSWORD_COST, r: 8, p: 1, keyLength: 32 };
 /** A stored hash with a cost above this is refused rather than computed. */
 const MAX_COST = 2 ** 20;
 /**
- * Hashes run a few at a time and the rest wait in a short queue; past that the
- * request is refused. Without this, a burst of sign-in requests would each
- * take 128 MiB at once.
+ * Hashing is rationed, in three separate pools, so that the cheapest work to
+ * abuse can never crowd out real people:
+ *
+ *  - `client`: verifying or setting the password of a real, usable client
+ *    account. What can reach it is bounded by the lockout (a few attempts per
+ *    account and address).
+ *  - `staff`: the same for staff. Reserved: client traffic cannot touch it.
+ *  - `decoy`: the hash done for a sign-in attempt on an email that has no
+ *    usable account. Anyone can cause these for free, so they get one slot and
+ *    a very short queue of their own, and when that is busy the attempt is
+ *    answered after a wait of about one hash instead of a hash (see
+ *    `decoyVerify`). A flood of them costs neither memory nor a place in the
+ *    queue real accounts use.
+ *
+ * Each pool runs a few hashes at a time (128 MiB each) and lets a few more
+ * wait. A full `client` or `staff` queue refuses the request (429).
  */
-const MAX_CONCURRENT_HASHES = 2;
-const MAX_WAITING_HASHES = 64;
-let running = 0;
-const waiting: (() => void)[] = [];
+export type HashPool = 'client' | 'staff';
+interface Pool {
+  max: number;
+  queue: number;
+  running: number;
+  waiting: (() => void)[];
+}
+const POOLS: Record<HashPool | 'decoy', Pool> = {
+  client: { max: 2, queue: 32, running: 0, waiting: [] },
+  staff: { max: 1, queue: 16, running: 0, waiting: [] },
+  decoy: { max: 1, queue: 2, running: 0, waiting: [] },
+};
+/** Counts of work done, for tests and for an operator to look at. */
+export const passwordWork = { hashes: 0, decoyHashes: 0, decoyWaits: 0 };
+/** Rolling average of how long one hash takes, so a decoy wait looks like one. */
+let averageHashMs = 250;
 
 /** The cost new hashes are made with. Tests lower it; nothing else should. */
 export function setPasswordCost(N: number): void {
   SCRYPT.N = N;
 }
 
-async function withSlot<T>(run: () => Promise<T>): Promise<T> {
-  if (running >= MAX_CONCURRENT_HASHES) {
-    if (waiting.length >= MAX_WAITING_HASHES) throw new ApiError('rate_limited', { retryAfterSeconds: 5 });
-    await new Promise<void>((resolve) => waiting.push(resolve));
+const hasRoom = (pool: Pool): boolean => pool.running < pool.max || pool.waiting.length < pool.queue;
+
+async function withSlot<T>(name: HashPool | 'decoy', run: () => Promise<T>): Promise<T> {
+  const pool = POOLS[name];
+  if (pool.running >= pool.max) {
+    if (pool.waiting.length >= pool.queue) throw new ApiError('rate_limited', { retryAfterSeconds: 5 });
+    await new Promise<void>((resolve) => pool.waiting.push(resolve));
   } else {
-    running += 1;
+    pool.running += 1;
   }
   try {
     return await run();
   } finally {
-    const next = waiting.shift();
+    const next = pool.waiting.shift();
     // The slot passes straight to the next waiter, so `running` stays the same.
     if (next) next();
-    else running -= 1;
+    else pool.running -= 1;
   }
 }
 
-function scryptAsync(secret: string, salt: Buffer, N: number, r: number, p: number, keyLength: number): Promise<Buffer> {
-  return withSlot(
-    () =>
-      new Promise<Buffer>((resolve, reject) => {
-        scrypt(secret.normalize('NFKC'), salt, keyLength, { N, r, p, maxmem: 128 * N * r + 32 * 1024 * 1024 }, (error, key) => (error ? reject(error) : resolve(key)));
-      }),
-  );
+function scryptAsync(secret: string, salt: Buffer, N: number, r: number, p: number, keyLength: number, pool: HashPool | 'decoy' = 'client'): Promise<Buffer> {
+  return withSlot(pool, async () => {
+    const started = performance.now();
+    const key = await new Promise<Buffer>((resolve, reject) => {
+      scrypt(secret.normalize('NFKC'), salt, keyLength, { N, r, p, maxmem: 128 * N * r + 32 * 1024 * 1024 }, (error, derived) => (error ? reject(error) : resolve(derived)));
+    });
+    if (N === SCRYPT.N) averageHashMs = averageHashMs * 0.8 + (performance.now() - started) * 0.2;
+    return key;
+  });
 }
 
-export async function hashPassword(password: string): Promise<string> {
+export async function hashPassword(password: string, pool: HashPool = 'client'): Promise<string> {
   const salt = randomBytes(16);
   const { N, r, p, keyLength } = SCRYPT;
-  const key = await scryptAsync(password, salt, N, r, p, keyLength);
+  const key = await scryptAsync(password, salt, N, r, p, keyLength, pool);
   return ['scrypt', N, r, p, salt.toString('base64'), key.toString('base64')].join('$');
 }
 
-export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+export async function verifyPassword(password: string, stored: string, pool: HashPool = 'client'): Promise<boolean> {
   const [scheme, N, r, p, salt, key] = stored.split('$');
   if (scheme !== 'scrypt' || !N || !r || !p || !salt || !key) return false;
   const cost = Number(N);
   if (!Number.isInteger(cost) || cost < 2 || cost > MAX_COST || Number(r) !== 8 || Number(p) !== 1) return false;
   const expected = Buffer.from(key, 'base64');
-  const actual = await scryptAsync(password, Buffer.from(salt, 'base64'), cost, 8, 1, expected.length);
+  passwordWork.hashes += 1;
+  const actual = await scryptAsync(password, Buffer.from(salt, 'base64'), cost, 8, 1, expected.length, pool);
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+const DECOY_SALT = randomBytes(16);
+
+/**
+ * The work done for a sign-in attempt that cannot succeed because there is no
+ * usable account. Always answers false, and never refuses.
+ *
+ * When the decoy pool has room it does a real hash, so an attempt on an
+ * unknown email costs and takes what one on a real email does. When it has
+ * not (someone is flooding), it waits about as long as a hash currently takes
+ * instead. The answer is the same either way. What can differ is timing, and
+ * only during a flood: the wait follows the recent average, not the load a
+ * real account's hash is under at that moment, so someone timing responses
+ * while flooding could tell known emails from unknown ones. That is the price
+ * of not letting unknown emails starve real sign-ins.
+ */
+export async function decoyVerify(password: string): Promise<false> {
+  if (hasRoom(POOLS.decoy)) {
+    passwordWork.decoyHashes += 1;
+    await scryptAsync(password, DECOY_SALT, SCRYPT.N, SCRYPT.r, SCRYPT.p, SCRYPT.keyLength, 'decoy');
+    return false;
+  }
+  passwordWork.decoyWaits += 1;
+  await new Promise((resolve) => setTimeout(resolve, averageHashMs * (0.85 + Math.random() * 0.3)));
+  return false;
 }
 
 /** True when a hash was made with a lower cost than today's, so it should be replaced at the next successful sign-in. */
@@ -143,25 +200,25 @@ export const RECOVERY_CODE_GROUPS = 4;
 const RECOVERY_COST = 2 ** 14;
 
 /** Stored as `rc1$<salt>$<scrypt>`: one random salt per set, so a set costs one scrypt to check. */
-export async function hashRecoveryCodes(codes: string[]): Promise<string[]> {
+export async function hashRecoveryCodes(codes: string[], pool: HashPool = 'client'): Promise<string[]> {
   const salt = randomBytes(16);
   const out: string[] = [];
   for (const code of codes) {
-    const key = await scryptAsync(normaliseCode(code), salt, RECOVERY_COST, 8, 1, 32);
+    const key = await scryptAsync(normaliseCode(code), salt, RECOVERY_COST, 8, 1, 32, pool);
     out.push(['rc1', salt.toString('base64'), key.toString('base64')].join('$'));
   }
   return out;
 }
 
 /** The stored entry this code matches, or null. */
-export async function matchRecoveryCode(code: string, stored: string[]): Promise<string | null> {
+export async function matchRecoveryCode(code: string, stored: string[], pool: HashPool = 'client'): Promise<string | null> {
   const candidate = normaliseCode(code);
   const computed = new Map<string, string>();
   let match: string | null = null;
   for (const entry of stored) {
     const [scheme, salt, key] = entry.split('$');
     if (scheme !== 'rc1' || !salt || !key) continue;
-    if (!computed.has(salt)) computed.set(salt, (await scryptAsync(candidate, Buffer.from(salt, 'base64'), RECOVERY_COST, 8, 1, 32)).toString('base64'));
+    if (!computed.has(salt)) computed.set(salt, (await scryptAsync(candidate, Buffer.from(salt, 'base64'), RECOVERY_COST, 8, 1, 32, pool)).toString('base64'));
     if (safeEqual(computed.get(salt) as string, key) && match === null) match = entry;
   }
   return match;
