@@ -7,9 +7,6 @@
     "icon": "./assets/images/icon.png",
     "scheme": "globalconnect",
     "userInterfaceStyle": "light",
-    "ios": {
-      "icon": "./assets/expo.icon"
-    },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#0F172A",

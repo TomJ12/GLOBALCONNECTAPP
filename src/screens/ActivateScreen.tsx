@@ -7,6 +7,7 @@ import { getAuthClient } from '@/api';
 import { toProviderError } from '@/api/errors';
 import type { ActivationStart, TotpEnrolment } from '@/api/types';
 import { AppText } from '@/components/AppText';
+import { BrandLockup } from '@/components/BrandLockup';
 import { Button } from '@/components/Button';
 import { QrCode } from '@/components/QrCode';
 import { Screen } from '@/components/Screen';
@@ -129,9 +130,7 @@ export function ActivateScreen() {
   return (
     <Screen tone="navy">
       <View style={styles.brand}>
-        <AppText variant="label" tone="onDarkMuted" style={styles.wordmark}>
-          {APP_NAME.toUpperCase()}
-        </AppText>
+        <BrandLockup />
         <AppText variant="heading" tone="onDark" accessibilityRole="header">
           Activate your account
         </AppText>
@@ -314,7 +313,6 @@ export function ActivateScreen() {
 
 const styles = StyleSheet.create({
   brand: { gap: spacing.md, marginTop: spacing.xxl },
-  wordmark: { letterSpacing: 2 },
   block: { gap: spacing.md },
   rules: { gap: spacing.xs, padding: spacing.lg, borderRadius: radii.card, borderWidth: 1, borderColor: colors.navyBorder },
   check: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, minHeight: 48 },

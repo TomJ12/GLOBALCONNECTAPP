@@ -122,10 +122,12 @@ describe('SignInScreen', () => {
     expect(selectCompany).toHaveBeenCalledWith('co-b');
   });
 
-  it('shows only placeholder wording for tagline and assurances, and why the person was signed out', async () => {
+  it('shows the approved headline, placeholder wording for assurances, and why the person was signed out', async () => {
     useSession.setState({ signedOutReason: 'inactive' });
     await renderScreen(<SignInScreen />);
-    expect(screen.getByText(disclosures.signInTagline)).toBeOnTheScreen();
+    expect(screen.getByText('Connecting Businesses Globally')).toBeOnTheScreen();
+    expect(screen.getByText('Sign in to manage your currency accounts.')).toBeOnTheScreen();
+    expect(screen.getByLabelText('Global Connect')).toBeOnTheScreen();
     expect(screen.getByText(disclosures.signInAssurance)).toBeOnTheScreen();
     expect(screen.getByText(/in the background for a while/)).toBeOnTheScreen();
   });

@@ -6,11 +6,13 @@ import { getAuthClient } from '@/api';
 import { toProviderError } from '@/api/errors';
 import type { CodeMethod, CompanyOption } from '@/api/types';
 import { AppText } from '@/components/AppText';
+import { BrandLockup } from '@/components/BrandLockup';
 import { Button } from '@/components/Button';
 import { Screen } from '@/components/Screen';
 import { InlineMessage } from '@/components/StateViews';
 import { TextField } from '@/components/TextField';
 import { APP_NAME } from '@/config/app';
+import { brand } from '@/config/brand';
 import { disclosures } from '@/config/disclosures';
 import { useCompleteSignIn, useSelectCompany, useSignIn } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
@@ -122,11 +124,12 @@ export function SignInScreen() {
   return (
     <Screen tone="navy">
       <View style={styles.brand}>
-        <AppText variant="label" tone="onDarkMuted" style={styles.wordmark} accessibilityRole="header">
-          {APP_NAME.toUpperCase()}
+        <BrandLockup />
+        <AppText variant="heading" tone="onDark" accessibilityRole="header">
+          {brand.signInHeadline}
         </AppText>
-        <AppText variant="heading" tone="onDark">
-          {disclosures.signInTagline}
+        <AppText variant="body" tone="onDarkMuted">
+          {brand.signInSupporting}
         </AppText>
       </View>
 
@@ -281,7 +284,6 @@ export function SignInScreen() {
 
 const styles = StyleSheet.create({
   brand: { gap: spacing.md, marginTop: spacing.xxl },
-  wordmark: { letterSpacing: 2 },
   block: { gap: spacing.md },
   devCard: { gap: spacing.sm, padding: spacing.lg, borderRadius: radii.card, borderWidth: 1, borderColor: colors.navyBorder, borderStyle: 'dashed' },
   footer: { marginTop: 'auto', gap: spacing.sm, paddingTop: spacing.xl },
