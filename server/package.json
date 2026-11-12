@@ -8,6 +8,7 @@
     "start": "tsx --env-file-if-exists=.env src/index.ts",
     "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
     "invite": "tsx --env-file-if-exists=.env src/cli/invite.ts",
+    "create-ops-admin": "tsx --env-file-if-exists=.env src/cli/create-ops-admin.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"
   },

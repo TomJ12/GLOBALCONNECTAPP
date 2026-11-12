@@ -35,6 +35,9 @@ export interface Harness {
   /** Get a step-up token for an action. */
   stepUp: (token: string, secret: string, action: string, payload: unknown) => Promise<string>;
   close: () => Promise<void>;
+  app: Awaited<ReturnType<typeof buildApp>>['app'];
+  opsAuth: Awaited<ReturnType<typeof buildApp>>['opsAuth'];
+  opsRoutes: { method: string; url: string }[];
 }
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory()): Promise<Harness> {
@@ -51,7 +54,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, now }),
     equals: equalsFactory({ credentials: config.providers.equals, now }),
   });
-  const { app, auth } = await buildApp({ config, stores, registry, now });
+  const { app, auth, opsAuth, opsRoutes } = await buildApp({ config, stores, registry, now });
   const bodies: string[] = [];
 
   const call: Harness['call'] = async (method, url, options = {}) => {
@@ -99,7 +102,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, close: () => app.close() };
+  return { config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, close: () => app.close(), app, opsAuth, opsRoutes };
 }
 
 export const AMIRA = 'amira@northfield.example';

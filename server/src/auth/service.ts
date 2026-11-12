@@ -23,11 +23,16 @@ import {
   verifyPassword,
 } from '../crypto';
 import { ApiError } from '../errors';
-import type { CompanyRecord, SessionRecord, Stores, UserRecord } from '../store/types';
+import type { AuditParty, CompanyRecord, SessionRecord, Stores, UserRecord } from '../store/types';
+import { Lockout } from './lockout';
 
 const ISSUER = 'Global Connect';
 const RECOVERY_CODE_COUNT = 10;
 const MAX_CHALLENGE_ATTEMPTS = 5;
+
+const partyOf = (user: UserRecord): AuditParty => ({ type: 'client', id: user.id, label: user.email });
+/** The neutral reason of a refusal, for the audit log. Never the submitted value. */
+export const reasonOf = (error: unknown): string => (error instanceof ApiError ? (error.options.reason ?? error.kind) : 'error');
 
 export interface SessionContext {
   session: SessionRecord;
@@ -48,39 +53,32 @@ export interface SignedIn {
 export class AuthService {
   /** Verified against when the email is unknown, so both paths cost one scrypt. */
   private dummyHash: Promise<string> | null = null;
+  private readonly lockout: Lockout;
 
   constructor(
     private readonly stores: Stores,
     private readonly config: Config,
     private readonly now: () => number = Date.now,
-  ) {}
-
-  // --- Lockout ----------------------------------------------------------------
-
-  /**
-   * Progressive lockout. The key is what is being guessed against (an email's
-   * password, a user's codes), whether or not that account exists, so a locked
-   * response says nothing about existence.
-   */
-  private async assertNotLocked(key: string): Promise<void> {
-    const record = await this.stores.auth.attempts.get(key);
-    if (record && record.lockedUntil > this.now()) {
-      throw new ApiError('rate_limited', { reason: 'locked', retryAfterSeconds: Math.ceil((record.lockedUntil - this.now()) / 1000) });
-    }
+  ) {
+    this.lockout = new Lockout(stores.auth.attempts, config, now);
   }
 
-  private async recordFailure(key: string): Promise<void> {
-    const record = (await this.stores.auth.attempts.get(key)) ?? { failures: 0, lockedUntil: 0 };
-    record.failures += 1;
-    const over = record.failures - this.config.lockoutThreshold;
-    if (over >= 0) {
-      record.lockedUntil = this.now() + Math.min(this.config.lockoutBaseMs * 2 ** Math.min(over, 30), this.config.lockoutMaxMs);
-    }
-    await this.stores.auth.attempts.put(key, record);
+  /** Writes an authentication event. `detail` holds neutral reasons only: never a password, key, code or token. */
+  private log(action: string, outcome: 'success' | 'failure', actor: AuditParty, source: string, detail: Record<string, string> = {}): Promise<void> {
+    return this.stores.audit.append({ at: this.now(), actor, target: null, action, outcome, source, detail });
+  }
+
+  private assertNotLocked(key: string): Promise<void> {
+    return this.lockout.assertNotLocked(key);
+  }
+
+  private async recordFailure(key: string, who?: AuditParty, source = ''): Promise<void> {
+    const locked = await this.lockout.recordFailure(key);
+    if (locked && who) await this.log('client.lockout', 'failure', who, source, { guarded: key.split(':')[0] ?? '' });
   }
 
   private clearFailures(key: string): Promise<void> {
-    return this.stores.auth.attempts.delete(key);
+    return this.lockout.clear(key);
   }
 
   // --- Invitations and activation ---------------------------------------------
@@ -126,14 +124,15 @@ export class AuthService {
   }
 
   /** Completes activation: needs a correct code from the newly added authenticator entry. The invitation is then spent. */
-  async activationConfirm(activationCode: string, code: string) {
+  async activationConfirm(activationCode: string, code: string, source = '') {
     const { key, record, user } = await this.activation(activationCode);
     if (!record.pendingPasswordHash || !record.pendingTotpSecret) throw new ApiError('validation', { reason: 'activation_invalid' });
     const lockKey = `activation:${key}`;
     await this.assertNotLocked(lockKey);
     const check = checkTotp(record.pendingTotpSecret, code, this.now(), 0);
     if (!check.ok) {
-      await this.recordFailure(lockKey);
+      await this.recordFailure(lockKey, partyOf(user), source);
+      await this.log('client.activation', 'failure', partyOf(user), source, { reason: 'invalid_code' });
       throw new ApiError('validation', { reason: 'invalid_code', fields: ['code'] });
     }
     const recoveryCodes = Array.from({ length: RECOVERY_CODE_COUNT }, () => randomCode(2));
@@ -147,6 +146,7 @@ export class AuthService {
     });
     await this.stores.auth.activations.delete(key);
     await this.clearFailures(lockKey);
+    await this.log('client.activation', 'success', partyOf(user), source);
     return { recoveryCodes };
   }
 
@@ -156,16 +156,28 @@ export class AuthService {
    * Step 1. Unknown email, wrong password and not-yet-activated account all
    * give the same answer after the same work (one scrypt verification).
    */
-  async login(email: string, password: string): Promise<{ challengeId: string }> {
+  async login(email: string, password: string, source = ''): Promise<{ challengeId: string }> {
     const address = email.trim().toLowerCase();
+    // The address as typed is kept for the audit log; it is not a secret, but cap what an anonymous caller can store.
+    const who: AuditParty = { type: 'client', id: null, label: address.slice(0, 254) };
+    try {
+      return await this.checkPassword(address, password, who, source);
+    } catch (error) {
+      await this.log('client.sign_in', 'failure', who, source, { stage: 'password', reason: reasonOf(error) });
+      throw error;
+    }
+  }
+
+  private async checkPassword(address: string, password: string, who: AuditParty, source: string): Promise<{ challengeId: string }> {
     const lockKey = `password:${address}`;
     await this.assertNotLocked(lockKey);
     const user = await this.stores.directory.findUserByEmail(address);
     this.dummyHash ??= hashPassword(randomToken());
-    const usable = user !== null && user.passwordHash !== null && user.activatedAt !== null;
+    // A disabled account answers exactly like an unknown one.
+    const usable = user !== null && user.passwordHash !== null && user.activatedAt !== null && !user.disabledAt;
     const matches = await verifyPassword(password, usable ? (user.passwordHash as string) : await this.dummyHash);
     if (!usable || !matches) {
-      await this.recordFailure(lockKey);
+      await this.recordFailure(lockKey, who, source);
       throw new ApiError('validation', { reason: 'invalid_credentials' });
     }
     await this.clearFailures(lockKey);
@@ -179,48 +191,57 @@ export class AuthService {
   }
 
   /** Checks an authenticator code for this user and burns its time step. */
-  private async verifyUserTotp(user: UserRecord, code: string): Promise<void> {
+  private async verifyUserTotp(user: UserRecord, code: string, source: string): Promise<UserRecord> {
     const lockKey = `code:${user.id}`;
     await this.assertNotLocked(lockKey);
     const check = user.totpSecret ? checkTotp(user.totpSecret, code, this.now(), user.lastTotpStep) : ({ ok: false, reason: 'invalid' } as const);
     if (!check.ok) {
-      await this.recordFailure(lockKey);
+      await this.recordFailure(lockKey, partyOf(user), source);
       throw new ApiError('validation', { reason: check.reason === 'reused' ? 'code_reused' : 'invalid_code', fields: ['code'] });
     }
     await this.clearFailures(lockKey);
-    await this.stores.directory.saveUser({ ...user, lastTotpStep: check.step });
+    const updated = { ...user, lastTotpStep: check.step };
+    await this.stores.directory.saveUser(updated);
+    return updated;
   }
 
   /** Step 2. An authenticator code, or a recovery code that is then spent. */
-  async verifyLogin(challengeId: string, code: string, method: CodeMethod): Promise<SignedIn> {
+  async verifyLogin(challengeId: string, code: string, method: CodeMethod, source = ''): Promise<SignedIn> {
     const challengeKey = sha256(challengeId);
     const challenge = await this.stores.auth.challenges.get(challengeKey);
-    const user = challenge && challenge.expiresAt > this.now() ? await this.stores.directory.getUser(challenge.userId) : null;
+    const found = challenge && challenge.expiresAt > this.now() ? await this.stores.directory.getUser(challenge.userId) : null;
+    let user = found && !found.disabledAt ? found : null;
     if (!challenge || !user) {
       await this.stores.auth.challenges.delete(challengeKey);
       throw new ApiError('validation', { reason: 'challenge_expired' });
     }
     try {
       if (method === 'totp') {
-        await this.verifyUserTotp(user, code);
+        user = await this.verifyUserTotp(user, code, source);
       } else {
         const lockKey = `code:${user.id}`;
         await this.assertNotLocked(lockKey);
         const hash = sha256(normaliseCode(code));
         if (!user.recoveryCodeHashes.includes(hash)) {
-          await this.recordFailure(lockKey);
+          await this.recordFailure(lockKey, partyOf(user), source);
           throw new ApiError('validation', { reason: 'invalid_code', fields: ['code'] });
         }
         await this.clearFailures(lockKey);
-        await this.stores.directory.saveUser({ ...user, recoveryCodeHashes: user.recoveryCodeHashes.filter((item) => item !== hash) });
+        const kept = user.recoveryCodeHashes;
+        user = { ...user, recoveryCodeHashes: kept.filter((item) => item !== hash) };
+        await this.stores.directory.saveUser(user);
       }
     } catch (error) {
+      await this.log('client.sign_in', 'failure', partyOf(user), source, { stage: 'code', method, reason: reasonOf(error) });
       challenge.attempts += 1;
       if (challenge.attempts >= MAX_CHALLENGE_ATTEMPTS) await this.stores.auth.challenges.delete(challengeKey);
       else await this.stores.auth.challenges.put(challengeKey, challenge);
       throw error;
     }
     await this.stores.auth.challenges.delete(challengeKey);
+    user = { ...user, lastSignInAt: this.now() };
+    await this.stores.directory.saveUser(user);
+    await this.log('client.sign_in', 'success', partyOf(user), source, { method });
 
     const companies = await this.companiesOf(user.id);
     const token = randomToken();
@@ -247,7 +268,8 @@ export class AuthService {
     const found = await Promise.all(
       memberships.map(async (membership) => ({ company: await this.stores.directory.getCompany(membership.companyId), role: membership.role })),
     );
-    return found.filter((item): item is { company: CompanyRecord; role: UserRole } => item.company !== null);
+    // A deactivated company is as good as absent: it cannot be selected or used.
+    return found.filter((item): item is { company: CompanyRecord; role: UserRole } => item.company !== null && !item.company.deactivatedAt);
   }
 
   private async contextFor(tokenHash: string, session: SessionRecord, user: UserRecord): Promise<SessionContext> {
@@ -269,7 +291,7 @@ export class AuthService {
       throw new ApiError('unauthorized');
     }
     const user = await this.stores.directory.getUser(session.userId);
-    if (!user || user.activatedAt === null) {
+    if (!user || user.activatedAt === null || user.disabledAt) {
       await this.revoke(tokenHash, session.id);
       throw new ApiError('unauthorized');
     }
@@ -294,11 +316,55 @@ export class AuthService {
     await this.stores.auth.stepUps.deleteWhere((record) => record.sessionId === sessionId);
   }
 
-  async logout(token: string | undefined): Promise<void> {
+  async logout(token: string | undefined, source = ''): Promise<void> {
     if (!token) return;
     const tokenHash = sha256(token);
     const session = await this.stores.auth.sessions.get(tokenHash);
-    if (session) await this.revoke(tokenHash, session.id);
+    if (!session) return;
+    await this.revoke(tokenHash, session.id);
+    const user = await this.stores.directory.getUser(session.userId);
+    if (user) await this.log('client.sign_out', 'success', partyOf(user), source);
+  }
+
+  // --- For operations (the ops console). None of these reads or returns a credential. ---
+
+  activeSessionCount(userId: string): Promise<number> {
+    const now = this.now();
+    return this.stores.auth.sessions.count(
+      (session) => session.userId === userId && now - session.lastSeenAt <= this.config.sessionIdleMs && now - session.createdAt <= this.config.sessionAbsoluteMs,
+    );
+  }
+
+  /** Ends every session of this person. Returns how many there were. */
+  async revokeAllSessions(userId: string): Promise<number> {
+    const total = await this.stores.auth.sessions.count((session) => session.userId === userId);
+    await this.stores.auth.sessions.deleteWhere((session) => session.userId === userId);
+    await this.stores.auth.stepUps.deleteWhere((record) => record.userId === userId);
+    await this.stores.auth.challenges.deleteWhere((record) => record.userId === userId);
+    return total;
+  }
+
+  async isLocked(user: UserRecord): Promise<boolean> {
+    return (await this.lockout.isLocked(`password:${user.email}`)) || (await this.lockout.isLocked(`code:${user.id}`));
+  }
+
+  async unlock(user: UserRecord): Promise<void> {
+    await this.lockout.clear(`password:${user.email}`);
+    await this.lockout.clear(`code:${user.id}`);
+  }
+
+  /**
+   * Removes the password, the authenticator key and the recovery codes, ends
+   * every session and withdraws any invitation. The person is back to "not
+   * activated" and needs a new activation link.
+   */
+  async clearCredentials(userId: string): Promise<number> {
+    const user = await this.stores.directory.getUser(userId);
+    if (!user) throw new ApiError('not_found');
+    await this.stores.directory.saveUser({ ...user, passwordHash: null, totpSecret: null, recoveryCodeHashes: [], activatedAt: null });
+    await this.stores.auth.activations.deleteWhere((record) => record.userId === userId);
+    await this.unlock(user);
+    return this.revokeAllSessions(userId);
   }
 
   // --- Step-up ----------------------------------------------------------------
@@ -307,8 +373,14 @@ export class AuthService {
    * A fresh authenticator code buys ONE permission, for this person, in this
    * session, to do this action with exactly this payload, for a short time.
    */
-  async grantStepUp(context: SessionContext, action: StepUpAction, payload: unknown, code: string): Promise<{ token: string; expiresInSeconds: number }> {
-    await this.verifyUserTotp(context.user, code);
+  async grantStepUp(context: SessionContext, action: StepUpAction, payload: unknown, code: string, source = ''): Promise<{ token: string; expiresInSeconds: number }> {
+    try {
+      await this.verifyUserTotp(context.user, code, source);
+    } catch (error) {
+      await this.log('client.step_up', 'failure', partyOf(context.user), source, { for: action, reason: reasonOf(error) });
+      throw error;
+    }
+    await this.log('client.step_up', 'success', partyOf(context.user), source, { for: action });
     const token = randomToken();
     await this.stores.auth.stepUps.put(sha256(token), {
       userId: context.user.id,

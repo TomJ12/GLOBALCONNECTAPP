@@ -5,7 +5,9 @@ details, payments with approval, spot and forward conversion, rates and rate ale
 the Global Connect server it signs in to.
 
 **Nothing here is connected to a real provider or a real database. All data is sample
-data, the provider APIs are in-memory mocks and server storage is in memory.** Fees,
+data, the provider APIs are in-memory mocks and server storage is in memory (or, for
+the local demo only, one JSON file).** The server also serves an **ops console** for
+Global Connect staff under `/ops` (see "Ops console"). Fees,
 delivery times and regulatory wording are bracketed placeholders.
 
 - App: Expo SDK 58, React Native 0.88, TypeScript strict, expo-router; iOS, Android, web
@@ -42,8 +44,9 @@ the forwarded address (`https://<codespace>-3001.app.github.dev`); open it from 
 tab. The port can stay private. Activation links printed by the server use that address.
 (Not run in a Codespace by us: see "Not production-ready and not verified".)
 
-The server prints activation codes for the three sample users at start-up, in development
-only (never when `NODE_ENV=production`):
+The server prints activation codes for the three sample users, and an activation link
+for one demo ops admin (`ops.admin@globalconnect.example`, for the ops console at
+`/ops`), at start-up, in development only (never when `NODE_ENV=production`):
 
 | User | Company | Held at |
 |---|---|---|
@@ -67,7 +70,14 @@ To try it:
    for the next one if you just used it to activate).
 6. Send a payment: after the review step the app asks for a fresh 6-digit code.
 
-Everything is in memory: restarting the server forgets the accounts and prints new codes.
+**Demo accounts are kept between runs.** `npm run demo` sets `DATA_FILE` to
+`.demo-data/accounts.json` (git-ignored) and says so when it starts, so accounts you
+activate survive a restart. Wipe it with `npm run demo:reset`. That file holds password
+hashes, authenticator keys **in plain form**, unused activation records and the audit
+log. It is for a local demonstration only: the server refuses to start with `DATA_FILE`
+when `NODE_ENV=production`. Sessions are not kept, so a restart signs everyone out.
+Without `DATA_FILE` (for example `npm run server`) everything is in memory and a restart
+forgets the accounts and prints new codes.
 
 To invite again by hand (stands in for an admin tool and for email delivery), set
 `ADMIN_TOKEN` in `server/.env` (see `server/.env.example`), restart the server and run
@@ -109,7 +119,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 29 tests
+npm test                 # node:test, 42 tests
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -178,14 +188,18 @@ server/
   src/
     config.ts       environment -> settings (provider credentials, CORS, timeouts, flags)
     crypto.ts       scrypt passwords, TOTP (RFC 6238), base32, tokens
-    auth/service.ts invitations, activation, login, lockout, sessions, step-up
-    store/          types.ts (repository interfaces), memory.ts, seed.ts  <- PLACEHOLDER storage
+    auth/service.ts invitations, activation, login, sessions, step-up (clients)
+    auth/lockout.ts progressive lockout, shared by client and staff sign-in
+    ops/            the ops console: auth.ts (staff accounts, sessions, step-up),
+                    console.ts (every /ops route and page), html.ts, static/ (css, js)
+    store/          types.ts (repository interfaces incl. OpsStore and AuditLog), memory.ts,
+                    file.ts (local demo only), seed.ts  <- PLACEHOLDER storage
     providers/
       adapter.ts          ProviderAdapter (= the app's ProviderClient + capabilities), registry
       currencycloud.ts    provider A: reuses src/api/adapters/currencycloud
       equals/             provider B: raw.ts, mockServer.ts, adapter.ts
     http/app.ts     the REST API
-    cli/invite.ts   npm run invite -- <email>
+    cli/            invite.ts (npm run invite -- <email>), create-ops-admin.ts
   test/             node:test
 scripts/demo.mjs    npm run demo
 metro.config.js     leaves the in-app demo (and provider A's code) out of server builds
@@ -267,8 +281,8 @@ been assessed.
 ### Accounts are invite-only
 
 There is no sign-up endpoint. Operations add the person to the directory (users,
-companies, memberships with a role: `creator`, `approver` or `admin`; the seed file
-stands in for an admin tool) and issue an activation code:
+companies, memberships with a role: `creator`, `approver` or `admin`) from the ops
+console and issue an activation code there (the seed file provides the sample people):
 
 1. `POST /v1/activation/start {activationCode}` → email, name, password policy.
 2. `POST /v1/activation/password {activationCode, password}` → policy check (12+
@@ -356,6 +370,127 @@ With `STEP_UP_CONVERSIONS=1` the code has to be typed while the quote is still h
 - After 2 minutes in the background (`INACTIVITY_LOCK_MS`) the app signs out. There is no
   device unlock of any kind.
 
+## Ops console
+
+A staff-only, desktop web console served by the server itself at `/ops`: plain
+server-rendered HTML, one stylesheet, one small script for copy buttons and
+confirmations (the pages work without it), no framework, no CDN, no third-party request.
+It shares nothing with the client app: separate routes, a separate account table
+(`stores.ops`), separate invitations, sessions and lockout counters, and a separate
+cookie. The client app was not changed and knows nothing about it.
+
+### Create the first ops admin
+
+- **Demo / development:** the server creates `ops.admin@globalconnect.example` and
+  prints its activation link beside the client codes. Open the link, choose a password,
+  scan the QR code with an authenticator app, confirm with a code and save the recovery
+  codes. This never happens with `NODE_ENV=production`.
+- **Otherwise:** set `ADMIN_TOKEN` in `server/.env`, start the server, then
+
+  ```bash
+  npm run create-ops-admin -- jo@example.com "Jo Smith"
+  ```
+
+  It prints an activation link valid for 72 hours. It works only while no activated,
+  enabled ops admin exists (it may be re-run to replace the link of one not yet
+  activated). After that, staff are invited from **Ops staff** in the console.
+
+Activation links for staff carry the code after `#` (`/ops/activate#code=…`), which
+browsers do not send to the server, so it is not in request logs; the script copies it
+into the form. Without JavaScript, type the code.
+
+### Open it
+
+- `npm run demo`, then `http://localhost:3001/ops`.
+- `npm run server`: `http://localhost:3001/ops` (set `OPS_URL` if the server is reached
+  at another address, so printed staff links and the cookie's `Secure` flag are right).
+- **GitHub Codespaces:** `npm run demo` and open the forwarded port 3001 address with
+  `/ops` on the end (`https://<codespace>-3001.app.github.dev/ops`). The port can stay
+  private. The session cookie is `Secure` there because the address is not localhost.
+  (Not run in a Codespace by us.)
+
+Sign-in is email + password, then a code (or a recovery code). The session is a cookie
+(`gc_ops_session`: HttpOnly, SameSite=Strict, Path=/ops, Secure unless on localhost),
+ends after **10 minutes** idle or 8 hours, and every form carries a CSRF field bound to
+that session; requests a browser marks as coming from another site are refused. `/ops`
+responses carry a CSP without inline script or style, `frame-ancestors 'none'` and
+`no-store`. Lockout and uniform errors work as for clients.
+
+### What ops can do
+
+Every change needs a **fresh authenticator code from the staff member, typed into the
+form that makes the change** (step-up), and is written to the audit log whether it
+succeeds or not. A code works once, so two changes need two codes (about 30 seconds
+apart).
+
+- **Companies:** list, search, view, create (name, provider, provider account id), edit,
+  deactivate / reactivate. A deactivated company disappears for its clients at once.
+  The provider is chosen as "Provider A / Provider B" with its name beside it; provider
+  names appear only here, never in anything the client app receives (tested).
+- **Client users:** list, search, view; create (name, email) attached to one or more
+  companies with a role; change roles; remove from a company.
+- **Activation link:** issue or re-issue for a client who is not activated. The earlier
+  link stops working; the new one is shown once with a copy button and its expiry.
+  **Nothing is emailed**: staff pass it on through an approved channel.
+- **Unlock** a locked-out client. **Revoke all sessions.** **Disable / re-enable** (a
+  disabled client cannot sign in, gets the same answer as a wrong password, and loses
+  every session immediately).
+- **Status:** activated or not, last sign-in, locked or not, number of active sessions.
+- **Reset authenticator** (see the warning below).
+- **Ops admins only:** list staff, invite, change role, disable / re-enable, re-issue a
+  staff activation link, reset a staff authenticator. An admin cannot demote, disable or
+  reset themselves, and the last active ops admin cannot be removed.
+- **Audit log:** view and filter by actor, target, action and date.
+
+### What ops cannot do
+
+There is no route for any of these, and tests check the route list and the pages:
+
+- see or set anyone's password, authenticator key or recovery codes (a reset removes
+  them; the person chooses new ones);
+- see balances, transactions, payees or payments; create, approve or cancel a payment or
+  a conversion. The console never calls a provider;
+- sign in as a client. A staff session is refused by the client API and a client
+  session is refused by `/ops` (tested in both directions);
+- change or delete an audit entry.
+
+### Resetting an authenticator: verify identity first
+
+A reset removes the person's authenticator, recovery codes **and password**, ends every
+session and issues a new activation link. **Whoever receives that link controls the
+account.** Before resetting, verify the person's identity by a route that does not
+depend on the request itself (call back on a number already on file, not one given in
+the email asking for the reset). The form will not submit without a description of how
+identity was verified, and that text is stored in the audit log with the staff member's
+name. The console cannot check that the verification really happened.
+
+### Audit log
+
+`AuditLog` (`server/src/store/types.ts`) has `append` and `query` and nothing else.
+Recorded: every ops action (success and failure) and, for clients and staff alike,
+activation, sign-in success and failure, lockout, step-up, sign-out and sessions revoked
+by ops; each with time, actor, target, action, outcome and source address. It never
+contains a password, key, code or token (a test plants them and searches the log). A
+failed sign-in records the email address that was typed. Expired sessions are not
+recorded.
+
+### Still not production-ready (ops console)
+
+- **Email delivery** of activation links: staff copy the link by hand.
+- **A real database:** staff accounts, the audit log and everything else are in memory
+  (or the demo JSON file). The in-memory audit log is capped at 100,000 entries and is
+  append-only only in the sense that the code offers no other operation; it needs
+  write-once storage, **shipping and a retention policy**.
+- **Who can reach `/ops`:** it is on the same port as the client API, open to anyone who
+  can reach the server. It needs **IP allow-listing or a VPN, and staff SSO**.
+- **Four-eyes approval:** one staff member alone can reset a client's authenticator or
+  invite an ops admin. Sensitive actions should need a second person.
+- **Break-glass:** if the only ops admin loses their authenticator and recovery codes
+  there is no way back in short of editing storage.
+- **Penetration testing:** none. The CSRF, cookie and CSP choices follow common practice
+  and are covered by tests, not by an independent review.
+- `ADMIN_TOKEN` (one shared secret) still guards the bootstrap and `invite` endpoints.
+
 ## Replacing the placeholders
 
 ### A real provider adapter
@@ -375,8 +510,9 @@ With `STEP_UP_CONVERSIONS=1` the code has to be typed while the quote is still h
 
 ### A real database
 
-Implement `Directory` and `AuthStore` from `server/src/store/types.ts` and pass them to
-`buildApp`. Things the in-memory version gets away with that a database must do properly:
+Implement `Directory`, `AuthStore`, `OpsStore` and `AuditLog` from
+`server/src/store/types.ts` and pass them to `buildApp`. (`store/file.ts` is not that:
+it is the in-memory store written to a JSON file for the local demo.) Things the in-memory version gets away with that a database must do properly:
 encrypt TOTP keys at rest; make "accept this TOTP step" and "spend this step-up token"
 atomic (compare-and-set), since two simultaneous requests could both pass today; expire
 rows; move the issued-quote map (`http/app.ts`) and provider B's key→order map
@@ -453,7 +589,8 @@ the real product. No rate history is offered, so no trend line is drawn.
   is ever sent.
 - **App icon and splash**: the Expo template images.
 - **Developer panel**: shown whenever the mock backend is active. Hide it before release.
-- **Server storage**: in memory, with a seed directory of made-up people and companies.
+- **Server storage**: in memory (optionally mirrored to a local JSON file for the demo),
+  with a seed directory of made-up people and companies.
 - **Both provider APIs**: in-memory mocks.
 - **The in-app demo sign-in**: accepts anything; code `000000`.
 
@@ -483,15 +620,17 @@ Not built:
 
 - **Email delivery** of activation links. Codes are printed to the console in development
   and returned by the `invite` command.
-- **Account recovery** when a phone and the recovery codes are both lost; password
-  change and reset; re-enrolling an authenticator; regenerating recovery codes. An
-  activated account cannot be re-invited.
-- **Admin tool**: users, companies, memberships and roles exist only as seed data. The
-  `/admin/invites` endpoint guarded by one shared token is a stand-in, not a design.
-- **Audit log**: no record of sign-ins, step-ups or money actions is kept.
+- **Self-service account recovery**: password change and reset, re-enrolling an
+  authenticator and regenerating recovery codes by the client. The only recovery is an
+  ops reset (see "Ops console"), which replaces everything.
+- **Ops console gaps**: see "Still not production-ready (ops console)". The older
+  `/admin/invites` endpoint guarded by one shared token is still there as a stand-in.
+- **Audit of money actions**: the audit log covers authentication and ops actions, not
+  payments, approvals or conversions.
 - **Secrets management**: credentials are plain environment variables; TOTP keys are
   held unencrypted in memory.
-- **Database**: see "A real database". Everything is lost on restart.
+- **Database**: see "A real database". Everything is lost on restart unless the demo
+  file store is on.
 - **Hosting**: no TLS termination, deployment, monitoring, backups or multi-instance
   support. Rate limits and lockouts are per process. Behind a proxy set `TRUST_PROXY=1`
   or every client shares one address for rate limiting.
@@ -508,6 +647,9 @@ Not verified by us:
 - GitHub Codespaces: `npm run demo` was run locally only.
 - The web app driven in a browser against the server: the server flow was exercised
   with a script over HTTP and the screens with Jest against the in-app demo.
+- The ops console in a real browser: it was driven end to end over HTTP by a script
+  (forms, cookies, CSRF fields), so its layout, the copy button, the confirmation
+  prompts, the `#code=` prefill and the CSP as a browser enforces it were not seen.
 - A real authenticator app scanning the QR code. The URI is the standard `otpauth://`
   form and the codes match the RFC 6238 test vectors.
 - Any physical or simulated iOS or Android device.

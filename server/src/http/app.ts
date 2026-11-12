@@ -22,6 +22,8 @@ import { AuthService, type SessionContext } from '../auth/service';
 import type { Config } from '../config';
 import { safeEqual } from '../crypto';
 import { ApiError } from '../errors';
+import { OpsAuthService } from '../ops/auth';
+import { registerOps } from '../ops/console';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
 
@@ -69,10 +71,23 @@ function header(request: FastifyRequest, name: string): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+/** Creates the first ops admin, or re-invites one that is not activated yet. Null when an active ops admin already exists. */
+export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, email: string, name: string, at: number, source: string) {
+  const staff = await stores.ops.users.list();
+  if (staff.some((user) => user.role === 'ops_admin' && user.activatedAt !== null && user.disabledAt === null)) return null;
+  const existing = await stores.ops.users.findByEmail(email);
+  if (existing && (existing.role !== 'ops_admin' || existing.disabledAt !== null)) return null;
+  const user = existing ?? (await opsAuth.createUser(email, name, 'ops_admin'));
+  const invite = await opsAuth.createInvite(user.id);
+  await stores.audit.append({ at, actor: { type: 'system', id: null, label: 'bootstrap' }, target: { type: 'ops', id: user.id, label: user.email }, action: 'ops.bootstrap_admin', outcome: 'success', source, detail: {} });
+  return invite;
+}
+
 export async function buildApp(deps: AppDeps) {
   const { config, registry } = deps;
   const now = deps.now ?? Date.now;
   const auth = new AuthService(deps.stores, config, now);
+  const opsAuth = new OpsAuthService(deps.stores, config, now);
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
 
   const app = Fastify({
@@ -215,16 +230,16 @@ export async function buildApp(deps: AppDeps) {
         auth.activationPassword(field(request.body, 'activationCode', text(64)), field(request.body, 'password', text(1000))),
       );
       api.post('/activation/confirm', { preHandler: limitAttempts }, async (request) =>
-        auth.activationConfirm(field(request.body, 'activationCode', text(64)), field(request.body, 'code', text(16))),
+        auth.activationConfirm(field(request.body, 'activationCode', text(64)), field(request.body, 'code', text(16)), request.ip),
       );
 
       // --- Sign-in ------------------------------------------------------------
       api.post('/auth/login', { preHandler: limitAttempts }, async (request) =>
-        auth.login(field(request.body, 'email', text(254)), field(request.body, 'password', text(1000))),
+        auth.login(field(request.body, 'email', text(254)), field(request.body, 'password', text(1000)), request.ip),
       );
       api.post('/auth/login/verify', { preHandler: limitAttempts }, async (request) => {
         const method = (request.body as { method?: unknown } | null)?.method === 'recovery' ? 'recovery' : 'totp';
-        const signedIn = await auth.verifyLogin(field(request.body, 'challengeId', text(128)), field(request.body, 'code', text(32)), method);
+        const signedIn = await auth.verifyLogin(field(request.body, 'challengeId', text(128)), field(request.body, 'code', text(32)), method, request.ip);
         const { context } = signedIn;
         return {
           token: signedIn.token,
@@ -234,7 +249,7 @@ export async function buildApp(deps: AppDeps) {
         };
       });
       api.post('/auth/logout', async (request) => {
-        await auth.logout(bearer(request));
+        await auth.logout(bearer(request), request.ip);
         return { ok: true };
       });
       api.post('/session/company', async (request) => {
@@ -248,7 +263,7 @@ export async function buildApp(deps: AppDeps) {
         const body = request.body as { payload?: unknown } | null;
         const action = field<StepUpAction>(body, 'action', schemas.stepUpAction);
         if (!MAY[action].includes(context.role)) throw new ApiError('forbidden');
-        return auth.grantStepUp(context, action, body?.payload ?? null, field(body, 'code', text(16)));
+        return auth.grantStepUp(context, action, body?.payload ?? null, field(body, 'code', text(16)), request.ip);
       });
 
       // --- Account data, always for the session's company ---------------------
@@ -383,13 +398,33 @@ export async function buildApp(deps: AppDeps) {
     return { ...invite, expiresAt: new Date(invite.expiresAt).toISOString() };
   });
 
+  /**
+   * Bootstrap for `npm run create-ops-admin`: creates the FIRST ops admin (or
+   * re-issues the link of one not yet activated). Refused once an active ops
+   * admin exists; from then on staff are invited from the ops console.
+   */
+  app.post('/admin/ops-admins', { preHandler: limitAttempts }, async (request) => {
+    const token = bearer(request);
+    if (!config.adminToken || !token || !safeEqual(token, config.adminToken)) throw new ApiError('not_found');
+    const body = request.body as { email?: unknown; name?: unknown } | null;
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new ApiError('validation', { fields: ['email'] });
+    if (!name || name.length > 120) throw new ApiError('validation', { fields: ['name'] });
+    const invite = await bootstrapOpsAdmin(deps.stores, opsAuth, email, name, now(), request.ip);
+    if (!invite) throw new ApiError('forbidden');
+    return { ...invite, expiresAt: new Date(invite.expiresAt).toISOString() };
+  });
+
+  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, now, limitAttempts });
+
   app.get('/healthz', async () => ({ ok: true }));
 
   // --- Demo: serve the exported web app from the same origin ----------------------
   if (config.webDir) {
     await app.register(fastifyStatic, { root: path.resolve(config.webDir), wildcard: false });
     app.setNotFoundHandler((request, reply) => {
-      const isPage = request.method === 'GET' && !request.url.startsWith('/v1/') && !request.url.startsWith('/admin/');
+      const isPage = request.method === 'GET' && !request.url.startsWith('/v1/') && !request.url.startsWith('/admin/') && !request.url.startsWith('/ops');
       // The web app is a single page: every other path is one of its routes.
       if (isPage) return reply.header('Cache-Control', 'no-store').sendFile('index.html');
       return reply.status(404).send(new ApiError('not_found').body());
@@ -399,5 +434,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, auth };
+  return { app, auth, opsAuth, opsRoutes };
 }

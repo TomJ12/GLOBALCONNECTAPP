@@ -10,6 +10,10 @@ export interface Config {
   production: boolean;
   corsOrigins: string[];
   appUrl: string;
+  /** Public address of this server, where the ops console lives under /ops. */
+  opsUrl: string;
+  /** LOCAL DEMO ONLY: keep accounts in this JSON file. Never allowed in production. */
+  dataFile: string | null;
   trustProxy: boolean;
   adminToken: string | null;
   /** Folder of the exported web app to serve from the same origin, or null. */
@@ -21,6 +25,9 @@ export interface Config {
   loginChallengeTtlMs: number;
   activationTtlMs: number;
   stepUpTtlMs: number;
+  /** Staff sessions are shorter than client sessions. */
+  opsSessionIdleMs: number;
+  opsSessionAbsoluteMs: number;
   /** Conversions between the client's own balances need a fresh code too. Off by default. */
   stepUpConversions: boolean;
 
@@ -52,15 +59,23 @@ export function loadConfig(env: Env = process.env): Config {
   } else if (!providers.currencycloud || !providers.equals) {
     throw new Error('Provider credentials are missing. Set CURRENCYCLOUD_LOGIN_ID, CURRENCYCLOUD_API_KEY and EQUALS_API_KEY.');
   }
+  if (production && env.DATA_FILE) {
+    throw new Error('DATA_FILE keeps password hashes and authenticator keys in a plain file. It is for local demonstrations only and is refused when NODE_ENV=production.');
+  }
+  const port = Number(env.PORT ?? 3001) || 3001;
+  const appUrl = (env.APP_URL ?? 'http://localhost:8081').replace(/\/+$/, '');
   return {
-    port: Number(env.PORT ?? 3001) || 3001,
+    port,
     host: env.HOST ?? '0.0.0.0',
     production,
     corsOrigins: (env.CORS_ORIGINS ?? '')
       .split(',')
       .map((origin) => origin.trim().replace(/\/+$/, ''))
       .filter(Boolean),
-    appUrl: (env.APP_URL ?? 'http://localhost:8081').replace(/\/+$/, ''),
+    appUrl,
+    // When the server also serves the web app (npm run demo), both share one address.
+    opsUrl: (env.OPS_URL ?? (env.WEB_DIR ? appUrl : `http://localhost:${port}`)).replace(/\/+$/, ''),
+    dataFile: env.DATA_FILE || null,
     trustProxy: env.TRUST_PROXY === '1',
     adminToken: env.ADMIN_TOKEN && env.ADMIN_TOKEN.length >= 16 ? env.ADMIN_TOKEN : null,
     webDir: env.WEB_DIR || null,
@@ -70,6 +85,8 @@ export function loadConfig(env: Env = process.env): Config {
     loginChallengeTtlMs: 5 * MINUTE,
     activationTtlMs: 72 * 60 * MINUTE,
     stepUpTtlMs: 2 * MINUTE,
+    opsSessionIdleMs: 10 * MINUTE,
+    opsSessionAbsoluteMs: 8 * 60 * MINUTE,
     stepUpConversions: env.STEP_UP_CONVERSIONS === '1',
     lockoutThreshold: 5,
     lockoutBaseMs: MINUTE,

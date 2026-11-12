@@ -46,3 +46,6 @@ example
 dist-demo/
 server/.env
 .env
+
+# local demo accounts (password hashes and authenticator keys in plain form)
+.demo-data/

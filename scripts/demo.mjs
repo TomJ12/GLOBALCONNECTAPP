@@ -7,9 +7,11 @@
  * means no cross-origin requests, so it works unchanged on a laptop and behind
  * a GitHub Codespaces forwarded port (including a private one).
  *
- * Sample data, in-memory storage, mock providers. Not a deployment.
+ * Sample data, mock providers, accounts kept in a local JSON file (DATA_FILE).
+ * Not a deployment. `npm run demo:reset` (this script with --reset) wipes the file.
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,6 +28,15 @@ if (process.env.NODE_ENV === 'production') {
   process.exit(1);
 }
 
+// LOCAL DEMO ONLY: accounts are kept in this git-ignored file so they survive a restart.
+// It holds password hashes and authenticator keys in plain form.
+const dataFile = process.env.DATA_FILE ?? path.join(root, '.demo-data', 'accounts.json');
+if (process.argv.includes('--reset')) {
+  rmSync(dataFile, { force: true });
+  console.log(`Removed ${dataFile}. The next npm run demo starts with fresh sample accounts.`);
+  process.exit(0);
+}
+
 console.log('Building the web app (this takes a minute)...');
 const build = spawnSync(npx, ['expo', 'export', '-p', 'web', '--output-dir', 'dist-demo'], {
   cwd: root,
@@ -35,11 +46,14 @@ const build = spawnSync(npx, ['expo', 'export', '-p', 'web', '--output-dir', 'di
 });
 if (build.status !== 0) process.exit(build.status ?? 1);
 
-console.log(`\nOpen ${publicUrl}\nActivation codes for the sample users are printed below.\n`);
+console.log(
+  `\nOpen ${publicUrl} (client app) or ${publicUrl}/ops (ops console)\nActivation codes are printed below.\n` +
+    `Demo accounts are being kept in ${dataFile} (local demo only; wipe with: npm run demo:reset).\n`,
+);
 const server = spawn(npm, ['--prefix', 'server', 'run', 'start'], {
   cwd: root,
   stdio: 'inherit',
-  env: { ...process.env, PORT: port, WEB_DIR: path.join(root, 'dist-demo'), APP_URL: publicUrl, TRUST_PROXY: codespace ? '1' : (process.env.TRUST_PROXY ?? '0') },
+  env: { ...process.env, PORT: port, WEB_DIR: path.join(root, 'dist-demo'), APP_URL: publicUrl, DATA_FILE: dataFile, TRUST_PROXY: codespace ? '1' : (process.env.TRUST_PROXY ?? '0') },
 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.kill(signal));
 server.on('exit', (code) => process.exit(code ?? 0));
