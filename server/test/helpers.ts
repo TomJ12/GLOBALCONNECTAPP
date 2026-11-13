@@ -216,3 +216,20 @@ export function dumpDatabase(stores: SqliteStores): string {
   const tables = stores.db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'");
   return JSON.stringify(tables.map((table) => [table.name, stores.db.all(`SELECT * FROM ${table.name}`)]));
 }
+
+/** The password every test staff account has. */
+export const OPS_PASSWORD = 'staff horse battery staple';
+
+/**
+ * Does an ops console action the way a person does: press the button, read
+ * the confirmation page, press Confirm (typing the password if the page asks
+ * for it). `post` is the browser's own POST. Returns the reply to Confirm,
+ * or the first reply if that was not a confirmation page (a refusal).
+ */
+export async function confirmed<R extends { status: number; body: string }>(post: (url: string, form: Record<string, string>) => Promise<R>, url: string, form: Record<string, string> = {}, password = OPS_PASSWORD): Promise<R> {
+  const page = await post(url, form);
+  const token = confirmTokenOf(page.body);
+  if (page.status !== 200 || !token) return page;
+  return post(url, { ...form, _confirm: token, ...(/name="password"/.test(page.body) ? { password } : {}) });
+}
+export const confirmTokenOf = (body: string): string | undefined => /name="_confirm" value="([^"]+)"/.exec(body)?.[1];

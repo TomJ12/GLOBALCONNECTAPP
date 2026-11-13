@@ -51,4 +51,8 @@ form + form, .card form { margin-top: 12px; }
 .toolbar form { display: flex; gap: 8px; align-items: flex-end; margin: 0; }
 .toolbar label { margin: 0; }
 tr.alert td { background: #FEF3C7; font-weight: 600; }
-.warn { background: #FEF3C7; border: 1px solid #FCD34D; border-radius: 6px; padding: 10px 14px; font-weight: 600; }
+.button.quiet { background: #fff; color: var(--text); border: 1px solid #CBD5E1; }
+.note { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; }
+.confirm h2 { font-size: 20px; }
+.confirm.danger { border: 2px solid var(--danger); }
+.confirm.danger h2 { color: var(--danger); }

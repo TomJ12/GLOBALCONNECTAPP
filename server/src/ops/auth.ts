@@ -4,8 +4,9 @@
  * sessions and lockout counters (stores.ops). A client session token means
  * nothing here and a staff session token means nothing on the client API.
  *
- * Step-up for staff is a fresh authenticator code sent WITH the action, so it
- * is bound to that action by construction and, like every code, works once.
+ * The authenticator code is asked for at sign-in and activation only. Actions
+ * in the console are confirmed on a confirmation page (see console.ts); the
+ * few highest-impact ones also ask for the password again (`confirmPassword`).
  *
  * As in the client service, security state is only ever changed through the
  * store's atomic operations.
@@ -194,7 +195,7 @@ export class OpsAuthService {
     }
   }
 
-  private async verifyTotp(user: OpsUserRecord, code: string, scope: 'code' | 'stepup', source: string): Promise<OpsUserRecord> {
+  private async verifyTotp(user: OpsUserRecord, code: string, scope: 'code', source: string): Promise<OpsUserRecord> {
     const attempt = await this.lockout.begin(scope, `user:${user.id}`, source, isKnownSource(user, source));
     const check = user.totpSecret ? checkTotp(user.totpSecret, code, this.now(), user.lastTotpStep) : ({ ok: false, reason: 'invalid' } as const);
     const reused = async (): Promise<never> => {
@@ -314,16 +315,25 @@ export class OpsAuthService {
     return this.lockout.unlock(this.subjectsOf(user));
   }
 
-  // --- Step-up -------------------------------------------------------------------
+  // --- Password again, for the few highest-impact approvals -----------------------------------
 
-  /** A fresh, unused authenticator code from this staff member, for this one action. */
-  async stepUp(context: OpsContext, code: string, action: string, source: string): Promise<void> {
+  /**
+   * The staff member's own password, typed again. Counted before it is
+   * checked, like sign-in, so an unattended signed-in browser does not give
+   * unlimited guesses at it.
+   */
+  async confirmPassword(context: OpsContext, password: string, action: string, source: string): Promise<void> {
+    const { user } = context;
     try {
-      context.user = await this.verifyTotp(context.user, code, 'stepup', source);
+      const attempt = await this.lockout.begin('password', `user:${user.id}`, source, isKnownSource(user, source));
+      if (!password || !user.passwordHash || !(await verifyPassword(password, user.passwordHash, 'staff'))) {
+        if (attempt.locked) await this.log('ops.lockout', 'failure', opsParty(user), source, { guarded: 'password' });
+        throw new ApiError('validation', { reason: 'invalid_credentials', fields: ['password'] });
+      }
+      await this.lockout.succeed(attempt);
     } catch (error) {
-      await this.log('ops.step_up', 'failure', opsParty(context.user), source, { for: action, reason: reasonOf(error) });
+      await this.log('ops.password_check', 'failure', opsParty(user), source, { for: action, reason: reasonOf(error) });
       throw error;
     }
-    await this.log('ops.step_up', 'success', opsParty(context.user), source, { for: action });
   }
 }

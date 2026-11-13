@@ -1,14 +1,13 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { assertStaffRemovalAllowed, OpsError } from '../src/ops/console';
+import { assertStaffRemovalAllowed, CONFIRM_TTL_MS, OpsError } from '../src/ops/console';
 import type { OpsRole } from '../src/store/types';
-import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, type Harness } from './helpers';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
 
-const OPS_PASSWORD = 'staff horse battery staple';
 
 /** A browser, as far as the console can tell: a cookie jar and the CSRF field of the last page. */
 class Browser {
@@ -89,7 +88,7 @@ async function staff(email = 'admin@globalconnect.example', role: OpsRole = 'ops
   assert.equal(reply.status, 303, reply.body);
   assert.equal(reply.location, '/ops');
   await account.browser.get('/ops/users');
-  return { ...account, act: (url, form = {}) => account.browser.post(url, { ...form, code: h.freshCode(account.secret) }) };
+  return { ...account, act: (url, form = {}) => confirmed((to, fields) => account.browser.post(to, fields), url, form) };
 }
 
 const audit = (action?: string) => h.stores.audit.query({ action, limit: 10_000 });
@@ -108,6 +107,9 @@ async function activateClient(email: string, password = PASSWORD) {
 }
 
 /** One staff member asks, a different one approves. Returns the approver's reply and the request id. */
+/** Approving these asks the approver for their password again: staff management, company create and re-point, client authenticator reset. */
+const PASSWORD_APPROVALS = ['ops.staff.invite', 'ops.staff.role', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.activation_link', 'ops.staff.unlock', 'ops.staff.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.client.reset_authenticator'];
+
 async function fourEyes(requester: Staff, approver: Staff, url: string, form: Record<string, string> = {}) {
   const asked = await requester.act(url, form);
   assert.equal(asked.status, 303, `${url}: ${asked.body.slice(-300)}`);
@@ -274,7 +276,7 @@ test('ops: roles. ops manages clients but not staff or company mappings, and can
   assert.equal((await h.stores.directory.getCompany('co_northfield'))?.name, 'Northfield Trading Limited');
 });
 
-test('ops: every action needs a fresh code and is written to the audit log', async () => {
+test('ops: every action needs its confirmation (bound to session, action and payload, once), never a code, and is written to the audit log', async () => {
   h = await harness();
   await h.activate(AMIRA);
   const { admin, second } = await pair();
@@ -302,7 +304,8 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
     ...(route === '/ops/companies/:id' ? { provider: 'provider-b', providerAccountId: 'S00003' } : { provider: 'provider-a', providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0002' }),
     company1: 'co_northfield',
     role1: 'creator',
-    companyId: 'co_northfield',
+    // Ben is attached to Northfield (he is not in it) and removed from Castlebrook (he is).
+    companyId: route.endsWith('/remove') ? 'co_castlebrook' : 'co_northfield',
     role: route.startsWith('/ops/staff') ? 'ops' : 'approver',
     verification: 'Called back on the number on file',
     approvalsRequired: '2',
@@ -316,23 +319,55 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
       await h.stores.ops.approvals.list(),
       h.outbox.sent.length,
     ]);
-  const stepUpFailures = async () => (await audit('ops.step_up')).filter((entry) => entry.outcome === 'failure').length;
+  const confirmPage = async (who: Staff, url: string, form: Record<string, string>) => {
+    const page = await who.browser.post(url, form);
+    assert.equal(page.status, 200, `${url}: ${page.body.slice(-300)}`);
+    assert.match(page.body, /<div class="card narrow confirm[^"]*">/, url);
+    // After sign-in no page asks for an authenticator code.
+    assert.doesNotMatch(page.body, /name="code"|[Aa]uthenticator code|one-time-code/, url);
+    return { body: page.body, token: confirmTokenOf(page.body) as string };
+  };
 
-  // Without a code, with a wrong code and with a reused code: refused, nothing changes, the refusal is logged.
+  // The first POST of every action does nothing but show the confirmation. Then every wrong way of confirming is refused.
   for (const route of actions) {
-    for (const code of ['', '000000', h.code(admin.secret)]) {
-      const before = await state();
-      const failures = await stepUpFailures();
-      // Wrong codes would lock the account; this test is about each refusal, not the lockout.
-      await h.stores.ops.attempts.deleteWhere(() => true);
-      const reply = await admin.browser.post(urlOf(route.url), { ...formOf(route.url, 0), code });
-      assert.equal(reply.status, 400, `${route.url} with code "${code}": ${reply.body.slice(-200)}`);
-      assert.equal(await state(), before, route.url);
-      assert.equal(await stepUpFailures(), failures + 1, route.url);
+    const url = urlOf(route.url);
+    const form = formOf(route.url, 0);
+    const before = await state();
+    const entries = (await audit()).length;
+    const mine = await confirmPage(admin, url, form);
+    assert.equal(await state(), before, `${route.url}: showing the confirmation changed something`);
+    assert.equal((await audit()).length, entries, `${route.url}: showing the confirmation is not an action`);
+    assert.match(mine.token, /^\d+\.[\w-]+\.[\w-]+$/);
+    assert.ok(mine.body.includes(`action="${url}"`) && /<button[^>]*>Confirm<\/button><a class="button quiet" href="\/ops\/[^"]*">Cancel<\/a>/.test(mine.body), route.url);
+    const password: Record<string, string> = /name="password"/.test(mine.body) ? { password: OPS_PASSWORD } : {};
+    const [expires, nonce, signature] = mine.token.split('.') as [string, string, string];
+    const refused: [string, Record<string, string>][] = [
+      ['a made-up token', { ...form, _confirm: `${expires}.${nonce}.${'A'.repeat(signature.length)}` }],
+      ['a token with a later expiry written in', { ...form, _confirm: `${Number(expires) + 60_000}.${nonce}.${signature}` }],
+      ['a token for a different payload', { ...form, extra: 'x', _confirm: mine.token }],
+      ['a token for a changed field', { ...Object.fromEntries(Object.entries(form).map(([key, value], index) => [key, index === 0 ? `${value}x` : value])), _confirm: mine.token }],
+      ['a token from another session', { ...form, _confirm: (await confirmPage(second, url, form).catch(() => ({ token: mine.token.replace(/.$/, 'A') }))).token }],
+    ];
+    for (const [what, sent] of refused) {
+      const reply = await admin.browser.post(url, { ...sent, ...password });
+      // Refused: the confirmation is shown again (with a new token), and nothing was done.
+      assert.equal(reply.status, 409, `${route.url} with ${what}: ${reply.status}`);
+      assert.match(reply.body, /Nothing was done/, what);
+      assert.equal(await state(), before, `${route.url} with ${what}`);
     }
+    // A token made for one action does not confirm another.
+    const other = actions.find((item) => item.url !== route.url && urlOf(item.url) !== url) as { url: string };
+    assert.equal((await admin.browser.post(urlOf(other.url), { ...form, _confirm: mine.token, ...password })).status === 303, false, `${route.url}: token accepted by ${other.url}`);
+    // Past its five minutes it is refused too.
+    h.clock.advance(CONFIRM_TTL_MS + 1);
+    const late = await admin.browser.post(url, { ...form, _confirm: mine.token, ...password });
+    h.clock.advance(-(CONFIRM_TTL_MS + 1));
+    assert.equal(late.status, 409, `${route.url} expired`);
+    assert.equal(await state(), before, `${route.url} expired`);
   }
+  assert.equal((await audit('ops.step_up')).length, 0, 'staff step-up no longer exists');
 
-  // With a fresh code each one is done, or becomes a request that the second staff member approves; both leave entries.
+  // Confirmed properly, each one is done, or becomes a request that the second staff member approves; both leave entries.
   const done = async () => (await audit()).filter((entry) => entry.outcome === 'success' && /^ops\.(company|client|staff|approval)\./.test(entry.action));
   let n = 0;
   const viaApproval: string[] = [];
@@ -345,6 +380,7 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
     const entries = await done();
     assert.equal(entries.length, before + (route.url.endsWith('/approve') ? 2 : 1), route.url);
     assert.equal(entries[0]?.source, '127.0.0.1');
+    assert.equal(entries[0]?.detail.confirmed, 'yes', `${route.url}: the entry says it was confirmed`);
     if (!route.url.startsWith('/ops/approvals') && reply.location.startsWith('/ops/approvals/')) {
       // Nothing happened yet: only a request exists.
       assert.equal(entries[0]?.action, 'ops.approval.request');
@@ -358,6 +394,9 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
       assert.equal(approval?.detail.requestedBy, admin.email);
       assert.equal(carriedOut?.actor.id, admin.id);
       assert.equal(carriedOut?.detail.approvedBy, second.email);
+      assert.equal(approval?.detail.confirmed, 'yes');
+      // The highest-impact approvals, and only those, were made with the approver's password.
+      assert.equal(approval?.detail.passwordChecked, PASSWORD_APPROVALS.includes(carriedOut?.action ?? '') ? 'yes' : undefined, carriedOut?.action);
       viaApproval.push(carriedOut?.action ?? '');
     }
   }
@@ -366,14 +405,15 @@ test('ops: every action needs a fresh code and is written to the audit log', asy
     'ops.staff.activation_link', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.invite', 'ops.staff.reset_authenticator', 'ops.staff.role', 'ops.staff.unlock',
   ]);
   const names = new Set((await audit()).map((entry) => entry.action));
-  for (const name of ['ops.company.deactivate', 'ops.client.membership.remove', 'ops.client.unlock', 'ops.client.revoke_sessions', 'ops.client.disable', 'ops.staff.new', 'ops.approval.reject', 'ops.approval.cancel', 'ops.step_up', 'client.session_revoked', 'ops.session_revoked']) {
+  for (const name of ['ops.company.deactivate', 'ops.client.membership.remove', 'ops.client.unlock', 'ops.client.revoke_sessions', 'ops.client.disable', 'ops.staff.new', 'ops.approval.reject', 'ops.approval.cancel', 'client.session_revoked', 'ops.session_revoked']) {
     assert.ok(names.has(name), `no audit entry for ${name}`);
   }
   const reset = (await audit('ops.client.reset_authenticator')).find((entry) => entry.outcome === 'success');
   assert.equal(reset?.detail.identityVerification, 'Called back on the number on file');
   assert.equal(reset?.target?.label, AMIRA);
   // A refusal after the target was known is logged against that target.
-  const refusal = (await audit('ops.client.unlock')).find((entry) => entry.outcome === 'failure');
+  assert.equal((await admin.browser.post(`/ops/users/${ben}/reset-authenticator`, { verification: 'Called back on the number on file' })).status, 400, 'Ben has never activated: there is nothing to reset');
+  const refusal = (await audit('ops.client.reset_authenticator')).find((entry) => entry.outcome === 'failure');
   assert.equal(refusal?.target?.label, BEN);
 });
 
@@ -381,14 +421,13 @@ test('ops: CSRF. A post without the field, with a wrong field or from another si
   h = await harness();
   const { admin, second: other } = await pair();
   const form = { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' };
-  const code = () => h.freshCode(admin.secret);
   const nothingChanged = async () => assert.equal((await h.stores.directory.listCompanies()).length + (await h.stores.ops.approvals.list()).length, 2);
 
-  assert.equal((await admin.browser.request('POST', '/ops/companies', { ...form, code: code() })).status, 403);
-  assert.equal((await admin.browser.request('POST', '/ops/companies', { ...form, code: code(), _csrf: 'f'.repeat(64) })).status, 403);
+  assert.equal((await admin.browser.request('POST', '/ops/companies', { ...form })).status, 403);
+  assert.equal((await admin.browser.request('POST', '/ops/companies', { ...form, _csrf: 'f'.repeat(64) })).status, 403);
   // Another session's field does not fit this session.
-  assert.equal((await admin.browser.request('POST', '/ops/companies', { ...form, code: code(), _csrf: other.browser.csrf })).status, 403);
-  assert.equal((await admin.browser.post('/ops/companies', { ...form, code: code() }, { 'sec-fetch-site': 'cross-site' })).status, 403);
+  assert.equal((await admin.browser.request('POST', '/ops/companies', { ...form, _csrf: other.browser.csrf })).status, 403);
+  assert.equal((await admin.browser.post('/ops/companies', { ...form }, { 'sec-fetch-site': 'cross-site' })).status, 403);
   assert.equal((await admin.browser.request('POST', '/ops/logout', {})).status, 403);
   await nothingChanged();
 
@@ -409,7 +448,12 @@ test('ops: CSRF. A post without the field, with a wrong field or from another si
 
   // The real form still works.
   const fresh = await staff('fresh@globalconnect.example', 'ops_admin');
-  assert.equal((await fresh.browser.post('/ops/companies', { ...form, code: h.freshCode(fresh.secret) }, { 'sec-fetch-site': 'same-origin' })).status, 303);
+  // (Both steps: the form, then its confirmation. A valid confirmation token does not excuse the CSRF checks.)
+  const shown = await fresh.browser.post('/ops/companies', form, { 'sec-fetch-site': 'same-origin' });
+  const token = confirmTokenOf(shown.body) as string;
+  assert.equal((await fresh.browser.request('POST', '/ops/companies', { ...form, _confirm: token })).status, 403, 'a confirmation token without the CSRF field');
+  assert.equal((await fresh.browser.post('/ops/companies', { ...form, _confirm: token }, { 'sec-fetch-site': 'cross-site' })).status, 403, 'a confirmation token from another site');
+  assert.equal((await fresh.browser.post('/ops/companies', { ...form, _confirm: token }, { 'sec-fetch-site': 'same-origin' })).status, 303);
   assert.equal((await fresh.browser.post('/ops/logout')).status, 303);
   assert.equal((await fresh.browser.get('/ops/users')).status, 303);
   assert.equal((await audit('ops.sign_out')).length, 1);
@@ -536,7 +580,7 @@ test('ops: company and client set up with approval; the link goes by email only;
   assert.equal((await h.call('GET', '/v1/balances', { token: login.json.token })).status, 200, 'a request alone changes nothing');
   const detail = (await second.browser.get(`/ops/approvals/${idOf(asked.location)}`)).body;
   assert.match(detail, /Video call, passport checked against KYC file/);
-  assert.match(detail, /ends every session/);
+  assert.match(detail, /ends their \d+ active sessions?/);
   assert.equal((await second.act(`/ops/approvals/${idOf(asked.location)}/approve`)).status, 303);
 
   // Old session, old password, old authenticator and old recovery codes are all dead.
@@ -678,7 +722,7 @@ test('four-eyes: requests wait for a different staff member, can be rejected or 
   assert.equal((await second.act(`/ops/approvals/${cancelled}/approve`)).status, 409);
   // Expired after 24 hours.
   const expired = await ask(second);
-  assert.match((await admin.browser.get('/ops/approvals')).body, /Email an activation link to client ben@castlebrook\.example/);
+  assert.match((await admin.browser.get('/ops/approvals')).body, /Email an activation link to client Ben Okoro &lt;ben@castlebrook\.example&gt;/);
   h.clock.advance(24 * 60 * 60_000 + 1);
   const late = await staff('late@globalconnect.example', 'ops');
   assert.equal((await late.act(`/ops/approvals/${expired}/approve`)).status, 409);
@@ -688,10 +732,10 @@ test('four-eyes: requests wait for a different staff member, can be rejected or 
   // Approved: carried out exactly once, even if two approvals arrive together.
   const other = await staff('other@globalconnect.example', 'ops');
   const fresh = idOf((await late.act('/ops/users/usr_ben/activation-link')).location);
-  const codes = [h.freshCode(other.secret)];
   const third = await staff('third@globalconnect.example', 'ops');
-  codes.push(h.code(third.secret));
-  const [a, b] = await Promise.all([other.browser.post(`/ops/approvals/${fresh}/approve`, { code: codes[0] as string }), third.browser.post(`/ops/approvals/${fresh}/approve`, { code: codes[1] as string })]);
+  // Both have the confirmation page open and press Confirm together.
+  const tokens = [confirmTokenOf((await other.browser.post(`/ops/approvals/${fresh}/approve`)).body) as string, confirmTokenOf((await third.browser.post(`/ops/approvals/${fresh}/approve`)).body) as string];
+  const [a, b] = await Promise.all([other.browser.post(`/ops/approvals/${fresh}/approve`, { _confirm: tokens[0] as string }), third.browser.post(`/ops/approvals/${fresh}/approve`, { _confirm: tokens[1] as string })]);
   assert.deepEqual([a.status, b.status].sort(), [303, 409]);
   assert.equal(h.outbox.sent.length, 1);
 
@@ -802,7 +846,7 @@ test('audit log: records client and staff authentication, holds no secret, and c
   const entries = await audit();
   const has = (action: string, outcome: string) => entries.some((entry) => entry.action === action && entry.outcome === outcome);
   for (const [action, outcome] of [
-    ['ops.activation', 'success'], ['ops.sign_in', 'success'], ['ops.step_up', 'success'],
+    ['ops.activation', 'success'], ['ops.sign_in', 'success'],
     ['client.activation', 'failure'], ['client.activation', 'success'], ['client.sign_in', 'failure'], ['client.sign_in', 'success'],
     ['client.step_up', 'failure'], ['client.step_up', 'success'], ['client.sign_out', 'success'], ['client.session_revoked', 'success'],
   ] as const) {
@@ -978,6 +1022,125 @@ test('ops: a company\'s payment approval rule is changed by request, approved on
   const companies = await h.stores.directory.listCompanies();
   assert.equal(companies.find((company) => company.name === 'Tideway Ltd')?.approvalsRequired, 1);
   assert.deepEqual([companies.find((company) => company.id === 'co_castlebrook')?.providerAccountId, companies.find((company) => company.id === 'co_castlebrook')?.approvalsRequired], ['S00003', 2]);
+});
+
+test('ops confirmation: says exactly what will happen, works once, marks high-impact changes, and asks for the password only for the highest-impact approvals', async () => {
+  h = await harness();
+  const admin = await staff();
+  const boss = await staff('boss@globalconnect.example', 'ops_admin');
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  await h.activate(AMIRA);
+  const post = (who: Staff, url: string, form: Record<string, string> = {}) => who.browser.post(url, form);
+  const page = async (who: Staff, url: string, form: Record<string, string> = {}) => {
+    const reply = await post(who, url, form);
+    assert.equal(reply.status, 200, `${url}: ${reply.body.slice(-300)}`);
+    return { body: reply.body, token: confirmTokenOf(reply.body) as string, danger: /class="card narrow confirm danger"/.test(reply.body), password: /type="password" name="password"/.test(reply.body) };
+  };
+
+  // --- A single-person action: who, what, the consequence; then once only. -------------------------------
+  const revoke = await page(olu, '/ops/users/usr_amira/revoke-sessions');
+  assert.match(revoke.body, /<h2>Revoke all sessions of client Amira Shah &lt;amira@northfield\.example&gt;<\/h2>/);
+  assert.match(revoke.body, /Ends their \d+ active sessions?\. They are signed out everywhere/);
+  assert.match(revoke.body, /This takes effect as soon as you confirm\./);
+  assert.deepEqual([revoke.danger, revoke.password], [false, false]);
+  assert.equal((await post(olu, '/ops/users/usr_amira/revoke-sessions', { _confirm: revoke.token })).status, 303);
+  const count = (await audit('ops.client.revoke_sessions')).length;
+  const replay = await post(olu, '/ops/users/usr_amira/revoke-sessions', { _confirm: revoke.token });
+  assert.equal(replay.status, 409, 'the same confirmation a second time');
+  assert.match(replay.body, /already been used\. Nothing more was done/);
+  assert.equal((await audit('ops.client.revoke_sessions')).length, count);
+  // The used token is remembered in the database, so a restart does not make it usable again.
+  assert.equal(await h.stores.ops.confirmations.count({}), 1);
+
+  // --- Destructive: marked, and the consequence is stated. --------------------------------------------------
+  const disable = await page(olu, '/ops/users/usr_dana/disable');
+  assert.equal(disable.danger, true);
+  assert.match(disable.body, /High-impact change\. Read this before you confirm\./);
+  assert.match(disable.body, /<h2>Disable client Dana Reid &lt;dana@adviser\.example&gt;<\/h2><p class="warn">They cannot sign in until re-enabled/);
+  assert.match(disable.body, /<button class="danger">Confirm<\/button><a class="button quiet" href="\/ops\/users\/usr_dana">Cancel<\/a>/);
+  // Cancel is a plain link: nothing was done.
+  assert.equal((await h.stores.directory.getUser('usr_dana'))?.disabledAt ?? null, null);
+
+  // --- A request: old -> new value, company with its id, and that it only asks. ----------------------------
+  const role = await page(olu, '/ops/users/usr_amira/memberships', { companyId: 'co_northfield', role: 'approver' });
+  assert.match(role.body, /<h2>Change the role of Amira Shah &lt;amira@northfield\.example&gt; in “Northfield Trading Ltd” \(co_northfield\) from admin to approver<\/h2>/);
+  assert.match(role.body, /This only makes a request\. Nothing changes until a second staff member approves it\./);
+  assert.deepEqual([role.danger, role.password], [false, false]);
+  // What is shown is what is confirmed: if the role is changed underneath, the old confirmation is not accepted.
+  await h.stores.directory.setMembership({ userId: 'usr_amira', companyId: 'co_northfield', role: 'creator' });
+  const stale = await post(olu, '/ops/users/usr_amira/memberships', { companyId: 'co_northfield', role: 'approver', _confirm: role.token });
+  assert.equal(stale.status, 409);
+  assert.match(stale.body, /what it would do has changed since it was shown[^]*from creator to approver/);
+  assert.equal((await h.stores.ops.approvals.list()).length, 0);
+  // An email: the masked address, and that the old link stops working.
+  const link = await page(olu, '/ops/users/usr_ben/activation-link');
+  assert.match(link.body, /will be sent to b…@castlebrook\.example\. Any earlier link stops working\. The link is never shown to staff\./);
+  const asked = await post(olu, '/ops/users/usr_ben/activation-link', { _confirm: link.token });
+  assert.equal(asked.status, 303);
+
+  // --- Approving an ordinary request: confirmation, no password. --------------------------------------------
+  const approveLink = await page(admin, `/ops/approvals/${idOf(asked.location)}/approve`);
+  assert.match(approveLink.body, /<h2>Approve and carry out: Email an activation link to client Ben Okoro/);
+  assert.match(approveLink.body, /Requested by olu@globalconnect\.example on /);
+  assert.deepEqual([approveLink.danger, approveLink.password], [false, false]);
+  assert.equal((await post(admin, `/ops/approvals/${idOf(asked.location)}/approve`, { _confirm: approveLink.token })).status, 303);
+
+  // --- The highest-impact approvals ask for the approver's PASSWORD (never a code). -------------------------
+  const requests: [string, string, Record<string, string>, RegExp][] = [
+    ['client authenticator reset', '/ops/users/usr_amira/reset-authenticator', { verification: 'Called back on the number on file' }, /How their identity was verified: “Called back on the number on file”/],
+    ['staff role change', `/ops/staff/${olu.id}/role`, { role: 'ops_admin' }, /from ops to ops_admin/],
+    ['company create', '/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' }, /Create company “Tideway Ltd”/],
+    ['company re-point', '/ops/companies/co_castlebrook', { name: 'Castlebrook Imports Ltd', provider: 'provider-b', providerAccountId: 'S00003' }, /Re-point company “Castlebrook Imports Ltd” \(co_castlebrook\) from Provider B[^<]*account S00001, to Provider B[^<]*account S00003/],
+  ];
+  for (const [what, url, form, says] of requests) {
+    const ask = await page(admin, url, form);
+    assert.match(ask.body, says, what);
+    // Making the request is marked high-impact, but it is the APPROVAL that carries it out and takes the password.
+    assert.deepEqual([ask.danger, ask.password], [true, false], what);
+    const made = await post(admin, url, { ...form, _confirm: ask.token });
+    assert.equal(made.status, 303, `${what}: ${made.body.slice(-300)}`);
+    const approveUrl = `/ops/approvals/${idOf(made.location)}/approve`;
+    const approve = await page(boss, approveUrl);
+    assert.deepEqual([approve.danger, approve.password], [true, true], what);
+    assert.doesNotMatch(approve.body, /name="code"/);
+    const pending = async () => (await h.stores.ops.approvals.get(idOf(made.location)))?.status;
+    // No password, a wrong one, and somebody else's: refused, nothing done, and logged.
+    for (const password of [undefined, 'not my password at all', PASSWORD]) {
+      const refused = await post(boss, approveUrl, { _confirm: approve.token, ...(password ? { password } : {}) });
+      assert.equal(refused.status, 400, `${what} with password ${password}`);
+      assert.match(refused.body, /That is not your password\. Nothing was done/);
+      assert.equal(await pending(), 'pending');
+    }
+    assert.ok((await audit('ops.password_check')).some((entry) => entry.outcome === 'failure' && entry.actor.id === boss.id));
+    // The wrong guesses did not use the confirmation up: with the right password it goes through, once.
+    await h.stores.ops.attempts.deleteWhere(() => true);
+    assert.equal((await post(boss, approveUrl, { _confirm: approve.token, password: OPS_PASSWORD })).status, 303, what);
+    assert.equal(await pending(), 'approved');
+    assert.equal((await post(boss, approveUrl, { _confirm: approve.token, password: OPS_PASSWORD })).status, 409);
+    await boss.browser.get('/ops/approvals');
+  }
+  // A plain rename of a company is not in that set: confirmation only.
+  const rename = idOf((await admin.act('/ops/companies/co_northfield', { name: 'Northfield Trading (UK) Ltd', provider: 'provider-a', providerAccountId: 'sample-account-0001', providerContactId: 'sample-contact-0001' })).location);
+  assert.equal((await page(boss, `/ops/approvals/${rename}/approve`)).password, false);
+
+  // Guessing the password from an unattended browser is counted and locks, like sign-in.
+  const invite = idOf((await admin.act('/ops/staff', { name: 'New Person', email: 'new.person@globalconnect.example', role: 'ops' })).location);
+  const guess = await page(boss, `/ops/approvals/${invite}/approve`);
+  let status = 0;
+  for (let attempt = 0; attempt < 8 && status !== 429; attempt += 1) status = (await post(boss, `/ops/approvals/${invite}/approve`, { _confirm: guess.token, password: `guess number ${attempt}` })).status;
+  assert.equal(status, 429);
+  assert.equal((await post(boss, `/ops/approvals/${invite}/approve`, { _confirm: guess.token, password: OPS_PASSWORD })).status, 429, 'locked: even the right password waits');
+  assert.equal((await h.stores.ops.approvals.get(invite))?.status, 'pending');
+
+  // The reset still needs its identity-verification note: without it there is not even a confirmation page.
+  assert.equal((await post(admin, `/ops/staff/${olu.id}/reset-authenticator`, {})).status, 400);
+  // And the idle limit is the server's: ten minutes without a request and the next one, even a Confirm, is refused.
+  const idle = await page(admin, '/ops/users/usr_dana/disable');
+  h.clock.advance(4 * 60_000);
+  await olu.browser.get('/ops/users');
+  h.clock.advance(6 * 60_000 + 1);
+  assert.equal((await post(admin, '/ops/users/usr_dana/disable', { _confirm: idle.token })).status, 401);
+  assert.equal((await h.stores.directory.getUser('usr_dana'))?.disabledAt ?? null, null);
 });
 
 void DANA;

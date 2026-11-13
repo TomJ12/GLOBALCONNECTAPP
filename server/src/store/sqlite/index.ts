@@ -95,6 +95,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const attempts = new SqlTable<AttemptRecord>(db, 'attempts', { indexed: ['subject'] });
   const opsAttempts = new SqlTable<AttemptRecord>(db, 'ops_attempts', { indexed: ['subject'] });
   const approvals = new SqlTable<ApprovalRecord>(db, 'ops_approvals', { indexed: ['status'] });
+  const confirmations = new SqlTable<{ expiresAt: number }>(db, 'ops_confirmations');
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
   const audit = new SqlAuditLog(db, keys, options.audit);
@@ -114,7 +115,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
     payments: new SqlHeldPayments(db, directory),
     directory,
     auth: { activations, challenges, sessions, stepUps, attempts },
-    ops: { users: opsUsers, activations: opsActivations, challenges: opsChallenges, sessions: opsSessions, attempts: opsAttempts, approvals },
+    ops: { users: opsUsers, activations: opsActivations, challenges: opsChallenges, sessions: opsSessions, attempts: opsAttempts, approvals, confirmations },
     audit,
     providerKeys,
     seedCodes,
@@ -138,6 +139,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
     async sweep(sessionMaxAgeMs, opsSessionMaxAgeMs) {
       const at = now();
       for (const table of [activations, opsActivations, challenges, opsChallenges] as Table<{ expiresAt: number }>[]) await table.deleteWhere((row) => row.expiresAt <= at);
+      await confirmations.deleteWhere((row) => row.expiresAt <= at);
       await stepUps.deleteWhere((row) => row.expiresAt <= at);
       // A live lock is never removed. A counter goes only once it is neither locked nor recent.
       for (const table of [attempts, opsAttempts]) await table.deleteWhere((row) => row.lockedUntil <= at && at - row.updatedAt > IDLE_COUNTER_MS);

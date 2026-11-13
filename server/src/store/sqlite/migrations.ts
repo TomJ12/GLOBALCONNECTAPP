@@ -104,4 +104,8 @@ CREATE UNIQUE INDEX held_payments_id ON held_payments (json_extract(data, '$.id'
 CREATE INDEX held_payments_company ON held_payments (json_extract(data, '$.companyId'));
 CREATE INDEX held_payments_status ON held_payments (json_extract(data, '$.status'));
 `,
+  // 3: ops console confirmations. A used confirmation token is remembered until it would have expired, so it works once.
+  `
+CREATE TABLE ops_confirmations (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+`,
 ];

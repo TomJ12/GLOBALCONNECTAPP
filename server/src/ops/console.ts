@@ -10,14 +10,18 @@
  *  1. No activation link or code is ever rendered. Links go by email to the
  *     address on file (Mailer); the console shows only a masked address.
  *  2. FOUR-EYES: the sensitive actions (see `fourEyes` below) only create a
- *     request. A DIFFERENT active staff member must approve it, with their own
- *     fresh authenticator code, before anything changes.
+ *     request. A DIFFERENT active staff member must approve it before anything
+ *     changes.
  *  3. A company's provider mapping can be set only by an ops admin, to an
  *     account the provider confirms exists and that no other company uses.
  *
- * Every state-changing request needs the session cookie, the CSRF field and a
- * fresh authenticator code from the staff member (step-up), and is written to
- * the audit log whether it succeeded or not. There is no route that reads or
+ * The authenticator code is asked for at sign-in (and activation) only. Every
+ * state-changing request needs the session cookie, the CSRF field and a
+ * CONFIRMATION: a page that restates what will happen, whose Confirm button
+ * carries a signed, single-use token bound to this session, this action and
+ * exactly this payload (see `post`). The few highest-impact changes also ask
+ * for the staff member's password again when they are carried out. Everything
+ * is written to the audit log whether it succeeded or not. There is no route that reads or
  * sets someone else's password, authenticator key or recovery codes, none
  * that reaches a provider's balances, transactions or payments, and none that
  * starts a client session.
@@ -28,6 +32,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
+import { canonicalJson } from '@/api/canonical';
 import type { UserRole } from '@/api/types';
 
 import { reasonOf, type AuthService } from '../auth/service';
@@ -39,7 +44,7 @@ import type { ProviderRegistry } from '../providers/adapter';
 import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate';
 import { approvalsRequiredOf, type ApprovalRecord, type ApprovalsRequired, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
-import { codeField, h, Html, layout, qrSvg, when } from './html';
+import { h, Html, layout, qrSvg, when } from './html';
 
 export interface OpsDeps {
   config: Config;
@@ -55,6 +60,8 @@ export interface OpsDeps {
 const CLIENT_ROLES: UserRole[] = ['creator', 'approver', 'admin'];
 const OPS_ROLES: OpsRole[] = ['ops', 'ops_admin'];
 const PRE_SESSION_MS = 30 * 60_000;
+/** How long a confirmation page's Confirm button stays good. */
+export const CONFIRM_TTL_MS = 5 * 60_000;
 
 /** Staff choose a provider by a neutral label; the name is shown beside it because staff need it. Never sent to the client app. */
 const PROVIDERS: Record<ProviderKey, { slug: string; label: string }> = {
@@ -269,6 +276,13 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         adminApproval?: boolean | ((params: Record<string, string>) => boolean);
         /** The result is an activation email; the approval page then says where it went. */
         mails?: boolean;
+        /** Destructive or high-impact: its confirmation page is marked as such. */
+        danger?: boolean | ((params: Record<string, string>) => boolean);
+        /**
+         * The few highest-impact changes: whoever CARRIES IT OUT (the approver, or the one person when four-eyes is
+         * off in development) must type their own password again on the confirmation page.
+         */
+        password?: boolean | ((params: Record<string, string>) => boolean);
         prepare(input: PrepareInput): Promise<Prepared>;
         /** Does it. Re-checks everything: by the time a request is approved, things may have changed. */
         apply(params: Record<string, string>, actors: Actors): Promise<Applied>;
@@ -278,13 +292,66 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         config.fourEyes && (typeof def.fourEyes === 'function' ? def.fourEyes(params) : def.fourEyes === true);
       const needsAdminApproval = (def: ActionDef, params: Record<string, string>): boolean =>
         typeof def.adminApproval === 'function' ? def.adminApproval(params) : def.adminApproval === true;
+      const flagOf = (flag: ActionDef['danger'], params: Record<string, string>): boolean => (typeof flag === 'function' ? flag(params) : flag === true);
       const person = (user: OpsUserRecord) => ({ id: user.id, email: user.email });
       const append = (actor: AuditParty, action: string, outcome: 'success' | 'failure', target: AuditParty | null, source: string, detail: Record<string, string>) =>
         stores.audit.append({ at: now(), actor, target, action, outcome, source, detail });
 
       /**
+       * CONFIRMATION. No ops action is carried out by the first POST. That POST
+       * is answered with a page that says, in words, exactly what will happen
+       * and to whom, with Confirm and Cancel. Confirm posts the same fields
+       * again together with a token that the server SIGNED for
+       *   this staff session + this action + this URL + exactly these fields
+       *   + exactly the words that were shown,
+       * valid for five minutes and usable once. So the confirming POST cannot
+       * be replayed, pointed at something else, altered, made up by another
+       * site or taken from another session, and if what would happen has
+       * changed since the page was shown, the page is shown again instead.
+       * This is on top of the CSRF field, and needs no script.
+       */
+      interface Confirmation {
+        /** What will happen, to whom: "Disable client jo@example.com". */
+        title: string;
+        /** Consequences and warnings, each a sentence. */
+        notes?: string[];
+        /** When it takes effect. */
+        effect: string;
+        danger?: boolean;
+        /** The staff member's password is asked for again. */
+        password?: boolean;
+      }
+      class ConfirmNeeded extends Error {
+        constructor(
+          readonly confirmation: Confirmation,
+          readonly notice: string | null,
+        ) {
+          super('confirmation needed');
+        }
+      }
+      const NOT_REPEATED = ['_csrf', '_confirm', 'password'];
+      const fieldsOf = (form: Form): [string, string][] => Object.entries(form).filter(([key, value]) => !NOT_REPEATED.includes(key) && typeof value === 'string').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)) as [string, string][];
+      const signConfirmation = (ctx: OpsContext, name: string, url: string, form: Form, confirmation: Confirmation, expires: string, nonce: string): string =>
+        createHmac('sha256', config.serverSecret)
+          .update(`ops-confirm:${canonicalJson([ctx.session.id, ctx.user.id, name, url, fieldsOf(form), confirmation.title, confirmation.notes ?? [], confirmation.effect, confirmation.password === true, expires, nonce])}`)
+          .digest('base64url');
+      const confirmationPage = (ctx: OpsContext, name: string, url: string, form: Form, confirmation: Confirmation, notice: string | null): string => {
+        const expires = String(now() + CONFIRM_TTL_MS);
+        const nonce = randomToken();
+        const token = `${expires}.${nonce}.${signConfirmation(ctx, name, url, form, confirmation, expires, nonce)}`;
+        const [, kind = '', id = ''] = url.split('/').filter(Boolean);
+        const back = `/ops/${kind}${/^(usr|co|ops|req)_/.test(id) ? `/${id}` : ''}`;
+        return layout(
+          chromeOf(ctx, 'Confirm'),
+          h`<div class="card narrow confirm${confirmation.danger ? ' danger' : ''}">${notice ? h`<p class="error" role="alert">${notice}</p>` : ''}<p class="muted">${confirmation.danger ? 'High-impact change. Read this before you confirm.' : 'Check this before you confirm.'}</p><h2>${confirmation.title}</h2>${(confirmation.notes ?? []).map((note) => h`<p class="${confirmation.danger ? 'warn' : 'note'}">${note}</p>`)}<p><strong>${confirmation.effect}</strong></p><form method="post" action="${url}">${csrfInput(ctx)}${fieldsOf(form).map(([key, value]) => h`<input type="hidden" name="${key}" value="${value}">`)}<input type="hidden" name="_confirm" value="${token}">${
+            confirmation.password ? h`<label>Your password, to confirm it is you <input type="password" name="password" autocomplete="current-password" required></label>` : ''
+          }<div class="row tight"><button${confirmation.danger ? h` class="danger"` : ''}>Confirm</button><a class="button quiet" href="${back}">Cancel</a></div></form></div>`,
+        );
+      };
+
+      /**
        * The frame every state-changing POST runs in: session, CSRF field, role,
-       * `run` (which must call stepUp before changing anything) and an audit
+       * `run` (which must call `confirm` before changing anything) and an audit
        * entry for the outcome, with the target when it is known.
        */
       interface PostInput {
@@ -293,7 +360,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         params: Record<string, string>;
         source: string;
         aim: (target: AuditParty) => void;
-        stepUp: () => Promise<void>;
+        /** Returns only when this exact action has been confirmed on its confirmation page (and, if asked, with the password). */
+        confirm: (confirmation: Confirmation) => Promise<void>;
       }
       const post = (url: string, options: { name: string; admin?: boolean }, run: (input: PostInput) => Promise<{ detail?: Record<string, string>; redirect: string; audited?: boolean }>) =>
         ops.post(url, { preHandler: limitAttempts }, async (request, reply) => {
@@ -301,8 +369,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           if (!ctx) return problem(reply, null, new OpsError('Your session has ended. Sign in again.', 401));
           if (!fieldOk(request, ctx.token)) return problem(reply, ctx, new OpsError('This form could not be verified. Reload the page and try again.', 403));
           const form = (request.body ?? {}) as Form;
+          const path = request.url.split('?')[0] as string;
           let target: AuditParty | null = null;
-          let steppedUp = false;
+          let confirmed = false;
           try {
             if (options.admin && ctx.user.role !== 'ops_admin') throw new OpsError('Only an ops admin can do that.', 403, 'forbidden');
             const result = await run({
@@ -313,15 +382,39 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               aim: (party) => {
                 target = party;
               },
-              stepUp: async () => {
-                await opsAuth.stepUp(ctx, text(form, 'code'), options.name, request.ip);
-                steppedUp = true;
+              confirm: async (confirmation) => {
+                const token = text(form, '_confirm');
+                if (!token) throw new ConfirmNeeded(confirmation, null);
+                const [expires = '', nonce = '', signature = ''] = token.split('.');
+                const genuine = token.split('.').length === 3 && /^\d{1,16}$/.test(expires) && nonce !== '' && safeEqual(signConfirmation(ctx, options.name, path, form, confirmation, expires, nonce), signature);
+                if (!genuine || Number(expires) <= now()) {
+                  throw new ConfirmNeeded(confirmation, 'That confirmation has expired, or what it would do has changed since it was shown. Nothing was done. Check what is shown now and confirm again.');
+                }
+                if (confirmation.password) {
+                  try {
+                    await opsAuth.confirmPassword(ctx, text(form, 'password'), options.name, request.ip);
+                  } catch (error) {
+                    // A lockout keeps its own wording and status; a wrong password is said plainly.
+                    if (error instanceof ApiError && error.options.reason === 'invalid_credentials') throw new OpsError('That is not your password. Nothing was done. Go back and try again.', 400, 'wrong_password');
+                    throw error;
+                  }
+                }
+                // Once only: the first use records the token's random part, and a second finds it there.
+                let first = false;
+                await stores.ops.confirmations.mutate(nonce, (current) => {
+                  first = current === null;
+                  return first ? { expiresAt: Number(expires) } : undefined;
+                });
+                if (!first) throw new ConfirmNeeded(confirmation, 'That confirmation has already been used. Nothing more was done. If you mean to do this again, confirm again.');
+                confirmed = true;
               },
             });
-            if (!steppedUp) throw new Error(`ops action ${options.name} ran without step-up`);
-            if (!result.audited) await append(opsParty(ctx.user), `ops.${options.name}`, 'success', target, request.ip, result.detail ?? {});
+            if (!confirmed) throw new Error(`ops action ${options.name} ran without confirmation`);
+            if (!result.audited) await append(opsParty(ctx.user), `ops.${options.name}`, 'success', target, request.ip, { ...result.detail, confirmed: 'yes' });
             return reply.redirect(result.redirect, 303);
           } catch (error) {
+            // Not a failure: the action has not been attempted yet. Nothing was changed and nothing is logged.
+            if (error instanceof ConfirmNeeded) return send(reply, error.notice ? 409 : 200, confirmationPage(ctx, options.name, path, form, error.confirmation, error.notice));
             await append(opsParty(ctx.user), `ops.${options.name}`, 'failure', target, request.ip, { reason: error instanceof OpsError ? error.reason : reasonOf(error) });
             return problem(reply, ctx, error);
           }
@@ -330,7 +423,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       /** Registers a console action: done at once, or turned into a request for a second staff member. */
       const action = (url: string, def: ActionDef) => {
         actions.set(def.name, def);
-        post(url, { name: def.name, admin: def.admin }, async ({ ctx, form, params, source, aim, stepUp }) => {
+        post(url, { name: def.name, admin: def.admin }, async ({ ctx, form, params, source, aim, confirm }) => {
           let target: AuditParty | null = null;
           const prepared = await def.prepare({
             actor: ctx.user,
@@ -341,8 +434,17 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               aim(party);
             },
           });
-          await stepUp();
-          if (!needsApproval(def, prepared.params)) {
+          const direct = !needsApproval(def, prepared.params);
+          await confirm({
+            title: prepared.summary,
+            notes: prepared.warnings,
+            effect: direct
+              ? 'This takes effect as soon as you confirm.'
+              : `This only makes a request. Nothing changes until a second staff member${needsAdminApproval(def, prepared.params) ? ', who must be an ops admin,' : ''} approves it.`,
+            danger: flagOf(def.danger, prepared.params),
+            password: direct && flagOf(def.password, prepared.params),
+          });
+          if (direct) {
             const applied = await def.apply(prepared.params, { requester: ctx.user, approver: null, source });
             const about = applied.target ?? target;
             if (about) aim(about);
@@ -363,7 +465,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             decidedAt: null,
           };
           await stores.ops.approvals.put(request.id, request);
-          await append(opsParty(ctx.user), 'ops.approval.request', 'success', target, source, { request: request.id, action: def.name, summary: prepared.summary });
+          await append(opsParty(ctx.user), 'ops.approval.request', 'success', target, source, { request: request.id, action: def.name, summary: prepared.summary, confirmed: 'yes' });
           return { redirect: `/ops/approvals/${request.id}?done=requested`, audited: true };
         });
       };
@@ -441,7 +543,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           reply,
           anchor,
           'Add your authenticator app',
-          h`${alert(message)}<p>Scan this with an authenticator app, or enter the key by hand (account ${enrol.email}, time-based).</p>${qrSvg(enrol.otpauthUri)}<p class="secret">${enrol.secret}</p><form method="post" action="/ops/activate/confirm">${hidden(anchor, { activationCode })}${codeField}<button>Confirm</button></form>`,
+          h`${alert(message)}<p>Scan this with an authenticator app, or enter the key by hand (account ${enrol.email}, time-based).</p>${qrSvg(enrol.otpauthUri)}<p class="secret">${enrol.secret}</p><form method="post" action="/ops/activate/confirm">${hidden(anchor, { activationCode })}<button>Confirm</button></form>`,
           reply.statusCode,
         );
 
@@ -536,9 +638,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       };
       const flashOf = (request: FastifyRequest): string | undefined => FLASH[queryOf(request, 'done')];
       const csrfInput = (ctx: OpsContext) => h`<input type="hidden" name="_csrf" value="${csrfFor(ctx.token)}">`;
-      /** A one-line form with the step-up field. `request` marks an action that only creates a request for approval. */
-      const form = (ctx: OpsContext, url: string, fields: Html, button: string, options: { danger?: boolean; confirm?: string; request?: boolean } = {}) =>
-        h`<form method="post" action="${url}"${options.confirm ? h` data-confirm="${options.confirm}"` : ''}>${csrfInput(ctx)}<div class="row tight">${fields}${codeField}<button${options.danger ? h` class="danger"` : ''}>${options.request && config.fourEyes ? `Request: ${button}` : button}</button></div></form>`;
+      /** A one-line form. Its button leads to the confirmation page; nothing is done before that. `request` marks an action that only creates a request for approval. */
+      const form = (ctx: OpsContext, url: string, fields: Html, button: string, options: { danger?: boolean; request?: boolean } = {}) =>
+        h`<form method="post" action="${url}">${csrfInput(ctx)}<div class="row tight">${fields}<button${options.danger ? h` class="danger"` : ''}>${options.request && config.fourEyes ? `Request: ${button}` : button}</button></div></form>`;
       const fourEyesNote = config.fourEyes ? h`<p class="muted">Needs approval by a second staff member before it takes effect.</p>` : h``;
       const search = (url: string, q: string, label: string) =>
         h`<form method="get" action="${url}"><label>${label} <input type="search" name="q" value="${q}"></label><button class="quiet">Search</button></form>`;
@@ -673,13 +775,13 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
                         ? h`<p class="muted">This request is about your own account, so you cannot approve it.</p>`
                         : adminOnly && ctx.user.role !== 'ops_admin'
                           ? h`<p class="muted">Only an ops admin can approve this kind of request (it changes who is staff, or which provider account a company uses).</p>`
-                          : h`<p class="${history.flag ? 'warn' : 'muted'}">In the last 30 days ${item.requestedBy.email} has had ${history.byRequester} ${history.byRequester === 1 ? 'request' : 'requests'} approved, ${history.byPair} of them by you.${history.flag ? ' You approve most of this person’s requests: a second pair of eyes only works if it is not always the same pair.' : ''}</p><p class="muted">Approving carries the change out now, in your name and the requester’s. Check it against what you know.</p>${form(ctx, `${base}/approve`, h``, 'Approve', { confirm: 'Approve and carry out this change?' })}`
+                          : h`<p class="${history.flag ? 'warn' : 'muted'}">In the last 30 days ${item.requestedBy.email} has had ${history.byRequester} ${history.byRequester === 1 ? 'request' : 'requests'} approved, ${history.byPair} of them by you.${history.flag ? ' You approve most of this person’s requests: a second pair of eyes only works if it is not always the same pair.' : ''}</p><p class="muted">Approving carries the change out now, in your name and the requester’s. Check it against what you know.</p>${form(ctx, `${base}/approve`, h``, 'Approve')}`
                     }${form(ctx, `${base}/reject`, h``, 'Reject', { danger: true })}</div>`
             }</div></div>`,
           ),
         );
       });
-      post('/approvals/:id/approve', { name: 'approval.approve' }, async ({ ctx, params, source, aim, stepUp }) => {
+      post('/approvals/:id/approve', { name: 'approval.approve' }, async ({ ctx, params, source, aim, confirm }) => {
         const item = await approvalOf(params.id);
         if (item.target) aim(item.target);
         const def = actions.get(item.action);
@@ -692,7 +794,18 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const history = await pairHistory(item.requestedBy.id, ctx.user.id);
         const requester = await stores.ops.users.get(item.requestedBy.id);
         if (!requester || !isActiveStaff(requester) || (def.admin && requester.role !== 'ops_admin')) throw new OpsError('The staff member who made this request can no longer make it. Reject it instead.', 409, 'requester_inactive');
-        await stepUp();
+        const password = flagOf(def.password, item.params);
+        await confirm({
+          title: `Approve and carry out: ${item.summary}`,
+          notes: [
+            ...item.warnings,
+            `Requested by ${requester.email} on ${when(item.requestedAt)}.`,
+            ...(history.flag ? [`You approve most of ${requester.email}’s requests (${history.byPair} of ${history.byRequester} in the last 30 days). A second pair of eyes only works if it is not always the same pair.`] : []),
+          ],
+          effect: 'Approving carries the change out now, in your name and the requester’s.',
+          danger: flagOf(def.danger, item.params),
+          password,
+        });
         await decide(item, 'approved', ctx.user);
         let applied: Applied;
         try {
@@ -702,24 +815,26 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           await stores.ops.approvals.mutate(item.id, (current) => (current && current.status === 'approved' ? { ...current, status: 'pending', decidedBy: null, decidedAt: null } : undefined));
           throw error;
         }
-        const both = { request: item.id, requestedBy: requester.email, approvedBy: ctx.user.email, pairApprovals30d: String(history.byPair + 1) };
+        const both = { request: item.id, requestedBy: requester.email, approvedBy: ctx.user.email, pairApprovals30d: String(history.byPair + 1), confirmed: 'yes', ...(password ? { passwordChecked: 'yes' } : {}) };
         await append(opsParty(requester), `ops.${def.name}`, 'success', applied.target ?? item.target, source, { ...applied.detail, ...both });
         await append(opsParty(ctx.user), 'ops.approval.approve', 'success', applied.target ?? item.target, source, { ...both, action: def.name });
         return { redirect: `/ops/approvals/${item.id}?done=approved`, audited: true };
       });
-      post('/approvals/:id/reject', { name: 'approval.reject' }, async ({ ctx, params, aim, stepUp }) => {
+      post('/approvals/:id/reject', { name: 'approval.reject' }, async ({ ctx, params, aim, confirm }) => {
         const item = await approvalOf(params.id);
         if (item.target) aim(item.target);
         if (item.requestedBy.id === ctx.user.id) throw new OpsError('To withdraw your own request, cancel it.', 403, 'own_request');
-        await stepUp();
+        if (item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
+        await confirm({ title: `Reject the request: ${item.summary}`, notes: [`Requested by ${item.requestedBy.email} on ${when(item.requestedAt)}.`], effect: 'The request is closed and nothing is changed. It cannot be approved afterwards.' });
         await decide(item, 'rejected', ctx.user);
         return { detail: { request: item.id, action: item.action, requestedBy: item.requestedBy.email, rejectedBy: ctx.user.email }, redirect: `/ops/approvals/${item.id}?done=rejected` };
       });
-      post('/approvals/:id/cancel', { name: 'approval.cancel' }, async ({ ctx, params, aim, stepUp }) => {
+      post('/approvals/:id/cancel', { name: 'approval.cancel' }, async ({ ctx, params, aim, confirm }) => {
         const item = await approvalOf(params.id);
         if (item.target) aim(item.target);
         if (item.requestedBy.id !== ctx.user.id) throw new OpsError('Only the staff member who made a request can cancel it. You can reject it.', 403, 'not_requester');
-        await stepUp();
+        if (item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
+        await confirm({ title: `Cancel your request: ${item.summary}`, effect: 'The request is withdrawn and nothing is changed.' });
         await decide(item, 'cancelled', ctx.user);
         return { detail: { request: item.id, action: item.action, requestedBy: item.requestedBy.email }, redirect: `/ops/approvals/${item.id}?done=cancelled` };
       });
@@ -806,7 +921,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         send(
           reply,
           200,
-          layout(chromeOf(ctx, 'New company'), h`<div class="card narrow"><form method="post" action="/ops/companies">${csrfInput(ctx)}${companyFields()}<p class="muted">The provider is asked whether the account exists, and no two companies can use the same account or the same name.</p>${config.fourEyes ? h`<p class="muted">Needs approval by a second ops admin before it takes effect.</p>` : h``}${codeField}<button>${config.fourEyes ? 'Request: create company' : 'Create company'}</button></form></div>`),
+          layout(chromeOf(ctx, 'New company'), h`<div class="card narrow"><form method="post" action="/ops/companies">${csrfInput(ctx)}${companyFields()}<p class="muted">The provider is asked whether the account exists, and no two companies can use the same account or the same name.</p>${config.fourEyes ? h`<p class="muted">Needs approval by a second ops admin before it takes effect.</p>` : h``}<button>${config.fourEyes ? 'Request: create company' : 'Create company'}</button></form></div>`),
         ),
       );
       action('/companies', {
@@ -814,11 +929,13 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         admin: true,
         fourEyes: true,
         adminApproval: true,
+        danger: true,
+        password: true,
         async prepare({ form: input }) {
           const mapping = mappingOf(input);
           await assertNameFree(mapping.name, null);
           await assertMappingAllowed(mapping, null);
-          return { params: { name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId }, summary: `Create company “${mapping.name}” on ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}` };
+          return { params: { name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId }, summary: `Create company “${mapping.name}” on ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}`, warnings: ['Everyone later attached to this company will see and move the money in that provider account. It starts with one approval required for payments.'] };
         },
         async apply(params) {
           const mapping = mappingOf(params);
@@ -840,7 +957,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           200,
           layout(
             chromeOf(ctx, company.name, flashOf(request)),
-            h`<div class="grid"><div class="card"><h2>Details ${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</h2><form method="post" action="/ops/companies/${company.id}">${csrfInput(ctx)}${companyFields(company)}<p class="muted">${config.fourEyes ? 'A rename needs approval by a second staff member. ' : ''}Changing the provider, account id or contact id needs an ops admin${config.fourEyes ? ' and approval by a second ops admin' : ''}, and ends the sessions of everyone attached to this company.${company.previousName && company.renamedAt ? ` Named “${company.previousName}” until ${when(company.renamedAt)}.` : ''}</p>${codeField}<button>${config.fourEyes ? 'Request: save changes' : 'Save changes'}</button></form></div>
+            h`<div class="grid"><div class="card"><h2>Details ${tag(!company.deactivatedAt, 'Active', 'Deactivated')}</h2><form method="post" action="/ops/companies/${company.id}">${csrfInput(ctx)}${companyFields(company)}<p class="muted">${config.fourEyes ? 'A rename needs approval by a second staff member. ' : ''}Changing the provider, account id or contact id needs an ops admin${config.fourEyes ? ' and approval by a second ops admin' : ''}, and ends the sessions of everyone attached to this company.${company.previousName && company.renamedAt ? ` Named “${company.previousName}” until ${when(company.renamedAt)}.` : ''}</p><button>${config.fourEyes ? 'Request: save changes' : 'Save changes'}</button></form></div>
 <div><div class="card"><h2>People</h2><table><tr><th>Name</th><th>Email</th><th>Role</th></tr>${users.map(({ role, user }) => user && h`<tr><td><a href="/ops/users/${user.id}">${user.name}</a></td><td>${user.email}</td><td>${role}</td></tr>`)}</table>${users.length === 0 && h`<p class="muted">Nobody yet. Attach people from their client user page.</p>`}</div>
 <div class="card"><h2>Payment approvals</h2><p>Now: <strong>${required} required</strong>. ${APPROVAL_LABELS[required] ?? ''}.</p>${gap ? h`<p class="warn">${gap}</p>` : ''}${form(
               ctx,
@@ -852,7 +969,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
                 ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company', { request: true })
-                : form(ctx, `/ops/companies/${company.id}/deactivate`, h``, 'Deactivate company', { danger: true, confirm: 'Deactivate this company?' })
+                : form(ctx, `/ops/companies/${company.id}/deactivate`, h``, 'Deactivate company', { danger: true })
             }</div></div></div>`,
           ),
         );
@@ -863,6 +980,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         fourEyes: true,
         // The mapping decides whose money a company's users see: that part needs two ops admins.
         adminApproval: (params) => params.mapping === 'changed',
+        danger: (params) => params.mapping === 'changed',
+        password: (params) => params.mapping === 'changed',
         async prepare({ actor, form: input, params, aim }) {
           const company = await companyOf(params.id);
           aim(companyParty(company));
@@ -880,7 +999,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           }
           return {
             params: { id: company.id, name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId, mapping: changed ? 'changed' : 'same' },
-            summary: `${changed ? `Re-point company ${describe(company)} to ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}` : `Rename company ${describe(company)}`}${renamed ? `${changed ? ', and rename it' : ''} to “${mapping.name}”` : ''}`,
+            summary: `${changed ? `Re-point company ${describe(company)} from ${PROVIDERS[company.providerKey].label}, account ${company.providerAccountId}, to ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}` : `Rename company ${describe(company)}`}${renamed ? `${changed ? ', and rename it' : ''} to “${mapping.name}”` : ''}`,
             warnings,
           };
         },
@@ -942,12 +1061,19 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       for (const [verb, deactivate] of [['deactivate', true], ['reactivate', false]] as const) {
         action(`/companies/:id/${verb}`, {
           name: `company.${verb}`,
+          danger: deactivate,
           // Taking access away is immediate. Giving it back needs a second person.
           fourEyes: !deactivate,
           async prepare({ params, aim }) {
             const company = await companyOf(params.id);
             aim(companyParty(company));
-            return { params: { id: company.id }, summary: `${verb} company ${describe(company)}` };
+            const members = await membersOf(company.id);
+            const people = `${members.length} ${members.length === 1 ? 'person is' : 'people are'} attached to it`;
+            return {
+              params: { id: company.id },
+              summary: `${deactivate ? 'Deactivate' : 'Reactivate'} company ${describe(company)}`,
+              warnings: [deactivate ? `${people}. None of them will be able to select or use this company until it is reactivated, which needs a second staff member.` : `${people} and will be able to use it again.`],
+            };
           },
           async apply(params) {
             const company = await companyOf(params.id);
@@ -982,7 +1108,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           200,
           layout(
             chromeOf(ctx, 'New client user'),
-            h`<div class="card narrow"><form method="post" action="/ops/users">${csrfInput(ctx)}<label>Name <input name="name" required maxlength="120"></label><label>Email <input type="email" name="email" required maxlength="254"></label>${[1, 2, 3].map(pick)}<p class="muted">The activation link will be emailed to this address, so it must be the client’s own. More companies can be attached afterwards.</p>${fourEyesNote}${codeField}<button>${config.fourEyes ? 'Request: create client user' : 'Create client user'}</button></form></div>`,
+            h`<div class="card narrow"><form method="post" action="/ops/users">${csrfInput(ctx)}<label>Name <input name="name" required maxlength="120"></label><label>Email <input type="email" name="email" required maxlength="254"></label>${[1, 2, 3].map(pick)}<p class="muted">The activation link will be emailed to this address, so it must be the client’s own. More companies can be attached afterwards.</p>${fourEyesNote}<button>${config.fourEyes ? 'Request: create client user' : 'Create client user'}</button></form></div>`,
           ),
         );
       });
@@ -1023,6 +1149,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           });
           const warnings: string[] = [];
           for (const { company } of memberships.values()) warnings.push(await domainCheck(email, company));
+          warnings.push(`No email is sent yet. The account cannot be used until an activation link is emailed to ${maskEmail(email)} from the person’s page (a separate request).`);
           return { params, summary: `Create client user ${name} <${email}> in ${[...memberships.values()].map(({ company, role }) => `${describe(company)} as ${role}`).join(', ')}`, warnings };
         },
         async apply(params) {
@@ -1050,17 +1177,17 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             chromeOf(ctx, user.name, flashOf(request)),
             h`<div class="grid"><div><div class="card"><h2>Status</h2><dl><dt>Email</dt><dd>${user.email}</dd><dt>Activated</dt><dd>${user.activatedAt ? `Yes, ${when(user.activatedAt)}` : 'No'}</dd><dt>Last sign-in</dt><dd>${when(user.lastSignInAt)}</dd><dt>Locked out</dt><dd>${locked ? 'Yes' : 'No'}</dd><dt>Active sessions</dt><dd>${sessions}</dd><dt>Account</dt><dd>${tag(!user.disabledAt, 'Enabled', 'Disabled')}</dd></dl></div>
 <div class="card"><h2>Companies</h2><table><tr><th>Company</th><th>Role</th><th></th></tr>${memberships.map(
-              (item) => h`<tr><td><a href="/ops/companies/${item.companyId}">${nameOf(item.companyId)}</a></td><td>${form(ctx, `${base}/memberships`, h`<input type="hidden" name="companyId" value="${item.companyId}"><label>Role ${roleSelect('role', CLIENT_ROLES, item.role)}</label>`, 'Change role', { request: true })}</td><td>${form(ctx, `${base}/memberships/remove`, h`<input type="hidden" name="companyId" value="${item.companyId}">`, 'Remove', { danger: true, confirm: 'Remove this person from the company?' })}</td></tr>`,
+              (item) => h`<tr><td><a href="/ops/companies/${item.companyId}">${nameOf(item.companyId)}</a></td><td>${form(ctx, `${base}/memberships`, h`<input type="hidden" name="companyId" value="${item.companyId}"><label>Role ${roleSelect('role', CLIENT_ROLES, item.role)}</label>`, 'Change role', { request: true })}</td><td>${form(ctx, `${base}/memberships/remove`, h`<input type="hidden" name="companyId" value="${item.companyId}">`, 'Remove', { danger: true })}</td></tr>`,
             )}</table>${free.length > 0 && h`<h2>Attach to a company</h2>${form(ctx, `${base}/memberships`, h`<label>Company <select name="companyId" required>${free.map((company) => h`<option value="${company.id}">${company.name}</option>`)}</select></label><label>Role ${roleSelect('role', CLIENT_ROLES)}</label>`, 'Attach', { request: true })}`}</div></div>
 <div>${
               user.activatedAt === null
                 ? h`<div class="card"><h2>Activation link</h2><p class="muted">Emails a new link to ${maskEmail(user.email)} and cancels any earlier one. Valid for 72 hours. The link is never shown to staff.</p>${fourEyesNote}${form(ctx, `${base}/activation-link`, h``, 'Email activation link', { request: true })}</div>`
-                : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><p class="muted">Removes the authenticator, the recovery codes and the password, ends every session and emails a new activation link to ${maskEmail(user.email)}.</p>${fourEyesNote}<form method="post" action="${base}/reset-authenticator" data-confirm="Reset this person’s authenticator?">${csrfInput(ctx)}${verifyField}<div class="row tight">${codeField}<button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
+                : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><p class="muted">Removes the authenticator, the recovery codes and the password, ends every session and emails a new activation link to ${maskEmail(user.email)}.</p>${fourEyesNote}<form method="post" action="${base}/reset-authenticator">${csrfInput(ctx)}${verifyField}<div class="row tight"><button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
             }
 ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the failed-attempt count so the person can try again now.</p>${form(ctx, `${base}/unlock`, h``, 'Unlock account')}</div>`}
 <div class="card"><h2>Sessions</h2>${form(ctx, `${base}/revoke-sessions`, h``, 'Revoke all sessions')}</div>
 <div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2><p class="muted">A disabled person cannot sign in. Disabling ends every session at once. Re-enabling gives back the old password and authenticator, so it needs a second staff member.</p>${
-              user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable user', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable user', { danger: true, confirm: 'Disable this person?' })
+              user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable user', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable user', { danger: true })
             }</div></div></div>`,
           ),
         );
@@ -1073,7 +1200,13 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
           aim(clientParty(user));
           const company = await companyOf(text(input, 'companyId'));
           const role = oneOf(text(input, 'role'), CLIENT_ROLES, 'role');
-          return { params: { id: user.id, companyId: company.id, role }, summary: `Give ${user.email} the role ${role} in ${describe(company)}`, warnings: [await domainCheck(user.email, company, user.id)] };
+          const current = (await stores.directory.membershipsOf(user.id)).find((item) => item.companyId === company.id)?.role;
+          if (current === role) throw new OpsError('The person already has that role in that company.');
+          return {
+            params: { id: user.id, companyId: company.id, role },
+            summary: current ? `Change the role of ${user.name} <${user.email}> in ${describe(company)} from ${current} to ${role}` : `Attach ${user.name} <${user.email}> to ${describe(company)} with the role ${role}`,
+            warnings: [await domainCheck(user.email, company, user.id)],
+          };
         },
         async apply(params) {
           const user = await clientOf(params.id);
@@ -1085,11 +1218,14 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
       });
       action('/users/:id/memberships/remove', {
         name: 'client.membership.remove',
+        danger: true,
         async prepare({ form: input, params, aim }) {
           const user = await clientOf(params.id);
           aim(clientParty(user));
           const company = await companyOf(text(input, 'companyId'));
-          return { params: { id: user.id, companyId: company.id }, summary: `Remove ${user.email} from ${describe(company)}` };
+          const role = (await stores.directory.membershipsOf(user.id)).find((item) => item.companyId === company.id)?.role;
+          if (!role) throw new OpsError('The person is not in that company.');
+          return { params: { id: user.id, companyId: company.id }, summary: `Remove ${user.name} <${user.email}> (${role}) from ${describe(company)}`, warnings: ['They lose access to this company at once. Putting them back needs a second staff member.'] };
         },
         async apply(params) {
           const user = await clientOf(params.id);
@@ -1110,7 +1246,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         async prepare({ params, aim }) {
           aim(clientParty(await clientOf(params.id)));
           const user = await linkable(params.id);
-          return { params: { id: user.id }, summary: `Email an activation link to client ${user.email}` };
+          return { params: { id: user.id }, summary: `Email an activation link to client ${user.name} <${user.email}>`, warnings: [`An email with a new link, valid for 72 hours, will be sent to ${maskEmail(user.email)}. Any earlier link stops working. The link is never shown to staff.`] };
         },
         async apply(params) {
           const user = await linkable(params.id);
@@ -1127,13 +1263,20 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         name: 'client.reset_authenticator',
         fourEyes: true,
         mails: true,
+        danger: true,
+        password: true,
         async prepare({ form: input, params, aim }) {
           aim(clientParty(await clientOf(params.id)));
           const user = await resettable(params.id);
+          const identityVerification = needVerification(input);
+          const sessions = await auth.activeSessionCount(user.id);
           return {
-            params: { id: user.id, identityVerification: needVerification(input) },
-            summary: `Reset the authenticator of client ${user.email}`,
-            warnings: ['Removes the password, authenticator and recovery codes, ends every session, and emails a new activation link to the address on file. Check the identity verification below before approving.'],
+            params: { id: user.id, identityVerification },
+            summary: `Reset the authenticator of client ${user.name} <${user.email}>`,
+            warnings: [
+              `Removes their password, authenticator and recovery codes, ends ${sessions === 1 ? 'their 1 active session' : `their ${sessions} active sessions`}, and emails a new activation link to ${maskEmail(user.email)}. Whoever reads that mailbox gets the account.`,
+              `How their identity was verified: “${identityVerification}”. Check this before approving.`,
+            ],
           };
         },
         async apply(params, { requester, source }) {
@@ -1150,14 +1293,16 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         },
       });
       /** Client actions on one person. Those that take access away are immediate; giving it back (`fourEyes`) needs a second person. */
-      const simple = (path: string, name: string, flash: string, run: (user: UserRecord, actors: Actors) => Promise<Record<string, string> | void>, fourEyes = false) =>
+      const simple = (path: string, name: string, flash: string, say: { verb: string; danger?: boolean; consequence: (sessions: string) => string }, run: (user: UserRecord, actors: Actors) => Promise<Record<string, string> | void>, fourEyes = false) =>
         action(`/users/:id/${path}`, {
           name,
           fourEyes,
+          danger: say.danger,
           async prepare({ params, aim }) {
             const user = await clientOf(params.id);
             aim(clientParty(user));
-            return { params: { id: user.id }, summary: `${name.replace('client.', '').replace('_', ' ')} client ${user.email}` };
+            const count = await auth.activeSessionCount(user.id);
+            return { params: { id: user.id }, summary: `${say.verb} client ${user.name} <${user.email}>`, warnings: [say.consequence(count === 1 ? '1 active session' : `${count} active sessions`)] };
           },
           async apply(params, actors) {
             const user = await clientOf(params.id);
@@ -1165,9 +1310,9 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             return { target: clientParty(user), detail: detail ?? {}, redirect: `/ops/users/${user.id}?done=${flash}` };
           },
         });
-      simple('unlock', 'client.unlock', 'unlocked', async (user) => auth.unlock(user));
-      simple('revoke-sessions', 'client.revoke_sessions', 'revoked', async (user, { requester, source }) => ({ sessions: String(await revokeClientSessions(requester, user, source, 'revoked by ops')) }));
-      simple('disable', 'client.disable', 'disabled', async (user, { requester, source }) => {
+      simple('unlock', 'client.unlock', 'unlocked', { verb: 'Unlock', consequence: () => 'Clears the count of failed sign-in attempts, so the person can try again now. Their password and authenticator are not changed.' }, async (user) => auth.unlock(user));
+      simple('revoke-sessions', 'client.revoke_sessions', 'revoked', { verb: 'Revoke all sessions of', consequence: (sessions) => `Ends their ${sessions}. They are signed out everywhere and can sign in again.` }, async (user, { requester, source }) => ({ sessions: String(await revokeClientSessions(requester, user, source, 'revoked by ops')) }));
+      simple('disable', 'client.disable', 'disabled', { verb: 'Disable', danger: true, consequence: (sessions) => `They cannot sign in until re-enabled, which needs a second staff member. Ends their ${sessions} and cancels any unused activation link.` }, async (user, { requester, source }) => {
         await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: now() }));
         await stores.auth.activations.deleteWhere({ userId: user.id });
         await revokeClientSessions(requester, user, source, 'user disabled');
@@ -1177,6 +1322,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         'enable',
         'client.enable',
         'enabled',
+        { verb: 'Re-enable', consequence: () => 'They can sign in again with the password and authenticator they had before.' },
         async (user) => {
           await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: null }));
         },
@@ -1235,10 +1381,12 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         fourEyes: true,
         adminApproval: true,
         mails: true,
+        danger: true,
+        password: true,
         async prepare({ form: input, aim }) {
           const { name, email, role } = await newStaffOf(input);
           aim({ type: 'ops', id: null, label: email });
-          return { params: { name, email, role }, summary: `Invite ${name} <${email}> as staff with the role ${role}`, warnings: ['This creates a new member of staff, who will be able to act on client accounts. Approve only if you know this person and this address.'] };
+          return { params: { name, email, role }, summary: `Invite ${name} <${email}> as staff with the role ${role}`, warnings: ['This creates a new member of staff, who will be able to act on client accounts. Approve only if you know this person and this address.', `An activation email will be sent to ${maskEmail(email)}.`] };
         },
         async apply(params, { requester, approver, source }) {
           const { name, email, role } = await newStaffOf(params);
@@ -1266,26 +1414,29 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
 ${
   user.activatedAt === null
     ? h`<div class="card"><h2>Activation link</h2><p class="muted">Emails a new link to ${maskEmail(user.email)}.</p>${form(ctx, `${base}/activation-link`, h``, 'Email activation link', { request: true })}</div>`
-    : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><form method="post" action="${base}/reset-authenticator" data-confirm="Reset this staff member’s authenticator?">${csrfInput(ctx)}${verifyField}<div class="row tight">${codeField}<button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
+    : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><form method="post" action="${base}/reset-authenticator">${csrfInput(ctx)}${verifyField}<div class="row tight"><button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
 }
-<div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2>${user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable', { danger: true, confirm: 'Disable this staff member?', request: true })}</div>`
+<div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2>${user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable', { danger: true, request: true })}</div>`
             }</div></div>`,
           ),
         );
       });
       /** A staff-management action on one existing staff member. `check` runs when it is requested AND again when it is carried out. */
-      const staffAction = (path: string, name: string, options: { mails?: boolean; flash: string; summary: (user: OpsUserRecord, params: Record<string, string>) => string }, check: (user: OpsUserRecord, input: Record<string, string>, requesterId: string, carryingOut: boolean) => Promise<Record<string, string>>, run: (user: OpsUserRecord, params: Record<string, string>, actors: Actors) => Promise<Record<string, string> | void>) =>
+      const staffAction = (path: string, name: string, options: { mails?: boolean; flash: string; summary: (user: OpsUserRecord, params: Record<string, string>) => string; consequence?: (user: OpsUserRecord, params: Record<string, string>) => string }, check: (user: OpsUserRecord, input: Record<string, string>, requesterId: string, carryingOut: boolean) => Promise<Record<string, string>>, run: (user: OpsUserRecord, params: Record<string, string>, actors: Actors) => Promise<Record<string, string> | void>) =>
         action(`/staff/:id/${path}`, {
           name,
           admin: true,
           fourEyes: true,
           adminApproval: true,
           mails: options.mails,
+          // Every change to who is staff, or to what a member of staff can do, is high-impact.
+          danger: true,
+          password: true,
           async prepare({ actor, form: input, params, aim }) {
             const user = await staffOf(params.id);
             aim(opsParty(user));
             const checked = { id: user.id, ...(await check(user, input, actor.id, false)) };
-            return { params: checked, summary: options.summary(user, checked) };
+            return { params: checked, summary: options.summary(user, checked), warnings: options.consequence ? [options.consequence(user, checked)] : [] };
           },
           async apply(params, actors) {
             const user = await staffOf(params.id);
@@ -1297,7 +1448,7 @@ ${
       staffAction(
         'role',
         'staff.role',
-        { flash: 'saved', summary: (user, params) => `Change the staff role of ${user.email} to ${params.role}` },
+        { flash: 'saved', summary: (user, params) => `Change the staff role of ${user.name} <${user.email}> from ${user.role} to ${params.role}`, consequence: (_user, params) => (params.role === 'ops_admin' ? 'As an ops admin they can manage staff and companies and approve those changes.' : 'As an ops user they can no longer manage staff or companies, or approve those changes.') },
         async (user, input, requesterId) => {
           const role = oneOf(text(input, 'role'), OPS_ROLES, 'role');
           if (role !== 'ops_admin') await assertStaffRemovalAllowed(stores, requesterId, user);
@@ -1312,7 +1463,7 @@ ${
       staffAction(
         'disable',
         'staff.disable',
-        { flash: 'disabled', summary: (user) => `Disable staff member ${user.email}` },
+        { flash: 'disabled', summary: (user) => `Disable staff member ${user.name} <${user.email}>`, consequence: () => 'They are signed out at once, cannot sign in until re-enabled, and any unused activation link is cancelled.' },
         async (user, _input, requesterId) => {
           await assertStaffRemovalAllowed(stores, requesterId, user);
           return {};
@@ -1327,7 +1478,7 @@ ${
       staffAction(
         'enable',
         'staff.enable',
-        { flash: 'enabled', summary: (user) => `Re-enable staff member ${user.email}` },
+        { flash: 'enabled', summary: (user) => `Re-enable staff member ${user.name} <${user.email}>`, consequence: (user) => `They can sign in again, as ${user.role}, with the password and authenticator they had before.` },
         async (user, _input, requesterId) => {
           if (user.id === requesterId) throw new OpsError('You cannot do this to your own account.', 403, 'self');
           return {};
@@ -1339,7 +1490,7 @@ ${
       staffAction(
         'activation-link',
         'staff.activation_link',
-        { mails: true, flash: 'mailed', summary: (user) => `Email an activation link to staff member ${user.email}` },
+        { mails: true, flash: 'mailed', summary: (user) => `Email an activation link to staff member ${user.name} <${user.email}>`, consequence: (user) => `An email with a new link will be sent to ${maskEmail(user.email)}. Any earlier link stops working. The link is never shown to staff.` },
         async (user) => {
           if (user.activatedAt !== null) throw new OpsError('This account is already activated.');
           if (user.disabledAt) throw new OpsError('Re-enable this staff member first.');
@@ -1350,14 +1501,14 @@ ${
       staffAction(
         'unlock',
         'staff.unlock',
-        { flash: 'unlocked', summary: (user) => `Unlock staff member ${user.email} (clear failed sign-in attempts)` },
+        { flash: 'unlocked', summary: (user) => `Unlock staff member ${user.name} <${user.email}> (clear failed sign-in attempts)`, consequence: () => 'They can try to sign in again now. Their password and authenticator are not changed.' },
         async () => ({}),
         async (user) => opsAuth.unlock(user),
       );
       staffAction(
         'reset-authenticator',
         'staff.reset_authenticator',
-        { mails: true, flash: 'mailed', summary: (user) => `Reset the authenticator of staff member ${user.email}` },
+        { mails: true, flash: 'mailed', summary: (user) => `Reset the authenticator of staff member ${user.name} <${user.email}>`, consequence: (user, params) => `Removes their password, authenticator and recovery codes, signs them out, and emails a new activation link to ${maskEmail(user.email)}. How their identity was verified: “${params.identityVerification ?? ''}”.` },
         async (user, input, requesterId, carryingOut) => {
           // When an approved reset is carried out again after the email could not be sent, the account is already cleared: that is fine.
           if (user.activatedAt === null && !carryingOut) throw new OpsError('This account is not activated. Issue an activation link instead.');

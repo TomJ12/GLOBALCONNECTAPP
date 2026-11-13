@@ -53,6 +53,3 @@ export function layout(chrome: Chrome, body: Html): string {
 <body><header><a class="brand" href="/ops"><img src="/ops/static/logo.png" alt="" width="26" height="29">Global Connect <span>Ops</span></a>${nav}</header>
 <main>${chrome.flash && h`<p class="flash" role="status">${chrome.flash}</p>`}<h1>${chrome.title}</h1>${body}</main></body></html>`.text;
 }
-
-/** The step-up field every state-changing form carries. */
-export const codeField = h`<label>Authenticator code <input name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required size="8"></label>`;

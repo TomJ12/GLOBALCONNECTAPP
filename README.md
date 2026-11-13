@@ -94,6 +94,13 @@ To try it:
 5. Sign in with the email, the password and a **new** code (a code works once, so wait
    for the next one if you just used it to activate).
 6. Send a payment: after the review step the app asks for a fresh 6-digit code.
+7. In the ops console (`/ops`): activate a demo staff account from its printed link the
+   same way and sign in with password and code. After that the console never asks for a
+   code again: press a button (say **Revoke all sessions** on a client's page), read the
+   confirmation page that says what will happen, and press **Confirm**. Things that
+   need a second person become a request under **Approvals**, which another staff
+   member opens and confirms; for staff changes, a new or re-pointed company and a
+   client authenticator reset that second person is also asked for their password.
 
 **There is no email.** Whenever the server "sends an activation email" (from the ops
 console or the operator commands below) the whole message, link included, is printed in
@@ -188,7 +195,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 131 tests (about three minutes)
+npm test                 # node:test, 132 tests (about three minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -264,7 +271,7 @@ server/
     auth/lockout.ts progressive lockout, shared by client and staff sign-in
     payments/held.ts payments held for approval: create, approve, reject, cancel, expire,
                     send once and settle (see "Approvals")
-    ops/            the ops console: auth.ts (staff accounts, sessions, step-up),
+    ops/            the ops console: auth.ts (staff accounts, sessions, password re-check),
                     console.ts (every /ops route and page, approvals), html.ts, static/
     store/          types.ts (repository interfaces incl. OpsStore, AuditLog and the atomic
                     operations), seed.ts (sample people, development only),
@@ -617,8 +624,8 @@ approvers (no email or push): they see the payment when they open the app.
 ## Ops console
 
 A staff-only, desktop web console served by the server itself at `/ops`: plain
-server-rendered HTML, one stylesheet, one small script for copy buttons and
-confirmations (the pages work without it), no framework, no CDN, no third-party request.
+server-rendered HTML, one stylesheet, one small script for copy buttons (the pages work
+without it), no framework, no CDN, no third-party request.
 It shares nothing with the client app: separate routes, a separate account table
 (`stores.ops`), separate invitations, sessions and lockout counters, and a separate
 cookie.
@@ -635,8 +642,7 @@ cookie.
    back their old password and authenticator); create, **rename**, re-point or
    **reactivate** a company; and all staff management (invite, role change, disable,
    re-enable, unlock, re-issue a staff link, reset a staff authenticator). A
-   **different**, active staff member must approve the request with their own fresh
-   authenticator code before anything changes. The requester cannot approve their own
+   **different**, active staff member must approve the request before anything changes. The requester cannot approve their own
    request, and nor can the staff member a request is about. **Staff management and
    creating or re-pointing a company can be approved only by an ops admin**: an ops user
    cannot wave through who is staff or where a company's money is. The approver is shown
@@ -674,7 +680,7 @@ who can read a client's mailbox, or has access to the server or its storage, is 
 all of this. Staff SSO and a review of approvals after the fact are the real answers and
 are not built.
 
-Take effect at once, with a fresh code and an audit entry, because they only take
+Take effect at once, after their confirmation page and with an audit entry, because they only take
 access away or change nothing a client can use: unlock a client, revoke sessions,
 disable a client, remove a client from a company, deactivate a company.
 
@@ -747,10 +753,50 @@ responses carry a CSP without inline script or style, `frame-ancestors 'none'` a
 
 ### What ops can do
 
-Every change needs a **fresh authenticator code from the staff member, typed into the
-form that makes the change** (step-up). A code works once, so two changes need two codes
-(about 30 seconds apart). "Approval" below means a second staff member, as described
-above.
+**The authenticator code is asked for when staff sign in (and when they activate), and
+nowhere else in the console.** That is the product owner's decision: a code for every
+role change, email and revocation was too much. Instead, every change goes through a
+**confirmation page**:
+
+- Pressing a button in the console changes nothing. The server answers with a page that
+  says in words exactly what will happen and to whom: the person's name and email, the
+  company's name and id, the old and the new value, how many sessions will end, that an
+  email will go to a masked address, and whether it takes effect at once or only makes a
+  request. It has **Confirm** and **Cancel**. It is plain HTML and needs no script.
+- **Confirm** carries a token the server signed (HMAC with `SERVER_SECRET`) for this
+  staff session, this action, this address, exactly these form fields and exactly the
+  words that were shown. It is good for five minutes and works **once** (a used token is
+  remembered in the database). So a confirming request cannot be replayed, altered,
+  pointed at another action, taken from another session or made up by another site; and
+  if what would happen has changed since the page was shown (someone else changed the
+  role in between, say), the page is shown again instead. This is on top of the CSRF
+  field, and the content security policy is unchanged.
+- **High-impact changes are marked** (red border, "High-impact change", a red Confirm
+  button) and state the consequence: disabling a client, removing them from a company,
+  deactivating a company, resetting an authenticator, creating or re-pointing a
+  company, and every staff change, both when they are asked for and when they are
+  approved.
+- **The staff member's password (not a code) is asked for again** on the confirmation
+  page for the few highest-impact approvals: approving **any staff-management request**,
+  approving a **company creation or re-point**, and approving a **client authenticator
+  reset**. (With `FOUR_EYES=off` in development, where one person carries these out, it
+  is asked of that person.) Wrong passwords are counted and lock like sign-in, and are
+  audited as `ops.password_check`.
+- A client authenticator reset and a staff one still need the free-text
+  identity-verification note, and break-glass still needs its reason.
+
+What the per-action code used to protect against was an **unattended, signed-in staff
+browser**. What stands there now: the session ends after **10 minutes** without a
+request (checked by the server on every request, including a Confirm) or 8 hours;
+everything that gives access needs a second person; and the highest-impact approvals
+need the password. Someone at an unattended console within those ten minutes can still
+do the single-person actions (unlock, revoke sessions, disable, remove from a company,
+deactivate a company), all of which take access away, and can make requests.
+
+Clients are not affected: they still type a fresh 6-digit code for payments, approvals,
+rejections, cancellations and adding a payee.
+
+"Approval" below means a second staff member, as described above.
 
 - **Companies:** list, search, view; rename, deactivate / reactivate; create and
   re-point (ops admin, approval); **change how many approvals a payment needs** (0, 1
@@ -812,8 +858,9 @@ changes or removes an entry.
 
 Recorded, each with time, actor, target, action, outcome and source address:
 
-- for clients and staff: activation, sign-in success and failure, lockout, step-up,
-  sign-out, and sessions revoked by ops;
+- for clients and staff: activation, sign-in success and failure, lockout, sign-out,
+  and sessions revoked by ops; for clients also step-up; for staff a failed password
+  check on a confirmation (`ops.password_check`);
 - for clients: company selection and **every money action** (create payment, approve,
   reject, cancel, add payee, book conversion), success and failure, with amount,
   currency, payee id and a hash of the idempotency key;
@@ -823,9 +870,11 @@ Recorded, each with time, actor, target, action, outcome and source address:
   (the payee changed), each with the payment id, amount, currency and payee id; and
   `ops.company.approvals` for a change of a company's rule, with the old and new value
   and both staff members;
-- every ops action that reached the console with a valid session and CSRF field, success
-  and failure, with its target when one was identified; approval requests and decisions
-  with both people;
+- every ops action that was confirmed, success and failure, with its target when one
+  was identified, marked `confirmed: yes` (and `passwordChecked: yes` where the password
+  was asked for); approval requests and decisions with both people. Showing a
+  confirmation page is not an action and is not logged; there is no staff step-up entry
+  any more;
 - the operator commands (`invite`, `create-ops-admin`, `break-glass`);
 - a new member of staff (`ops.staff.new`) and every break-glass use, both highlighted on
   the audit page.

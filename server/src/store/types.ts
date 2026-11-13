@@ -231,6 +231,8 @@ export interface OpsStore {
   sessions: Table<OpsSessionRecord>;
   attempts: Table<AttemptRecord>;
   approvals: Table<ApprovalRecord>;
+  /** Confirmation tokens that have been used, by their random part, until they would have expired anyway. A token works once. */
+  confirmations: Table<{ expiresAt: number }>;
 }
 
 // --- Audit log -----------------------------------------------------------------

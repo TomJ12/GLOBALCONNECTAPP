@@ -20,13 +20,12 @@ import type { OpsRole } from '../src/store/types';
 import { isEmail } from '../src/validate';
 import { AuthService } from '../src/auth/service';
 import { OpsAuthService } from '../src/ops/auth';
-import { ADMIN_TOKEN, AMIRA, BEN, DANA, dumpDatabase, harness, PASSWORD, TEST_DATA_KEY, type Harness } from './helpers';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, dumpDatabase, harness, PASSWORD, TEST_DATA_KEY, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const OPS_PASSWORD = 'staff horse battery staple';
 const from = (address: string) => ({ 'x-forwarded-for': address });
 const login = (email: string, password: string, address?: string) => h.call('POST', '/v1/auth/login', { body: { email, password }, headers: address ? from(address) : {} });
 const audit = (action?: string) => h.stores.audit.query({ action, limit: 100_000 });
@@ -84,7 +83,7 @@ async function staff(email: string, role: OpsRole): Promise<Staff> {
   const done = await browser.post('/ops/login/verify', { challengeId, code: h.freshCode(enrol.secret), method: 'totp' });
   assert.equal(done.status, 303, done.body.slice(-300));
   await browser.get('/ops/users');
-  return { browser, id: user.id, email, secret: enrol.secret, act: (url, form = {}) => browser.post(url, { ...form, code: h.freshCode(enrol.secret) }) };
+  return { browser, id: user.id, email, secret: enrol.secret, act: (url, form = {}) => confirmed((to, fields) => browser.post(to, fields), url, form) };
 }
 async function approved(requester: Staff, approver: Staff, url: string, form: Record<string, string> = {}) {
   const asked = await requester.act(url, form);
@@ -659,7 +658,7 @@ test('survivor: a request is decided once and only while it is pending and unexp
   let expireDuring: string | null = null;
   h = await harness({}, undefined, {
     storeLatency: true,
-    // "Time passes mid-request": the clock jumps a day at the moment the approver's code is being burnt.
+    // "Time passes mid-request": the clock jumps a day at the moment the confirmation is being marked as used.
     storeHook: (operation) => {
       if (expireDuring && operation === expireDuring) {
         expireDuring = null;
@@ -674,14 +673,20 @@ test('survivor: a request is decided once and only while it is pending and unexp
 
   // Two approvals of one request at the same moment: carried out once.
   const raced = await ask();
-  const codes = [h.freshCode(one.secret), h.code(two.secret)];
-  const [a, b] = await Promise.all([one.browser.post(`/ops/approvals/${raced}/approve`, { code: codes[0] as string }), two.browser.post(`/ops/approvals/${raced}/approve`, { code: codes[1] as string })]);
+  /** Both have the confirmation page open; `go` presses Confirm. */
+  const ready = async (who: typeof one, url: string) => {
+    const token = confirmTokenOf((await who.browser.post(url)).body) as string;
+    return () => who.browser.post(url, { _confirm: token });
+  };
+  const [first, second] = [await ready(one, `/ops/approvals/${raced}/approve`), await ready(two, `/ops/approvals/${raced}/approve`)];
+  const [a, b] = await Promise.all([first(), second()]);
   assert.deepEqual([a.status, b.status].sort(), [303, 409]);
   assert.equal(h.outbox.sent.length, 1);
   assert.equal((await audit('ops.client.activation_link')).filter((entry) => entry.outcome === 'success').length, 1);
   // An approval and a rejection at the same moment: one of them, never both.
   const mixed = await ask();
-  const [c, d] = await Promise.all([one.browser.post(`/ops/approvals/${mixed}/approve`, { code: h.freshCode(one.secret) }), two.browser.post(`/ops/approvals/${mixed}/reject`, { code: h.freshCode(two.secret) })]);
+  const [approve, reject] = [await ready(one, `/ops/approvals/${mixed}/approve`), await ready(two, `/ops/approvals/${mixed}/reject`)];
+  const [c, d] = await Promise.all([approve(), reject()]);
   assert.deepEqual([c.status, d.status].sort(), [303, 409]);
   const status = (await h.stores.ops.approvals.get(mixed))?.status;
   assert.equal(h.outbox.sent.length, status === 'approved' ? 2 : 1);
@@ -689,9 +694,9 @@ test('survivor: a request is decided once and only while it is pending and unexp
   // The request runs out while the approval is in progress (after the page checked it, before the decision is written).
   const sent = h.outbox.sent.length;
   const late = await ask();
-  const fresh = h.freshCode(one.secret);
-  expireDuring = 'update';
-  const reply = await one.browser.post(`/ops/approvals/${late}/approve`, { code: fresh });
+  const press = await ready(one, `/ops/approvals/${late}/approve`);
+  expireDuring = 'mutate';
+  const reply = await press();
   assert.equal(reply.status, 409);
   assert.equal(h.outbox.sent.length, sent);
   assert.notEqual((await h.stores.ops.approvals.get(late))?.status, 'approved');
