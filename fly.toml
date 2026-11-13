@@ -1,0 +1,77 @@
+# Global Connect DEMO on Fly.io (London). Mock providers and sample data only:
+# this is not a live deployment. Step-by-step guide: docs/DEPLOY-DEMO.md
+#
+# `app` must be unique across all of Fly.io. The guide's `fly launch` step sets it
+# to the name you choose; the address is then https://<app>.fly.dev
+
+app = "globalconnect-demo"
+primary_region = "lhr"
+
+# Fly sends SIGINT by default; the server closes its database cleanly on it.
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # The explicit opt-in to mock providers and sample data. The server will not
+  # start like this on a public address without the demo password and its own
+  # secrets (set with `fly secrets set`, never here).
+  APP_ENV = "development"
+  PORT = "8080"
+  WEB_DIR = "/app/dist-demo"
+  DATABASE_PATH = "/data/globalconnect.sqlite"
+  # Fly's proxy puts the visitor's address in X-Forwarded-For followed by the
+  # app's own Fly address, and connects from a third address. Two hops are
+  # therefore Fly's and the next one back is the visitor (see the guide).
+  TRUST_PROXY = "2"
+  # APP_URL is not needed: on Fly it defaults to https://<app>.fly.dev.
+  # Set it (fly secrets or here) only when you move to a custom domain.
+
+# ONE machine, always. The database is a SQLite file on this machine's volume:
+# a second machine would have its own empty database. Nothing here scales out,
+# and the guide deploys with --ha=false. Do not run `fly scale count 2`.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Left running. The mock providers keep their sample data in memory, so a
+  # machine that stops when idle starts again with the providers' data reset
+  # while the accounts in the database remain. To pay only while it is in use,
+  # change "off" to "stop" (see "What it costs" in the guide).
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 100
+    hard_limit = 200
+
+  # Unauthenticated and information-free: {"ok":true}. Checked from inside
+  # Fly's network, so the demo gate does not apply to it.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+# The database lives here and survives deploys and restarts. Created in London
+# by the guide (`fly volumes create gc_data --region lhr --size 1`).
+[mounts]
+  source = "gc_data"
+  destination = "/data"
+  # Fly's automatic daily snapshots of the volume, kept five days (billed by
+  # size; the first 10 GB a month are free at the time of writing).
+  snapshot_retention = 5
+
+# shared-cpu-1x with 1 GB. Password hashing (scrypt, N=2^17) takes 128 MB per
+# hash and the server runs at most four at once: about 590 MB at the measured
+# peak, plus roughly 90 MB for the server itself. 512 MB is not enough; 1 GB
+# leaves a third spare.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

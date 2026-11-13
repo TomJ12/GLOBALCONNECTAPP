@@ -1145,4 +1145,35 @@ test('ops confirmation: says exactly what will happen, works once, marks high-im
   assert.equal((await h.stores.directory.getUser('usr_dana'))?.disabledAt ?? null, null);
 });
 
+test('ops behind the demo gate: sign-in, CSRF and the confirmation flow work unchanged, and the gate cookie is not a staff session', async () => {
+  h = await harness({ demoAccessPassword: 'orchard-lantern-47-quay' });
+  // Without the gate cookie there is no console at all.
+  assert.equal((await h.app.inject({ method: 'GET', url: '/ops/login', headers: { accept: 'text/html' } })).headers.location, '/demo-access?next=%2Fops%2Flogin');
+  const opened = await h.app.inject({ method: 'POST', url: '/demo-access', headers: { 'content-type': 'application/x-www-form-urlencoded' }, payload: 'password=orchard-lantern-47-quay&next=%2Fops' });
+  const gate = String([opened.headers['set-cookie']].flat()[0]).split(';')[0] as string;
+  // From here every request carries the gate cookie beside whatever cookies the console itself sets.
+  const inject = h.app.inject.bind(h.app) as (options: any) => Promise<any>;
+  (h.app as any).inject = (options: any) => inject({ ...options, headers: { ...options.headers, cookie: [options.headers?.cookie, gate].filter(Boolean).join('; ') } });
+
+  // The gate cookie alone is nobody: the console still asks for a staff sign-in.
+  assert.equal((await h.app.inject({ method: 'GET', url: '/ops/users' })).headers.location, '/ops/login');
+  const admin = await staff();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  await h.activate(AMIRA);
+  assert.equal((await admin.browser.get('/ops/users')).status, 200);
+  // CSRF is as strict as ever.
+  assert.equal((await olu.browser.request('POST', '/ops/users/usr_amira/revoke-sessions', {})).status, 403);
+  assert.equal((await olu.browser.post('/ops/users/usr_amira/revoke-sessions', {}, { 'sec-fetch-site': 'cross-site' })).status, 403);
+  // Confirmation page, then Confirm; a request and its approval by a second person.
+  const shown = await olu.browser.post('/ops/users/usr_amira/revoke-sessions');
+  assert.match(shown.body, /<h2>Revoke all sessions of client Amira Shah/);
+  assert.equal((await olu.act('/ops/users/usr_amira/revoke-sessions')).status, 303);
+  const asked = await olu.act('/ops/users/usr_ben/activation-link');
+  assert.equal(asked.status, 303);
+  assert.equal((await admin.act(`/ops/approvals/${idOf(asked.location)}/approve`)).status, 303);
+  assert.equal(h.outbox.sent.length, 1);
+  assert.equal((await admin.browser.post('/ops/logout')).status, 303);
+  assert.equal((await admin.browser.get('/ops/users')).location, '/ops/login', 'signed out of the console, still through the gate');
+});
+
 void DANA;

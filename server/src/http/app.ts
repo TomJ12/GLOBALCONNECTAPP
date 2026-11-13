@@ -28,6 +28,7 @@ import { networkOf, sourceOf } from '../net';
 import { emailDomain, hasControlCharacters, isEmail } from '../validate';
 import { isActiveStaff, OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
+import { registerDemoGate } from './demoGate';
 import { HeldPayments, type HeldPaymentsDeps } from '../payments/held';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
@@ -266,6 +267,8 @@ export async function buildApp(deps: AppDeps) {
     reply.header('X-Frame-Options', 'DENY');
     reply.header('Content-Security-Policy', WEB_APP_CSP);
     reply.header('Referrer-Policy', 'no-referrer');
+    // Served over https (a deployed demo, or the real thing): browsers are told never to try plain http here again.
+    if (config.appUrl.startsWith('https://')) reply.header('Strict-Transport-Security', 'max-age=31536000');
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -335,6 +338,10 @@ export async function buildApp(deps: AppDeps) {
    * session cannot write them without limit. Sign-out does not come through
    * here and always works.
    */
+  // The demo gate (when DEMO_ACCESS_PASSWORD is set) stands in front of every route registered after this line.
+  const byGate = limiter(MAX_RATE_WINDOWS);
+  await registerDemoGate(app, { config, now, limitAttempts, limit: (address, allowed) => byGate(sourceOf(address), allowed) });
+
   const sessionOf = async (request: FastifyRequest): Promise<SessionContext> => {
     const context = await auth.authenticate(bearer(request));
     if (request.method !== 'GET' && request.method !== 'HEAD') {

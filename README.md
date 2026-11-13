@@ -130,6 +130,15 @@ Codespaces for a Node 22 image; a codespace created before it was added needs
 `ExperimentalWarning: SQLite is an experimental feature` line at start-up; see
 "Database".
 
+**Showing the demo without your laptop.** [docs/DEPLOY-DEMO.md](docs/DEPLOY-DEMO.md)
+is a step-by-step guide to putting this same demo on Fly.io in London behind a demo
+password (`Dockerfile`, `fly.toml`). It is still a demo on mock providers with sample
+data. On Fly, or on any address that is not this machine or a Codespace, the server
+refuses to start in development mode unless `DEMO_ACCESS_PASSWORD` and real values for
+`SERVER_SECRET`, `ADMIN_TOKEN` and `DATA_ENCRYPTION_KEY` are set; with the password set,
+everything except `/healthz` sits behind a gate page ("Global Connect demo: sample data
+only"). `npm run demo` on a laptop or in a Codespace is unchanged.
+
 **Operator commands.** Three commands talk to the running server; they stand in for
 tooling an operator with access to the machine would have:
 
@@ -196,7 +205,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 132 tests (about three minutes)
+npm test                 # node:test, 140 tests (about three minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example

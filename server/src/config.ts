@@ -44,6 +44,16 @@ export interface Config {
   adminPort: number;
   /** Key for values the server signs (the pre-login CSRF anchor). Required outside development; random per start in development. */
   serverSecret: string;
+  /**
+   * DEMO ON A PUBLIC ADDRESS. When set, nothing but /healthz is served until
+   * the visitor has typed this password on the gate page. Required whenever
+   * development mode runs anywhere other than this machine or a Codespace.
+   */
+  demoAccessPassword: string | null;
+  /** Development mode on a public address (Fly.io, or any APP_URL that is not localhost or a Codespace). */
+  publicDemo: boolean;
+  /** First-time setup of a public demo: print the sample accounts' activation codes to the log (DEMO_SETUP_CODES=1). Off, nothing is printed. */
+  demoSetupCodes: boolean;
   /** Staff accounts may only be created for addresses at these domains. */
   staffEmailDomains: string[];
   /** Sensitive ops actions need a second staff member. Can be turned off only in development. */
@@ -135,6 +145,27 @@ function parseTrustProxy(value: string | undefined): false | number | string[] {
   return ranges;
 }
 
+/** A demo password has to be something nobody guesses: long enough, not a placeholder, not one character repeated. */
+export function demoPasswordProblem(password: string): string | null {
+  if (password.length < 12) return 'it is shorter than 12 characters';
+  if (/replace|change-?me|example|placeholder|your-|^password|^demo|letmein|12345|qwerty/i.test(password)) return 'it looks like a placeholder or a common password';
+  if (new Set(password).size < 6) return 'it has too few different characters';
+  return null;
+}
+
+/** This machine, or a GitHub Codespace's forwarded port: the two places a development server may run without the demo gate. */
+function isPrivateAddress(url: string, env: Env): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host.endsWith('.localhost')) return true;
+  const forwarding = (env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN ?? 'app.github.dev').toLowerCase();
+  return Boolean(env.CODESPACE_NAME) && host.startsWith(`${env.CODESPACE_NAME?.toLowerCase()}-`) && host.endsWith(`.${forwarding}`);
+}
+
 export function loadConfig(env: Env = process.env): Config {
   if (env.APP_ENV !== undefined && env.APP_ENV !== 'development' && env.APP_ENV !== 'production') {
     throw new Error('APP_ENV must be "development" or "production" (the default).');
@@ -183,16 +214,44 @@ export function loadConfig(env: Env = process.env): Config {
   if (staffEmailDomains.some((domain) => !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain))) throw new Error('STAFF_EMAIL_DOMAINS must be a comma-separated list of domain names.');
 
   const port = Number(env.PORT ?? 3001) || 3001;
-  const appUrl = (env.APP_URL ?? 'http://localhost:8081').replace(/\/+$/, '');
+  // On Fly.io the app's own address is known, so it need not be typed into the configuration.
+  const flyUrl = env.FLY_APP_NAME ? `https://${env.FLY_APP_NAME}.fly.dev` : null;
+  const appUrl = (env.APP_URL ?? flyUrl ?? 'http://localhost:8081').replace(/\/+$/, '');
   // When the server also serves the web app (npm run demo), both share one address.
-  const opsUrl = (env.OPS_URL ?? (development ? (env.WEB_DIR ? appUrl : `http://localhost:${port}`) : '')).replace(/\/+$/, '');
+  const opsUrl = (env.OPS_URL ?? (development ? (env.WEB_DIR || env.FLY_APP_NAME ? appUrl : `http://localhost:${port}`) : '')).replace(/\/+$/, '');
   if (strict && !opsUrl.startsWith('https://')) throw new Error('OPS_URL must be set to the https:// address of this server (the ops console is served only over https outside development).');
+
+  // --- A demo that can be reached from the internet -------------------------------------------
+  const demoAccessPassword = env.DEMO_ACCESS_PASSWORD || null;
+  if (demoAccessPassword) {
+    const problem = demoPasswordProblem(demoAccessPassword);
+    if (problem) throw new Error(`DEMO_ACCESS_PASSWORD is refused because ${problem}. Use a phrase of 12 characters or more that you have not used anywhere else.`);
+  }
+  const publicDemo = development && (Boolean(env.FLY_APP_NAME) || !isPrivateAddress(appUrl, env) || !isPrivateAddress(opsUrl, env));
+  if (publicDemo) {
+    // Mock providers, sample data and "emails" printed to the log, on an address anyone can reach: only behind the
+    // gate, only over https, and with real secrets. No generated key files, no built-in defaults.
+    const missing = [
+      !demoAccessPassword && 'DEMO_ACCESS_PASSWORD (the password visitors must type before anything is shown)',
+      !env.SERVER_SECRET && 'SERVER_SECRET',
+      !env.ADMIN_TOKEN && 'ADMIN_TOKEN',
+      !env.DATA_ENCRYPTION_KEY && 'DATA_ENCRYPTION_KEY',
+      !env.DATABASE_PATH && 'DATABASE_PATH',
+    ].filter(Boolean);
+    if (missing.length > 0) {
+      throw new Error(`Refusing to start in development mode on a public address (${env.FLY_APP_NAME ? `Fly.io app ${env.FLY_APP_NAME}` : appUrl}) without: ${missing.join('; ')}. A demo that the internet can reach must be behind the demo password and must have its own secrets. See docs/DEPLOY-DEMO.md.`);
+    }
+    if (!appUrl.startsWith('https://') || !opsUrl.startsWith('https://')) throw new Error('A demo on a public address must be served over https: APP_URL (and OPS_URL, if set) must start with https://.');
+  }
 
   const approvalHours = Number(env.PAYMENT_APPROVAL_HOURS ?? 48);
   if (!(approvalHours > 0 && approvalHours <= 24 * 30)) throw new Error('PAYMENT_APPROVAL_HOURS must be a number of hours between 0 and 720 (default 48).');
 
   return {
     paymentApprovalMs: Math.round(approvalHours * 60 * 60_000),
+    demoAccessPassword,
+    publicDemo,
+    demoSetupCodes: env.DEMO_SETUP_CODES === '1',
     port,
     host: env.HOST ?? '0.0.0.0',
     development,

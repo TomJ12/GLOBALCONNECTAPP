@@ -49,8 +49,15 @@ if (config.development) {
       : 'No DATABASE_PATH: the database is in memory and everything is forgotten when the server stops.',
   );
   if (!config.fourEyes) lines.push('FOUR-EYES APPROVAL IS OFF (FOUR_EYES=off): one staff member alone can make sensitive changes.');
-  lines.push('', 'Activation codes for the sample accounts not yet activated (codes from an earlier start stay valid for 72 hours):');
-  lines.push(...(await seedInvitations(runtime, auth, opsAuth, config)));
-  lines.push('', `Ops console: ${config.opsUrl}/ops`, 'If the code field is empty after opening a link, type the code printed next to it.');
-  console.log(['', ...lines, ''].join('\n'));
+  if (config.demoAccessPassword) lines.push('THE DEMO GATE IS ON: nothing but /healthz is served until a visitor has typed the demo password.');
+  if (config.publicDemo && !config.demoSetupCodes) {
+    // On a public address the log is not the place for activation codes, except during first-time set-up, when it is asked for.
+    lines.push('', 'Activation codes for the sample accounts are NOT printed (set DEMO_SETUP_CODES=1 for the first start to print them once; see docs/DEPLOY-DEMO.md).', `Ops console: ${config.opsUrl}/ops`);
+    console.log(['', ...lines, ''].join('\n'));
+  } else {
+    lines.push('', 'Activation codes for the sample accounts not yet activated (codes from an earlier start stay valid for 72 hours):');
+    lines.push(...(await seedInvitations(runtime, auth, opsAuth, config)));
+    lines.push('', `Ops console: ${config.opsUrl}/ops`, 'If the code field is empty after opening a link, type the code printed next to it.');
+    console.log(['', ...lines, ''].join('\n'));
+  }
 }

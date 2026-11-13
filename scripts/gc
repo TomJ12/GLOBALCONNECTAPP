@@ -1,0 +1,32 @@
+#!/bin/sh
+# Operator commands inside the demo container, for use from `fly ssh console`:
+#
+#   gc backup /data/backup.sqlite          a consistent copy of the database
+#   gc audit-verify                        check the audit log's hash chain
+#   gc invite someone@client.example       email (= print in the log) a client activation link
+#   gc create-ops-admin a@b.example "Name" first ops admins (while fewer than two exist)
+#   gc break-glass <action> <email> "why"
+#
+# A shell opened by `fly ssh console` may not have the app's secrets in its
+# environment, so the few these commands need are read from /run/gc.env (written
+# by the entrypoint, readable by root only), and the command is then run as the
+# same unprivileged user as the server.
+set -eu
+if [ -z "${DATA_ENCRYPTION_KEY:-}" ] || [ -z "${ADMIN_TOKEN:-}" ]; then
+  if [ ! -r /run/gc.env ]; then echo "Run this as root inside the running machine (fly ssh console)." >&2; exit 1; fi
+  set -a
+  . /run/gc.env
+  set +a
+fi
+cd /app/server
+case "${1:-}" in
+  backup) shift; set -- src/cli/db.ts backup "$@" ;;
+  audit-verify) shift; set -- src/cli/db.ts audit-verify ;;
+  rotate-key) shift; set -- src/cli/db.ts rotate-key ;;
+  invite) shift; set -- src/cli/invite.ts "$@" ;;
+  create-ops-admin) shift; set -- src/cli/create-ops-admin.ts "$@" ;;
+  break-glass) shift; set -- src/cli/break-glass.ts "$@" ;;
+  *) echo "Usage: gc backup <file> | audit-verify | invite <email> | create-ops-admin <email> \"Name\" | break-glass <action> <email> \"reason\"" >&2; exit 2 ;;
+esac
+if [ "$(id -u)" = "0" ]; then exec setpriv --reuid=node --regid=node --init-groups node --import tsx "$@"; fi
+exec node --import tsx "$@"

@@ -1,0 +1,36 @@
+# Nothing that is not needed to build, and nothing private, goes to the Docker builder.
+.git
+.github
+.devcontainer
+.expo
+.demo-data
+**/.demo-data
+node_modules
+server/node_modules
+dist
+dist-demo
+web-build
+docs
+README.md
+fly.toml
+Dockerfile
+.dockerignore
+# Secrets and keys never belong in an image.
+.env
+.env.*
+!.env.example
+server/.env
+server/.env.*
+**/*.dev-key
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.pem
+**/*.key
+**/*.p8
+**/*.p12
+**/*.jks
+# Tests are not shipped.
+server/test
+src/**/__tests__
+src/test
