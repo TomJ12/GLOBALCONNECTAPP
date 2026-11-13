@@ -14,12 +14,9 @@ import { currencyDecimals } from '../../../lib/money';
 import type { MockControls } from '../../mockControls';
 import type { Transport, TransportParams, TransportRequest, TransportResponse } from './transport';
 
-export const MOCK_MAGIC_LINK_CODE = 'SAMPLE-LINK-CODE';
-
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Requests that change something. Used by "writes only" failure injection and "applied late". */
 const WRITE_PATHS = [/\/conversions\/create$/, /\/payments\/create$/, /\/payments\/authorise$/, /\/payments\/[^/]+\/delete$/, /\/beneficiaries\/create$/];
-const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
 
 /** Sample rates: units of each currency per 1 GBP. */
 const UNITS_PER_GBP: Record<string, string> = {
@@ -70,7 +67,6 @@ interface State {
   conversions: Json[];
   transactions: Json[];
   quotes: Map<string, StoredQuote>;
-  magicLinks: Map<string, { email: string; expiresAtMs: number; deviceSecret: string }>;
   tokens: Set<string>;
   idempotentPayments: Map<string, Json>;
   idempotentConversions: Map<string, Json>;
@@ -81,6 +77,8 @@ export interface MockServerOptions {
   getControls: () => MockControls;
   now?: () => number;
   random?: () => number;
+  /** Put into every id this instance generates, so several instances never produce the same id. */
+  idNamespace?: string;
 }
 
 function one(params: TransportParams | undefined, key: string): string | undefined {
@@ -139,9 +137,11 @@ export class MockCurrencycloudServer implements Transport {
   private readonly getControls: () => MockControls;
   private readonly now: () => number;
   private readonly random: () => number;
+  private readonly idNamespace: string;
   private state: State;
 
   constructor(options: MockServerOptions) {
+    this.idNamespace = options.idNamespace ?? '';
     this.getControls = options.getControls;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
@@ -211,9 +211,7 @@ export class MockCurrencycloudServer implements Transport {
     const { method, path, params } = request;
     const key = `${method} ${path}`;
 
-    // Sign-in endpoints. NOT PART OF THE PROVIDER API (see raw.ts).
-    if (key === 'POST /v2/authenticate/magic_link/request') return this.requestMagicLink(params);
-    if (key === 'POST /v2/authenticate/magic_link/verify') return this.verifyMagicLink(params);
+    if (key === 'POST /v2/authenticate/api') return this.authenticate(params);
 
     if (!request.token || !this.state.tokens.has(request.token)) {
       return fail(401, 'auth_failed', 'username', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
@@ -270,7 +268,7 @@ export class MockCurrencycloudServer implements Transport {
 
   private nextId(prefix: string): string {
     this.state.counter += 1;
-    return `sample-${prefix}-${this.state.counter.toString().padStart(4, '0')}`;
+    return `sample-${this.idNamespace}${prefix}-${this.state.counter.toString().padStart(4, '0')}`;
   }
 
   private shortReference(): string {
@@ -362,44 +360,20 @@ export class MockCurrencycloudServer implements Transport {
     });
   }
 
-  // --- Sign-in (not part of the provider API) --------------------------------
+  // --- API login ------------------------------------------------------------
 
-  private requestMagicLink(params: TransportParams | undefined): TransportResponse {
-    const email = (one(params, 'email') ?? '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
-      return fail(400, 'auth_invalid_user_login_details', 'email', 'email_is_in_invalid_format', 'email is in invalid format');
+  /** The mock accepts any non-empty login_id and api_key. `login_id` is treated as the contact's email. */
+  private authenticate(params: TransportParams | undefined): TransportResponse {
+    const loginId = (one(params, 'login_id') ?? '').trim().toLowerCase();
+    if (loginId === '' || (one(params, 'api_key') ?? '') === '') {
+      return fail(401, 'auth_failed', 'username', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
     }
-    // The link only works on the device that asked for it: the device sends a secret now and again at verification.
-    const deviceSecret = one(params, 'device_secret') ?? '';
-    if (deviceSecret.length < 32) {
-      return fail(400, 'auth_invalid_user_login_details', 'device_secret', 'device_secret_is_too_short', 'device_secret is too short');
-    }
-    const requestId = this.nextId('link');
-    const expiresAtMs = this.now() + MAGIC_LINK_TTL_MS;
-    this.state.magicLinks.set(requestId, { email, expiresAtMs, deviceSecret });
-    return ok({ request_id: requestId, email, expires_at: new Date(expiresAtMs).toISOString() });
-  }
-
-  private sessionBody(email: string): TransportResponse {
     const token = this.nextId('token');
     this.state.tokens.add(token);
-    // Each email is its own contact, so two people on one device never share an identity.
-    this.state.me = { ...this.state.me, id: `sample-contact-${contactSlug(email)}`, email_address: email };
+    // Each login is its own contact, so two people on one device never share an identity.
+    this.state.me = { ...this.state.me, id: `sample-contact-${contactSlug(loginId)}`, email_address: loginId };
     this.state.contacts.set(this.state.me.id, this.state.me);
-    return ok({
-      auth_token: token,
-      contact: this.contactBody(this.state.me),
-    });
-  }
-
-  private verifyMagicLink(params: TransportParams | undefined): TransportResponse {
-    const link = this.state.magicLinks.get(one(params, 'request_id') ?? '');
-    const badLink = () => fail(401, 'auth_failed', 'code', 'invalid_supplied_credentials', 'Authentication failed with the supplied credentials');
-    if (!link || link.expiresAtMs <= this.now()) return badLink();
-    if (one(params, 'code') !== MOCK_MAGIC_LINK_CODE) return badLink();
-    if (one(params, 'device_secret') !== link.deviceSecret) return badLink();
-    this.state.magicLinks.delete(one(params, 'request_id') ?? '');
-    return this.sessionBody(link.email);
+    return ok({ auth_token: token });
   }
 
   // --- Balances, accounts, rates ---------------------------------------------
@@ -843,7 +817,6 @@ export class MockCurrencycloudServer implements Transport {
       conversions: [],
       transactions: [],
       quotes: new Map(),
-      magicLinks: new Map(),
       tokens: new Set(),
       idempotentPayments: new Map(),
       idempotentConversions: new Map(),

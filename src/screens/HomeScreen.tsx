@@ -22,9 +22,10 @@ import {
 } from '@/hooks/queries';
 import { formatTimeOfDay } from '@/lib/dates';
 import { currencyName, currencyPrefix, formatMoney, totalInBaseCurrency } from '@/lib/money';
+import { useCapabilities } from '@/state/session';
 import { colors, radii, sizes, spacing } from '@/theme';
 
-import { TransactionRow } from './shared';
+import { needsYourApproval, TransactionRow } from './shared';
 
 function QuickAction({ label, icon, onPress }: { label: string; icon: ReactNode; onPress: () => void }) {
   return (
@@ -117,6 +118,7 @@ export function HomeScreen() {
   const router = useRouter();
   const company = useCompanyProfile();
   const balances = useBalances();
+  const capabilities = useCapabilities();
   const approvals = usePendingApprovals();
   const activity = useRecentTransactions(5);
 
@@ -124,12 +126,14 @@ export function HomeScreen() {
   const refresh = () => {
     void company.refetch();
     void balances.refetch();
-    void approvals.refetch();
+    if (capabilities.paymentApprovals) void approvals.refetch();
     void activity.refetch();
   };
 
+  // Only what this person is asked to approve: a payment they created themselves is waiting for somebody else.
+  const toApprove = (approvals.data ?? []).filter(needsYourApproval);
   const openApprovals = () => {
-    const list = approvals.data ?? [];
+    const list = toApprove;
     const only = list.length === 1 ? list[0] : undefined;
     if (only) router.push({ pathname: '/payments/[id]', params: { id: only.payment.id } });
     else router.push('/payments');
@@ -183,7 +187,7 @@ export function HomeScreen() {
         <QuickAction label="Rates" icon={<TrendingUp color={colors.tintText} size={22} />} onPress={() => router.push('/rates')} />
       </View>
 
-      {approvals.data && approvals.data.length > 0 ? <ApprovalBanner approvals={approvals.data} onPress={openApprovals} /> : null}
+      {toApprove.length > 0 ? <ApprovalBanner approvals={toApprove} onPress={openApprovals} /> : null}
       {approvals.isError && !approvals.data ? (
         <InlineMessage tone="warning">We could not check for payments waiting for approval. Pull down to try again.</InlineMessage>
       ) : null}

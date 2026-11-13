@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
+import type { NewBeneficiary } from '@/api/types';
 import { AppText } from '@/components/AppText';
 import { Button } from '@/components/Button';
 import { SegmentedControl } from '@/components/Controls';
@@ -13,6 +14,7 @@ import { InlineMessage } from '@/components/StateViews';
 import { TextField } from '@/components/TextField';
 import { useCreateBeneficiary } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
+import { confirmAction } from '@/lib/confirmAction';
 import { currencyName } from '@/lib/money';
 import { useIsOnline } from '@/lib/online';
 import {
@@ -79,18 +81,27 @@ export function AddPayeeScreen() {
     if (Object.keys(validatePayeeDraft(draft)).length > 0) return;
     const wanted = new Set(rules.map((rule) => rule.field));
     const value = (field: PayeeBankField) => (wanted.has(field) && draft[field].trim() !== '' ? draft[field].trim() : undefined);
+    const input: NewBeneficiary = {
+      name: draft.name.trim(),
+      entityType: draft.entityType,
+      currency: draft.currency,
+      bankCountry: draft.countryCode,
+      sortCode: value('sortCode') ? normalizeSortCode(value('sortCode') ?? '') : undefined,
+      accountNumber: value('accountNumber'),
+      iban: value('iban') ? normalizeIban(value('iban') ?? '') : undefined,
+      bic: value('bic')?.toUpperCase(),
+      routingNumber: value('routingNumber'),
+    };
+    // Adding someone who can be paid goes through the same gate as moving money.
+    const confirmed = await confirmAction({
+      title: 'Add this payee?',
+      message: `${input.name}, ${input.currency}, ${[input.sortCode, input.accountNumber, input.iban, input.bic, input.routingNumber].filter(Boolean).join(' ')}.`,
+      confirmLabel: 'Add payee',
+      stepUp: { action: 'beneficiary.create', payload: input },
+    });
+    if (!confirmed) return;
     try {
-      await createBeneficiary.mutateAsync({
-        name: draft.name.trim(),
-        entityType: draft.entityType,
-        currency: draft.currency,
-        bankCountry: draft.countryCode,
-        sortCode: value('sortCode') ? normalizeSortCode(value('sortCode') ?? '') : undefined,
-        accountNumber: value('accountNumber'),
-        iban: value('iban') ? normalizeIban(value('iban') ?? '') : undefined,
-        bic: value('bic')?.toUpperCase(),
-        routingNumber: value('routingNumber'),
-      });
+      await createBeneficiary.mutateAsync(input);
       showToast('Payee added');
       close();
     } catch (caught) {

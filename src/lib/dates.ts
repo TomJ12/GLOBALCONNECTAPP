@@ -44,6 +44,13 @@ export function settlementDateAfterMonths(months: number, nowMs: number = Date.n
   return date.toISOString().slice(0, 10);
 }
 
+/** "14 Jan 2027 at 14:05" in the device's time zone, for deadlines. */
+export function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return `${formatDate(value)} at ${formatTimeOfDay(value)}`;
+}
+
 /** "14:05" in the device's time zone, for "as of" labels. */
 export function formatTimeOfDay(value: string): string {
   const date = new Date(value);

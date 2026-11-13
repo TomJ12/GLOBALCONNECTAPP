@@ -155,7 +155,7 @@ export function SettingsScreen() {
             testID="sign-out"
           />
           <AppText variant="caption" tone="muted">
-            Signing out leaves nothing on this device that can sign you back in. You will need a new login link.
+            Signing out leaves nothing on this device that can sign you back in. You will need your password and a new code from your authenticator app.
           </AppText>
         </>
       ) : (

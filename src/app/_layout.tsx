@@ -7,7 +7,7 @@ import { useEffect } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
-import { ConfirmDialogHost, ToastHost } from '@/components/Overlays';
+import { ConfirmDialogHost, StepUpDialogHost, ToastHost } from '@/components/Overlays';
 import { installDevGlobals } from '@/lib/devGlobals';
 import { startInactivityLock } from '@/lib/inactivity';
 import { startOnlineTracking } from '@/lib/online';
@@ -25,7 +25,7 @@ export default function RootLayout() {
 
   useEffect(() => {
     const stopOnline = startOnlineTracking();
-    // After time in the background the session ends. There is no unlock: sign in again by email.
+    // After time in the background the session ends. There is no unlock: sign in again.
     const stopInactivity = startInactivityLock(() => void useSession.getState().signOut('inactive'));
     return () => {
       stopOnline();
@@ -47,9 +47,10 @@ export default function RootLayout() {
         <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.background } }}>
           <Stack.Screen name="(app)" />
           <Stack.Screen name="sign-in" options={{ contentStyle: { backgroundColor: colors.navy }, animation: 'fade' }} />
-          <Stack.Screen name="magic-link" options={{ contentStyle: { backgroundColor: colors.navy } }} />
+          <Stack.Screen name="activate" options={{ contentStyle: { backgroundColor: colors.navy } }} />
         </Stack>
         <ConfirmDialogHost />
+        <StepUpDialogHost />
         <ToastHost />
       </QueryClientProvider>
     </SafeAreaProvider>

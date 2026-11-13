@@ -18,7 +18,6 @@ import type {
   Conversion,
   ForwardContract,
   ListResult,
-  MagicLinkRequest,
   NewBeneficiary,
   NewPayment,
   Page,
@@ -29,7 +28,6 @@ import type {
   QuoteRequest,
   RateHistory,
   RatePair,
-  Session,
   Transaction,
 } from '../../types';
 import {
@@ -42,21 +40,19 @@ import {
   mapConversion,
   mapForwardContract,
   mapHttpError,
-  mapMagicLinkRequest,
   mapPage,
   mapPayment,
   mapPendingApproval,
   mapQuote,
   mapRate,
   mapRateHistory,
-  mapSession,
   mapTransaction,
   parseBody,
   toCreateBeneficiaryParams,
 } from './mapping';
 import {
   rawAccount,
-  rawAppSession,
+  rawAuthToken,
   rawBasicRates,
   rawBeneficiary,
   rawContact,
@@ -68,7 +64,6 @@ import {
   rawFindPayments,
   rawFindTransactions,
   rawHeldRateQuote,
-  rawMagicLinkRequest,
   rawPayment,
   rawPaymentAuthorisations,
   rawRateHistory,
@@ -81,13 +76,18 @@ export interface CurrencycloudClientOptions {
   planName: string | null;
   /** How long to ask the provider to hold a quote, in seconds. */
   quoteHoldSeconds?: number;
-  /** Set only by the mock so the sign-in screen can offer a shortcut. */
-  devMagicLinkCode?: string | null;
   /** Give up waiting for a response after this long. */
   requestTimeoutMs?: number;
   /** Most pages a "read everything" loop will fetch (100 rows each). */
   maxPages?: number;
   now?: () => number;
+  /**
+   * The contact id of the client this instance acts for. When set (always, on
+   * the server, where one set of API credentials serves many clients) it is
+   * sent as `on_behalf_of` with EVERY call after login, so the provider scopes
+   * the call to that client's account.
+   */
+  onBehalfOf?: string;
 }
 
 const MAX_PAGE_SIZE = 100;
@@ -122,7 +122,7 @@ export class CurrencycloudClient implements ProviderClient {
       // A request that never answers must not leave a spinner and a lock forever.
       // The request may still have been applied, so `timeout` counts as outcome-unknown.
       response = await Promise.race([
-        this.transport.request({ method, path, params, token: this.token }),
+        this.transport.request({ method, path, params: this.scoped(path, params), token: this.token }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new ProviderError('timeout', { detail: `No response after ${timeoutMs} ms` })), timeoutMs);
         }),
@@ -142,29 +142,37 @@ export class CurrencycloudClient implements ProviderClient {
     return parseBody(schema, response.body);
   }
 
-  // --- Sign-in ----------------------------------------------------------------
-
-  async requestMagicLink(email: string, deviceSecret: string): Promise<MagicLinkRequest> {
-    const raw = await this.call(rawMagicLinkRequest, 'POST', '/v2/authenticate/magic_link/request', {
-      email: email.trim().toLowerCase(),
-      device_secret: deviceSecret,
-    });
-    return mapMagicLinkRequest(raw, this.options.devMagicLinkCode ?? null);
+  private scoped(path: string, params: TransportParams | undefined): TransportParams | undefined {
+    const onBehalfOf = this.options.onBehalfOf;
+    if (onBehalfOf === undefined || path.startsWith('/v2/authenticate/')) return params;
+    return { ...params, on_behalf_of: onBehalfOf };
   }
 
-  async verifyMagicLink(requestId: string, code: string, deviceSecret: string): Promise<Session> {
-    const raw = await this.call(rawAppSession, 'POST', '/v2/authenticate/magic_link/verify', {
-      request_id: requestId,
-      code,
-      device_secret: deviceSecret,
-    });
+  /** Whether the provider knows this account id for the contact this instance acts for. */
+  async accountExists(accountId: string): Promise<boolean> {
+    try {
+      const raw = await this.call(rawAccount, 'GET', `/v2/accounts/${encodeURIComponent(accountId)}`);
+      return raw.id === accountId;
+    } catch (error) {
+      if (error instanceof ProviderError && (error.kind === 'not_found' || error.kind === 'forbidden' || error.kind === 'validation')) return false;
+      throw error;
+    }
+  }
+
+  // --- Provider session ----------------------------------------------------------------
+
+  /**
+   * Open a provider session with API credentials (the provider's documented
+   * login). These are Global Connect's credentials, held by the server; the
+   * customer's own sign-in is a separate Global Connect service.
+   */
+  async authenticate(loginId: string, apiKey: string): Promise<void> {
+    const raw = await this.call(rawAuthToken, 'POST', '/v2/authenticate/api', { login_id: loginId, api_key: apiKey });
     this.payeeCache.clear();
-    const { session, token } = mapSession(raw);
-    this.token = token;
-    return session;
+    this.token = raw.auth_token;
   }
 
-  async signOut(): Promise<void> {
+  async closeSession(): Promise<void> {
     const token = this.token;
     // Drop the token first so the app is signed out even if the request fails.
     this.token = null;
