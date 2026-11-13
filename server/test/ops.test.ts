@@ -107,8 +107,8 @@ async function activateClient(email: string, password = PASSWORD) {
 }
 
 /** One staff member asks, a different one approves. Returns the approver's reply and the request id. */
-/** Approving these asks the approver for their password again: staff management, company create and re-point, client authenticator reset. */
-const PASSWORD_APPROVALS = ['ops.staff.invite', 'ops.staff.role', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.activation_link', 'ops.staff.unlock', 'ops.staff.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.client.reset_authenticator'];
+/** Approving these asks the approver for their password again: staff management, company create and re-point, a change of a company's payment-approval rule, client authenticator reset. */
+const PASSWORD_APPROVALS = ['ops.staff.invite', 'ops.staff.role', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.activation_link', 'ops.staff.unlock', 'ops.staff.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.company.approvals', 'ops.client.reset_authenticator'];
 
 async function fourEyes(requester: Staff, approver: Staff, url: string, form: Record<string, string> = {}) {
   const asked = await requester.act(url, form);
@@ -346,7 +346,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
       ['a token with a later expiry written in', { ...form, _confirm: `${Number(expires) + 60_000}.${nonce}.${signature}` }],
       ['a token for a different payload', { ...form, extra: 'x', _confirm: mine.token }],
       ['a token for a changed field', { ...Object.fromEntries(Object.entries(form).map(([key, value], index) => [key, index === 0 ? `${value}x` : value])), _confirm: mine.token }],
-      ['a token from another session', { ...form, _confirm: (await confirmPage(second, url, form).catch(() => ({ token: mine.token.replace(/.$/, 'A') }))).token }],
+      ['a token from another session', { ...form, _confirm: (await confirmPage(second, url, form).catch(() => ({ token: mine.token.replace(/.$/, (last) => (last === 'A' ? 'B' : 'A')) }))).token }],
     ];
     for (const [what, sent] of refused) {
       const reply = await admin.browser.post(url, { ...sent, ...password });
@@ -1010,7 +1010,7 @@ test('ops: a company\'s payment approval rule is changed by request, approved on
   // Two requests made under the same rule: once one is carried out, the other is stale and changes nothing.
   const toZero = idOf((await olu.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '0' })).location);
   const toOne = idOf((await pat.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '1' })).location);
-  assert.match((await h.stores.ops.approvals.get(toZero))?.warnings.join(' ') ?? '', /With 0 required, one person at the client can create a payment and it is sent at once/);
+  assert.match((await h.stores.ops.approvals.get(toZero))?.warnings.join(' ') ?? '', /Payments created from now on will be sent without a second person/);
   assert.equal((await admin.act(`/ops/approvals/${toOne}/approve`)).status, 303);
   assert.equal((await admin.act(`/ops/approvals/${toZero}/approve`)).status, 409);
   assert.equal(await rule(), 1);
@@ -1090,6 +1090,8 @@ test('ops confirmation: says exactly what will happen, works once, marks high-im
     ['client authenticator reset', '/ops/users/usr_amira/reset-authenticator', { verification: 'Called back on the number on file' }, /How their identity was verified: “Called back on the number on file”/],
     ['staff role change', `/ops/staff/${olu.id}/role`, { role: 'ops_admin' }, /from ops to ops_admin/],
     ['company create', '/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' }, /Create company “Tideway Ltd”/],
+    ['payment-approval rule to 0', '/ops/companies/co_northfield/approvals', { approvalsRequired: '0' }, /from 1 to 0 required[^]*Payments created from now on will be sent without a second person/],
+    ['payment-approval rule to 2', '/ops/companies/co_castlebrook/approvals', { approvalsRequired: '2' }, /from 1 to 2 required[^]*Payments created from now on will be held until 2 other people have approved them \(it was 1\)/],
     ['company re-point', '/ops/companies/co_castlebrook', { name: 'Castlebrook Imports Ltd', provider: 'provider-b', providerAccountId: 'S00003' }, /Re-point company “Castlebrook Imports Ltd” \(co_castlebrook\) from Provider B[^<]*account S00001, to Provider B[^<]*account S00003/],
   ];
   for (const [what, url, form, says] of requests) {

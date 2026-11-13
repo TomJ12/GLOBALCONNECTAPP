@@ -1030,8 +1030,11 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       action('/companies/:id/approvals', {
         name: 'company.approvals',
         fourEyes: true,
-        // How many people stand between a payment and the bank is decided by two staff, the second an ops admin.
+        // How many people stand between a payment and the bank is decided by two staff, the second an ops admin
+        // who types their password again.
         adminApproval: true,
+        danger: true,
+        password: true,
         async prepare({ form: input, params, aim }) {
           const company = await companyOf(params.id);
           aim(companyParty(company));
@@ -1039,7 +1042,13 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           const current = approvalsRequiredOf(company);
           if (wanted === current) throw new OpsError('That is already the rule for this company.');
           const warnings: string[] = [];
-          if (wanted === 0) warnings.push('With 0 required, one person at the client can create a payment and it is sent at once, with no second person involved.');
+          warnings.push(
+            wanted === 0
+              ? 'Payments created from now on will be sent without a second person: one person at the client can create a payment and it goes to the provider at once.'
+              : wanted < current
+                ? `Payments created from now on will need ${wanted} other ${wanted === 1 ? 'person' : 'people'} to approve them instead of ${current}: one fewer check before money leaves.`
+                : `Payments created from now on will be held until ${wanted} other ${wanted === 1 ? 'person has' : 'people have'} approved them (it was ${current}).`,
+          );
           const gap = await approverGap(company, wanted);
           if (gap) warnings.push(gap);
           return {

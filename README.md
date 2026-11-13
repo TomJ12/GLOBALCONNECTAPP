@@ -99,8 +99,9 @@ To try it:
    code again: press a button (say **Revoke all sessions** on a client's page), read the
    confirmation page that says what will happen, and press **Confirm**. Things that
    need a second person become a request under **Approvals**, which another staff
-   member opens and confirms; for staff changes, a new or re-pointed company and a
-   client authenticator reset that second person is also asked for their password.
+   member opens and confirms; for staff changes, a new or re-pointed company, a
+   change to a company's payment-approval rule and a client authenticator reset that
+   second person is also asked for their password.
 
 **There is no email.** Whenever the server "sends an activation email" (from the ops
 console or the operator commands below) the whole message, link included, is printed in
@@ -774,12 +775,14 @@ role change, email and revocation was too much. Instead, every change goes throu
 - **High-impact changes are marked** (red border, "High-impact change", a red Confirm
   button) and state the consequence: disabling a client, removing them from a company,
   deactivating a company, resetting an authenticator, creating or re-pointing a
-  company, and every staff change, both when they are asked for and when they are
+  company, changing a company's payment-approval rule, and every staff change, both when they are asked for and when they are
   approved.
 - **The staff member's password (not a code) is asked for again** on the confirmation
   page for the few highest-impact approvals: approving **any staff-management request**,
-  approving a **company creation or re-point**, and approving a **client authenticator
-  reset**. (With `FOUR_EYES=off` in development, where one person carries these out, it
+  approving a **company creation or re-point**, approving a **change to a company's
+  payment-approval rule** (in either direction; the page says what it means, for
+  example that with 0 payments will be sent without a second person), and approving a
+  **client authenticator reset**. (With `FOUR_EYES=off` in development, where one person carries these out, it
   is asked of that person.) Wrong passwords are counted and lock like sign-in, and are
   audited as `ops.password_check`.
 - A client authenticator reset and a staff one still need the free-text
