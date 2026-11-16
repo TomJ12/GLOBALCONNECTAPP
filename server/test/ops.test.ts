@@ -1417,3 +1417,129 @@ test('L3: an approved request that was interrupted is neither "approved" nor for
   assert.equal((await second.act(`/ops/approvals/${taken}/approve`)).status, 409);
   assert.equal((await h.stores.ops.approvals.get(taken))?.status, 'pending');
 });
+
+// --- Audit of 2ac6785 ---------------------------------------------------------------------------------
+
+test('N10: finishing or closing an interrupted request takes exactly the checks of approving it, is refused while the approval is still running, and an old one can only be closed', async () => {
+  h = await harness();
+  const { admin, second } = await pair();
+  const boss = await staff('boss@globalconnect.example', 'ops_admin');
+  const subject = await staff('subject@globalconnect.example', 'ops_admin');
+  const realMutate = h.stores.ops.approvals.mutate.bind(h.stores.ops.approvals);
+  let crash = true;
+  h.stores.ops.approvals.mutate = (async (key: string, change: any, audit: any) =>
+    realMutate(
+      key,
+      (current: any) => {
+        const next = change(current);
+        if (crash && current?.status === 'applying' && next?.status === 'approved') throw new Error('the process stopped here');
+        return next;
+      },
+      audit,
+    )) as typeof realMutate;
+  const interrupted = async (url: string, form: Record<string, string>, approver = boss) => {
+    crash = true;
+    const id = idOf((await admin.act(url, form)).location);
+    assert.match(id, /^req_/, url);
+    assert.equal((await approver.act(`/ops/approvals/${id}/approve`)).status, 500);
+    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
+    crash = false;
+    return id;
+  };
+
+  // A request ABOUT a member of staff: that person can no more finish or close it than approve it, though an ops admin.
+  const about = await interrupted(`/ops/staff/${subject.id}/role`, { role: 'ops' });
+  await h.stores.ops.users.update(subject.id, (current) => ({ ...current, role: 'ops_admin' }));
+  for (const action of ['resume', 'abandon']) {
+    const refused = await subject.act(`/ops/approvals/${about}/${action}`);
+    assert.equal(refused.status, 403, action);
+    assert.match(refused.body, /about your own account/);
+  }
+  assert.match((await subject.browser.get(`/ops/approvals/${about}`)).body, /a different staff member must finish or close it/);
+  // The requester can no more close their own than finish it.
+  assert.equal((await admin.act(`/ops/approvals/${about}/abandon`)).status, 403);
+  assert.equal((await boss.act(`/ops/approvals/${about}/abandon`)).status, 303);
+
+  // The approver has since stopped being an ops admin: what needs an ops admin to approve needs one to finish, or to close.
+  const company = await interrupted('/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' });
+  await h.stores.ops.users.update(boss.id, (current) => ({ ...current, role: 'ops' }));
+  for (const action of ['resume', 'abandon']) {
+    const refused = await boss.act(`/ops/approvals/${company}/${action}`);
+    assert.equal(refused.status, 403, action);
+    assert.match(refused.body, /Only an ops admin can approve this kind of request/);
+  }
+  await h.stores.ops.users.update(boss.id, (current) => ({ ...current, role: 'ops_admin' }));
+  // The REQUESTER has since stopped being one: a request only an ops admin may make is not carried out for them.
+  await h.stores.ops.users.update(admin.id, (current) => ({ ...current, role: 'ops' }));
+  const stale = await boss.act(`/ops/approvals/${company}/resume`);
+  assert.equal(stale.status, 409);
+  assert.match(stale.body, /can no longer make it/);
+  await h.stores.ops.users.update(admin.id, (current) => ({ ...current, role: 'ops_admin' }));
+  assert.equal((await boss.act(`/ops/approvals/${company}/resume`)).status, 303);
+
+  // While the approval itself is still running it is not "interrupted": nobody can run it a second time beside it.
+  const real = h.registry.accountExists.bind(h.registry);
+  let hold = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let reached!: () => void;
+  const waiting = new Promise<void>((resolve) => (reached = resolve));
+  h.registry.accountExists = async (...args: Parameters<typeof real>) => {
+    if (hold > 0 && (hold -= 1) === 0) {
+      reached();
+      await gate;
+    }
+    return real(...args);
+  };
+  const running = idOf((await admin.act('/ops/companies', { name: 'Harbour Mills Ltd', provider: 'provider-b', providerAccountId: 'S00003' })).location);
+  const page = await boss.browser.post(`/ops/approvals/${running}/approve`);
+  hold = 1;
+  const approving = boss.browser.post(`/ops/approvals/${running}/approve`, { _confirm: confirmTokenOf(page.body) as string, password: OPS_PASSWORD });
+  await waiting;
+  assert.equal((await h.stores.ops.approvals.get(running))?.status, 'applying');
+  assert.doesNotMatch((await second.browser.get('/ops/approvals')).body, /Approved, but not finished/);
+  assert.match((await second.browser.get(`/ops/approvals/${running}`)).body, /being carried out right now/);
+  for (const action of ['resume', 'abandon']) {
+    const refused = await second.act(`/ops/approvals/${running}/${action}`);
+    assert.equal(refused.status, 409, action);
+    assert.match(refused.body, /being carried out right now/);
+  }
+  release();
+  assert.equal((await approving).status, 303);
+  assert.equal((await h.stores.directory.listCompanies()).filter((item) => item.name === 'Harbour Mills Ltd').length, 1);
+
+  // Left unfinished for longer than a request may wait: it says so, cannot be finished blind, and can be closed.
+  const old = await interrupted(`/ops/staff/${subject.id}/role`, { role: 'ops' });
+  h.clock.advance(h.config.approvalTtlMs + 60_000);
+  for (const who of [boss, second]) {
+    await signIn(who.browser, who.email, who.secret);
+    await who.browser.get('/ops/users');
+  }
+  assert.match((await boss.browser.get(`/ops/approvals/${old}`)).body, /too long ago to finish without looking again\. It can only be closed/);
+  const refused = await boss.act(`/ops/approvals/${old}/resume`);
+  assert.equal(refused.status, 409);
+  assert.match(refused.body, /approved too long ago/);
+  assert.equal((await boss.act(`/ops/approvals/${old}/abandon`)).status, 303);
+  assert.equal((await h.stores.ops.users.get(subject.id))?.role, 'ops', 'what was done stays done; the request says it may be partly done');
+});
+
+test('a change of a company\'s approval rule is written to the company as it is at that moment, not to a copy read earlier', async () => {
+  let deactivate = false;
+  h = await harness({}, undefined, {
+    storeLatency: true,
+    // The company is deactivated by someone else after the request has read it and before the rule is written.
+    storeHook: (operation) => {
+      if (operation === 'updateCompany' && deactivate) {
+        deactivate = false;
+        h.stores.db.run("UPDATE companies SET deactivated_at = 5, previous_name = 'Old Name' WHERE id = 'co_northfield'");
+      }
+    },
+  });
+  const { admin, second } = await pair();
+  const id = idOf((await admin.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '2' })).location);
+  deactivate = true;
+  assert.equal((await second.act(`/ops/approvals/${id}/approve`)).status, 303);
+  assert.equal(deactivate, false, 'the change landed in the gap');
+  const company = await h.stores.directory.getCompany('co_northfield');
+  assert.deepEqual([company?.approvalsRequired, company?.deactivatedAt, company?.previousName], [2, 5, 'Old Name']);
+});

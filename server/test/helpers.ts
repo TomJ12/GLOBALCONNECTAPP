@@ -77,6 +77,7 @@ export interface HarnessOptions {
   maxHeldQuotes?: number;
   /** Called after a held payment is marked `sending` and before the provider is asked; throwing is a crash at that moment. */
   beforeSend?: Parameters<typeof buildApp>[0]['beforeSend'];
+  gateDelay?: (ms: number) => Promise<void>;
   /** Use these provider mocks instead of new ones (a restart keeps the provider, not the server). */
   providers?: { a: MockCurrencycloudPlatform; b: MockEqualsServer };
   /** Continue this clock instead of starting a new one. */
@@ -133,7 +134,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
   });
   const outbox = new ConsoleOutbox(() => {});
   const logs: string[] = [];
-  const built = await buildApp({ config, stores, registry, mailer: outbox, now, logStream: { write: (line) => void logs.push(line) }, maxRateWindows: options.maxRateWindows, maxHeldQuotes: options.maxHeldQuotes, beforeSend: options.beforeSend });
+  const built = await buildApp({ config, stores, registry, mailer: outbox, now, logStream: { write: (line) => void logs.push(line) }, maxRateWindows: options.maxRateWindows, maxHeldQuotes: options.maxHeldQuotes, beforeSend: options.beforeSend, gateDelay: options.gateDelay });
   const { app, auth, opsAuth, opsRoutes, held } = built;
   const policy: Harness['policy'] = async (companyId, approvalsRequired) => {
     if (!(await stores.directory.updateCompany(companyId, (company) => ({ ...company, approvalsRequired })))) throw new Error(`no company ${companyId}`);

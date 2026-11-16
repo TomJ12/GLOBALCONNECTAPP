@@ -742,7 +742,35 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
        * waiting, nothing having been done. Any other failure (the provider, the mail, a crash) leaves it `applying`:
        * it may be half done, and it has to be finished or closed from the Approvals page, never guessed at.
        */
+      /** Requests this process is carrying out at this moment (there is one server process per database). */
+      const carrying = new Set<string>();
+      /** An approved request left unfinished for longer than a request may wait is too old to finish blind: it can only be closed. */
+      const staleApplying = (item: ApprovalRecord): boolean => item.status === 'applying' && now() - (item.decidedAt ?? item.requestedAt) > config.approvalTtlMs;
+      /**
+       * Who may approve a request, finish one that was interrupted, or close one: the SAME checks for all three.
+       * Never the person who asked, never the person it is about, an ops admin where the action needs one, and
+       * (to carry it out) only while the requester could still make the request.
+       */
+      const assertMayDecide = async (item: ApprovalRecord, def: ActionDef | undefined, user: OpsUserRecord, carryingOut: boolean): Promise<OpsUserRecord | null> => {
+        if (item.requestedBy.id === user.id) throw new OpsError('You cannot approve, finish or close your own request. A different staff member must do it.', 403, 'own_request');
+        if (item.target?.type === 'ops' && item.target.id === user.id) throw new OpsError('This request is about your own account, so you cannot decide it.', 403, 'self');
+        // Who is staff, and where a company's money is, are decided by two ops ADMINS.
+        if (def && needsAdminApproval(def, item.params) && user.role !== 'ops_admin') throw new OpsError('Only an ops admin can approve this kind of request.', 403, 'admin_approval');
+        if (!carryingOut) return null;
+        const requester = await stores.ops.users.get(item.requestedBy.id);
+        if (!def || !requester || !isActiveStaff(requester) || (def.admin && requester.role !== 'ops_admin')) throw new OpsError('The staff member who made this request can no longer make it. Reject or close it instead.', 409, 'requester_inactive');
+        return requester;
+      };
       const carryOut = async (item: ApprovalRecord, def: ActionDef, requester: OpsUserRecord, approver: OpsUserRecord, source: string, extra: Record<string, string>, resuming: boolean): Promise<void> => {
+        if (carrying.has(item.id)) throw new OpsError('This request is being carried out right now. Wait for it to finish.', 409, 'in_progress');
+        carrying.add(item.id);
+        try {
+          await carryOutNow(item, def, requester, approver, source, extra, resuming);
+        } finally {
+          carrying.delete(item.id);
+        }
+      };
+      const carryOutNow = async (item: ApprovalRecord, def: ActionDef, requester: OpsUserRecord, approver: OpsUserRecord, source: string, extra: Record<string, string>, resuming: boolean): Promise<void> => {
         let applied: Applied;
         try {
           applied = await def.apply(item.params, { requester, approver, source, requestId: item.id });
@@ -780,7 +808,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const row = (item: ApprovalRecord) =>
           h`<tr><td><a href="/ops/approvals/${item.id}">${item.summary}</a></td><td>${item.requestedBy.email}</td><td>${when(item.requestedAt)}</td><td>${statusTag(item)}</td><td>${item.status === 'pending' ? `expires ${when(item.expiresAt)}` : item.decidedBy ? `${item.decidedBy.email}, ${when(item.decidedAt)}` : when(item.decidedAt)}</td></tr>`;
         const pending = all.filter((item) => item.status === 'pending');
-        const interrupted = all.filter((item) => item.status === 'applying');
+        const interrupted = all.filter((item) => item.status === 'applying' && !carrying.has(item.id));
         return send(
           reply,
           200,
@@ -811,8 +839,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             }</div>
 <div>${
               item.status === 'applying'
-                ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">This was approved by ${item.decidedBy?.email ?? 'someone'} and then interrupted while being carried out. It may be partly done.</p>${
-                    mine ? h`<p class="muted">It is your own request: a different staff member must finish or close it.</p>` : h`${form(ctx, `${base}/resume`, h``, 'Finish carrying it out')}${form(ctx, `${base}/abandon`, h``, 'Close without finishing', { danger: true })}`
+                ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">This was approved by ${item.decidedBy?.email ?? 'someone'} and then interrupted while being carried out. It may be partly done.</p>${carrying.has(item.id) ? h`<p class="warn">It is being carried out right now. Wait for it to finish.</p>` : ''}${staleApplying(item) ? h`<p class="warn">It was approved more than ${String(Math.round(config.approvalTtlMs / 3_600_000))} hours ago: too long ago to finish without looking again. It can only be closed.</p>` : ''}${
+                    mine || aboutMe ? h`<p class="muted">It is your own request: a different staff member must finish or close it.</p>` : h`${form(ctx, `${base}/resume`, h``, 'Finish carrying it out')}${form(ctx, `${base}/abandon`, h``, 'Close without finishing', { danger: true })}`
                   }</div>`
                 : item.status !== 'pending'
                 ? h`<div class="card"><p class="muted">This request is ${item.status}.</p></div>`
@@ -834,14 +862,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         if (item.target) aim(item.target);
         const def = actions.get(item.action);
         if (!def || item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
-        // Four eyes: never the person who asked, and never the person the request is about.
-        if (item.requestedBy.id === ctx.user.id) throw new OpsError('You cannot approve your own request. A different staff member must do it.', 403, 'own_request');
-        if (item.target?.type === 'ops' && item.target.id === ctx.user.id) throw new OpsError('This request is about your own account, so you cannot approve it.', 403, 'self');
-        // Who is staff, and where a company's money is, are decided by two ops ADMINS.
-        if (needsAdminApproval(def, item.params) && ctx.user.role !== 'ops_admin') throw new OpsError('Only an ops admin can approve this kind of request.', 403, 'admin_approval');
+        // Four eyes: never the person who asked, and never the person the request is about (see assertMayDecide).
+        const requester = (await assertMayDecide(item, def, ctx.user, true)) as OpsUserRecord;
         const history = await pairHistory(item.requestedBy.id, ctx.user.id);
-        const requester = await stores.ops.users.get(item.requestedBy.id);
-        if (!requester || !isActiveStaff(requester) || (def.admin && requester.role !== 'ops_admin')) throw new OpsError('The staff member who made this request can no longer make it. Reject it instead.', 409, 'requester_inactive');
         const password = flagOf(def.password, item.params);
         await confirm({
           title: `Approve and carry out: ${item.summary}`,
@@ -865,12 +888,12 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         if (item.target) aim(item.target);
         const def = actions.get(item.action);
         if (!def || item.status !== 'applying' || !item.decidedBy) throw new OpsError('This request is not waiting to be finished.', 409, 'not_pending');
-        // Whoever approved it, or an ops admin: never the person who asked.
-        if (item.requestedBy.id === ctx.user.id) throw new OpsError('You cannot carry out your own request. A different staff member must do it.', 403, 'own_request');
+        // Exactly the checks of approving it, and then: whoever approved it, or an ops admin.
+        const requester = (await assertMayDecide(item, def, ctx.user, true)) as OpsUserRecord;
         if (item.decidedBy.id !== ctx.user.id && ctx.user.role !== 'ops_admin') throw new OpsError('Only the staff member who approved this request, or an ops admin, can finish it.', 403, 'forbidden');
-        if (needsAdminApproval(def, item.params) && ctx.user.role !== 'ops_admin') throw new OpsError('Only an ops admin can approve this kind of request.', 403, 'admin_approval');
-        const requester = await stores.ops.users.get(item.requestedBy.id);
-        if (!requester || !isActiveStaff(requester)) throw new OpsError('The staff member who made this request can no longer make it. Close it instead.', 409, 'requester_inactive');
+        // The approval that started it may still be running: that is not an interruption, and it is not done twice.
+        if (carrying.has(item.id)) throw new OpsError('This request is being carried out right now. Wait for it to finish.', 409, 'in_progress');
+        if (staleApplying(item)) throw new OpsError('This request was approved too long ago to be finished without looking again. Close it, check what was done, and make a new request for whatever is missing.', 409, 'stale');
         const password = flagOf(def.password, item.params);
         await confirm({
           title: `Finish carrying out: ${item.summary}`,
@@ -886,7 +909,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const item = await approvalOf(params.id);
         if (item.target) aim(item.target);
         if (item.status !== 'applying') throw new OpsError('This request is not waiting to be finished.', 409, 'not_pending');
+        await assertMayDecide(item, actions.get(item.action), ctx.user, false);
         if (item.decidedBy?.id !== ctx.user.id && ctx.user.role !== 'ops_admin') throw new OpsError('Only the staff member who approved this request, or an ops admin, can close it.', 403, 'forbidden');
+        if (carrying.has(item.id)) throw new OpsError('This request is being carried out right now. Wait for it to finish.', 409, 'in_progress');
         await confirm({
           title: `Close without finishing: ${item.summary}`,
           notes: ['It was approved and may have been PARTLY carried out before it was interrupted. Closing it does not undo anything: check the person or company it is about, and make a new request for whatever is still missing.'],

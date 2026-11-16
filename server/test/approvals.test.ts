@@ -1066,6 +1066,39 @@ for (const company of COMPANIES) {
     assert.deepEqual(loadConfig({ APP_ENV: 'development' }).payeeDigestIgnore, { currencycloud: [], equals: [] });
     assert.throws(() => loadConfig({ APP_ENV: 'development', PAYEE_DIGEST_IGNORE_EQUALS: 'a b; DROP' }), /PAYEE_DIGEST_IGNORE_\* must be a comma-separated list of field names/);
   });
+
+  test(on('H1: what an approval checked at the provider is checked again INSIDE its transaction: a company re-pointed, a payee digest replaced, or an expiry reached in between refuses it'), async () => {
+    const elsewhere = company.id === 'co_northfield' ? 'sample-account-0003' : 'S00002';
+    const cases: [string, () => void, string][] = [
+      ['the company was re-pointed', () => void h.stores.db.run('UPDATE companies SET provider_account_id = ? WHERE id = ?', elsewhere, company.id), 'not_awaiting_approval'],
+      ['the stored payee digest is no longer the one that was checked', () => void h.stores.db.run("UPDATE held_payments SET data = json_set(data, '$.payeeDigest', 'something else')"), 'not_awaiting_approval'],
+      ['the payment expired', () => h.clock.advance(49 * HOUR), 'payment_expired'],
+      ['the company was deactivated', () => void h.stores.db.run('UPDATE companies SET deactivated_at = 1 WHERE id = ?', company.id), 'not_awaiting_approval'],
+    ];
+    for (const [what, change, reason] of cases) {
+      let armed = false;
+      const { creator, approver, payee } = await team(company, {
+        storeLatency: true,
+        // After the request has asked the provider about the payee and the balance, and before it writes its decision.
+        storeHook: (operation) => {
+          if (operation === 'update' && armed) {
+            armed = false;
+            change();
+          }
+        },
+      });
+      const { id } = await create(company, creator, payee);
+      const token = await stepUp(approver, 'payment.approve', { paymentId: id });
+      armed = true;
+      const reply = await h.call('POST', `/v1/payments/${id}/approve`, { token: approver.token, headers: { 'x-step-up-token': token } });
+      assert.equal(armed, false, what);
+      assert.equal(reasonOf(reply), reason, what);
+      const stored = await record(id);
+      assert.ok(stored.status !== 'sending' && stored.status !== 'sent' && stored.approvals.length === 0, what);
+      assert.equal(allProviderPayments(company), 0, what);
+      await h.close();
+    }
+  });
 }
 
 test('isolation: a held payment cannot be seen, approved, rejected, cancelled or found by key from another company, on either provider', async () => {

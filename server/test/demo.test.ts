@@ -8,7 +8,7 @@ import { afterEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { demoPasswordProblem, loadConfig } from '../src/config';
-import { GATE_ATTEMPTS_PER_MINUTE, GATE_TTL_MS } from '../src/http/demoGate';
+import { GATE_ATTEMPTS_PER_MINUTE, GATE_GLOBAL_FAILURES, GATE_GLOBAL_WINDOW_MS, GATE_QUEUE, GATE_SLOW_MAX_MS, GATE_SLOW_MS, GATE_TTL_MS } from '../src/http/demoGate';
 import { ADMIN_TOKEN, AMIRA, harness, TEST_DATA_KEY, type Harness } from './helpers';
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -158,6 +158,54 @@ test('demo gate: guesses are rate limited per source, and the limit does not car
   // A minute later the first source may try again.
   h.clock.advance(60_000);
   assert.equal((await submit(DEMO_PASSWORD, { headers: from('198.51.100.7') })).statusCode, 303);
+});
+
+test('N11: wrong passwords from many sources slow EVERY guess, one at a time, with a wait that grows; nobody is locked out and the right password still works', async () => {
+  const waits: number[] = [];
+  let release: (() => void) | null = null;
+  let hold = false;
+  h = await harness({ demoAccessPassword: DEMO_PASSWORD, trustProxy: 1 }, undefined, {
+    gateDelay: async (ms) => {
+      waits.push(ms);
+      if (hold) await new Promise<void>((resolve) => (release = resolve));
+    },
+  });
+  const source = (n: number) => ({ 'x-forwarded-for': `203.0.${Math.floor(n / 250)}.${(n % 250) + 1}` });
+  // Under the ceiling: every source has its own allowance and nothing waits.
+  for (let n = 0; n < GATE_GLOBAL_FAILURES; n += 1) assert.equal((await submit(`wrong ${n}`, { headers: source(n) })).statusCode, 401);
+  assert.deepEqual(waits, []);
+  // From here on every guess waits, whoever makes it, right or wrong.
+  assert.equal((await submit('wrong again', { headers: source(500) })).statusCode, 401);
+  assert.deepEqual(waits, [GATE_SLOW_MS]);
+  const right = await submit(DEMO_PASSWORD, { headers: source(501) });
+  assert.equal(right.statusCode, 303, 'the right password works: slowed, not locked');
+  assert.deepEqual(waits, [GATE_SLOW_MS, GATE_SLOW_MS]);
+  // More failures: the wait doubles, up to its maximum.
+  for (let n = 0; n < GATE_GLOBAL_FAILURES; n += 1) await submit(`more ${n}`, { headers: source(600 + n) });
+  assert.equal(waits.at(-1), GATE_SLOW_MS * 2);
+  for (let n = 0; n < GATE_GLOBAL_FAILURES * 6; n += 1) await submit(`many ${n}`, { headers: source(700 + n) });
+  assert.equal(waits.at(-1), GATE_SLOW_MAX_MS);
+  assert.equal((await submit(DEMO_PASSWORD, { headers: source(502) })).statusCode, 303);
+
+  // One at a time: a second guess does not start its wait until the first has finished, and beyond the queue a
+  // guess is asked to come back rather than pile up.
+  hold = true;
+  waits.length = 0;
+  const queued = Array.from({ length: GATE_QUEUE }, (_, n) => submit(DEMO_PASSWORD, { headers: source(2000 + n) }));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(waits.length, 1, 'only the first is waiting its turn; the rest are behind it');
+  const turnedAway = await submit(DEMO_PASSWORD, { headers: source(2100) });
+  assert.equal(turnedAway.statusCode, 429);
+  assert.match(turnedAway.body, /busy checking passwords/);
+  assert.ok(Number(turnedAway.headers['retry-after']) > 0);
+  hold = false;
+  (release as (() => void) | null)?.();
+  assert.deepEqual((await Promise.all(queued)).map((reply) => reply.statusCode), Array.from({ length: GATE_QUEUE }, () => 303));
+  // The slowing ends by itself once the window has passed without more failures.
+  h.clock.advance(GATE_GLOBAL_WINDOW_MS + 1);
+  waits.length = 0;
+  assert.equal((await submit('wrong', { headers: source(3000) })).statusCode, 401);
+  assert.deepEqual(waits, []);
 });
 
 test('demo gate: behind it the client API works unchanged: activation, sign-in with a bearer token, step-up and a payment', async () => {

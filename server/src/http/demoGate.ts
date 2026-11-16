@@ -59,7 +59,25 @@ export interface DemoGateOptions {
   limitAttempts: (request: FastifyRequest) => Promise<void>;
   /** A counter per source address: throws when it has been seen more than `allowed` times this minute. */
   limit: (address: string, allowed: number) => void;
+  /** TESTS ONLY: stands in for waiting. */
+  delay?: (ms: number) => Promise<void>;
 }
+
+/**
+ * The limit above is per source, and sources are cheap. So there is a ceiling
+ * for everyone together: after this many wrong passwords within the window,
+ * from anywhere, EVERY guess (right or wrong) waits, one at a time, and the
+ * wait doubles with each further batch of failures up to a maximum. Guessing
+ * is then bounded by time, not by how many addresses the guesser has. Nobody
+ * is locked out: the right password still works, a few seconds later. If more
+ * guesses are already waiting than GATE_QUEUE, a new one is asked to try again
+ * shortly instead of joining the queue.
+ */
+export const GATE_GLOBAL_FAILURES = 20;
+export const GATE_GLOBAL_WINDOW_MS = 10 * 60_000;
+export const GATE_SLOW_MS = 2_000;
+export const GATE_SLOW_MAX_MS = 16_000;
+export const GATE_QUEUE = 10;
 
 export async function registerDemoGate(app: FastifyInstance, options: DemoGateOptions): Promise<void> {
   const { config, now } = options;
@@ -79,6 +97,16 @@ export async function registerDemoGate(app: FastifyInstance, options: DemoGateOp
     const [expires = '', nonce = '', signature = ''] = (raw ?? '').split('.');
     if (!raw || raw.split('.').length !== 3 || !/^\d{1,16}$/.test(expires) || !nonce) return false;
     return Number(expires) > now() && safeEqual(sign(expires, nonce), signature);
+  };
+  const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let failures: number[] = [];
+  let waiting = 0;
+  let turn: Promise<void> = Promise.resolve();
+  /** How long every guess waits now, given the wrong passwords of the last window from everywhere. */
+  const slowFor = (): number => {
+    failures = failures.filter((at) => now() - at < GATE_GLOBAL_WINDOW_MS);
+    if (failures.length < GATE_GLOBAL_FAILURES) return 0;
+    return Math.min(GATE_SLOW_MAX_MS, GATE_SLOW_MS * 2 ** Math.floor((failures.length - GATE_GLOBAL_FAILURES) / GATE_GLOBAL_FAILURES));
   };
   const send = (reply: FastifyReply, status: number, next: string, message: string | null) =>
     reply.status(status).header('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(page(next, message));
@@ -115,10 +143,30 @@ export async function registerDemoGate(app: FastifyInstance, options: DemoGateOp
         if (error instanceof ApiError && error.options.retryAfterSeconds !== undefined) reply.header('Retry-After', String(error.options.retryAfterSeconds));
         return send(reply, 429, next, 'Too many attempts. Wait a minute and try again.');
       }
+      // The ceiling for everyone together (see GATE_GLOBAL_FAILURES): slowed, one guess at a time, never locked.
+      const slow = slowFor();
+      if (slow > 0) {
+        if (waiting >= GATE_QUEUE) {
+          reply.header('Retry-After', String(Math.ceil(slow / 1000)));
+          return send(reply, 429, next, 'The demo is busy checking passwords. Wait a few seconds and try again.');
+        }
+        waiting += 1;
+        const mine = turn.then(() => delay(slow));
+        turn = mine.catch(() => {});
+        try {
+          await mine;
+        } finally {
+          waiting -= 1;
+        }
+      }
       const typed = typeof body.password === 'string' ? body.password : '';
       // Digests of equal length are compared, in constant time: neither the length of the password nor how much of it was right can be timed.
       const digest = (value: string) => createHash('sha256').update(`demo-gate-attempt:${value}`).digest('base64url');
-      if (!safeEqual(digest(typed), digest(password))) return send(reply, 401, next, 'That is not the demo password.');
+      if (!safeEqual(digest(typed), digest(password))) {
+        failures.push(now());
+        if (failures.length > 10_000) failures = failures.slice(-5_000);
+        return send(reply, 401, next, 'That is not the demo password.');
+      }
       const expires = String(now() + GATE_TTL_MS);
       const nonce = randomToken();
       reply.header('Set-Cookie', `${cookieName}=${expires}.${nonce}.${sign(expires, nonce)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${GATE_TTL_MS / 1000}${secure ? '; Secure' : ''}`);

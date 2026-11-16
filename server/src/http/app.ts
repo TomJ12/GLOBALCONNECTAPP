@@ -34,6 +34,8 @@ import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
 
 export interface AppDeps {
+  /** TESTS ONLY: stands in for the demo gate's waiting. */
+  gateDelay?: (ms: number) => Promise<void>;
   config: Config;
   stores: Stores;
   registry: ProviderRegistry;
@@ -340,7 +342,7 @@ export async function buildApp(deps: AppDeps) {
    */
   // The demo gate (when DEMO_ACCESS_PASSWORD is set) stands in front of every route registered after this line.
   const byGate = limiter(MAX_RATE_WINDOWS);
-  await registerDemoGate(app, { config, now, limitAttempts, limit: (address, allowed) => byGate(sourceOf(address), allowed) });
+  await registerDemoGate(app, { config, now, limitAttempts, limit: (address, allowed) => byGate(sourceOf(address), allowed), delay: deps.gateDelay });
 
   const sessionOf = async (request: FastifyRequest): Promise<SessionContext> => {
     const context = await auth.authenticate(bearer(request));

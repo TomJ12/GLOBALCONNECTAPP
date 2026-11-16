@@ -459,7 +459,7 @@ export class HeldPayments {
     // checked, and the new state written together with its audit entries.
     let refusal: ApiError | null = null;
     const refuse = (error: ApiError): null => ((refusal = error), null);
-    const at = now();
+    let at = now();
     let company: CompanyRecord | null = null;
     let dropped: NonNullable<HeldPaymentRecord['droppedApprovals']> = [];
     let required = record.approvalsRequired as number;
@@ -468,6 +468,8 @@ export class HeldPayments {
       (current) => [current.createdBy, actor.user.id, ...current.approvals.map((item) => item.userId)],
       (current, context: HeldPaymentPeople) => {
         company = context.company;
+        // The time of the decision is the time of the transaction that makes it, not of the checks that led up to it.
+        at = now();
         if (current.status !== 'awaiting_approval') return refuse(new ApiError('validation', { reason: 'not_awaiting_approval' }));
         if (current.expiresAt <= at) return refuse(new ApiError('validation', { reason: 'payment_expired' }));
         if (current.createdBy === actor.user.id) return refuse(new ApiError('forbidden', { reason: 'creator_cannot_approve' }));
