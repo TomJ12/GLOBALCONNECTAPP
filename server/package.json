@@ -16,7 +16,8 @@
     "audit:verify": "tsx --env-file-if-exists=.env src/cli/db.ts audit-verify",
     "db:backup": "tsx --env-file-if-exists=.env src/cli/db.ts backup",
     "db:rotate-key": "tsx --env-file-if-exists=.env src/cli/db.ts rotate-key",
-    "audit:checkpoint": "tsx --env-file-if-exists=.env src/cli/db.ts audit-checkpoint"
+    "audit:checkpoint": "tsx --env-file-if-exists=.env src/cli/db.ts audit-checkpoint",
+    "audit:reseal": "tsx --env-file-if-exists=.env src/cli/db.ts audit-reseal"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

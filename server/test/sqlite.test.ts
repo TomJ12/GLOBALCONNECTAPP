@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -13,7 +14,7 @@ import { MINIMUM_NODE, nodeVersionProblem } from '../src/nodeVersion';
 import { createRuntime, keysFor } from '../src/startup';
 import { seedDirectory } from '../src/store/seed';
 import { createSqliteStores } from '../src/store/sqlite';
-import type { AuditCheckpoint } from '../src/store/sqlite/audit';
+import { legacyHeadMac, type AuditCheckpoint } from '../src/store/sqlite/audit';
 import { Db, lockForServer } from '../src/store/sqlite/db';
 import { dataKeys, newDataKey } from '../src/store/sqlite/keys';
 import { AUDIT_TRIGGERS, MIGRATIONS } from '../src/store/sqlite/migrations';
@@ -37,6 +38,8 @@ afterEach(async () => {
   rmSync(folder, { recursive: true, force: true });
 });
 
+const DROP_TRIGGERS = Object.keys(AUDIT_TRIGGERS).map((name) => `DROP TRIGGER ${name};`).join(' ');
+const RECREATE_TRIGGERS = `${Object.values(AUDIT_TRIGGERS).join('; ')};`;
 const system = (action: string, at = 1) => ({ at, actor: { type: 'system' as const, id: null, label: 'test' }, target: null, action, outcome: 'success' as const, source: '', detail: { note: 'x' } });
 /** The database file and its write-ahead log, as someone who copied them would see them. */
 const rawBytes = () => Buffer.concat(readdirSync(folder).filter((name) => name.startsWith('data.sqlite')).map((name) => readFileSync(path.join(folder, name)))).toString('latin1');
@@ -324,18 +327,25 @@ test('audit: the database rejects any change or removal; audit:verify passes on 
   // An entry removed from the archive, with the numbering closed up, is found by the count as well as the chain.
   assert.equal(tamper(`DELETE FROM audit_archive WHERE seq = (SELECT MIN(seq) FROM audit_archive)`).ok, false);
   // Triggers left off, or put back as something that refuses nothing, are reported even when no entry was touched.
-  assert.match(tamper('SELECT 1', 'SELECT 1').problem ?? '', /The trigger audit_log_no_update, which stops audit entries being changed or removed, is missing/);
+  assert.match(tamper('SELECT 1', 'SELECT 1').problem ?? '', /The trigger audit_log_no_update, which is part of how the audit log is protected, is missing/);
   assert.match(tamper('SELECT 1', `${RECREATE.replace(AUDIT_TRIGGERS.audit_log_no_delete as string, "CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log WHEN 1 = 0 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: entries cannot be removed'); END")}`).problem ?? '', /The trigger audit_log_no_delete, .* has been altered/);
   // An entry added by someone without the key does not make a cut-off log look whole again.
   copyOf();
   const forged = new Db(backup);
   forged.exec(`${DROP} ${cutOff} UPDATE sqlite_sequence SET seq = 9 WHERE name = 'audit_log'; UPDATE audit_head SET seq = 9, count = 9, hash = (SELECT hash FROM audit_log WHERE seq = 9); ${RECREATE}`);
   forged.close();
-  const reopened = createSqliteStores({ path: backup, keys });
-  await reopened.audit.append(system('event.after', 11));
-  assert.equal(reopened.db.get<{ seq: number }>('SELECT MAX(seq) AS seq FROM audit_log')?.seq, 10, 'the new entry took the place of the one removed');
-  assert.match(reopened.verifyAudit().problem ?? '', /end of the log is not signed/, 'writing on does not re-sign a record that was not valid');
-  reopened.close();
+  // The server does not start on it, and does not offer to sign it either (only the key holder can accept an end).
+  assert.throws(() => createSqliteStores({ path: backup, keys }), /end of the log has been altered: its signature does not match[^]*will not sign the end of a log it cannot vouch for/);
+  // The same done to a database a server has OPEN: the next entry is refused, with whatever it was to record.
+  copyOf();
+  const running = createSqliteStores({ path: backup, keys });
+  const other = new Db(backup);
+  other.exec(`${DROP} ${cutOff} UPDATE sqlite_sequence SET seq = 9 WHERE name = 'audit_log'; UPDATE audit_head SET seq = 9, count = 9, hash = (SELECT hash FROM audit_log WHERE seq = 9); ${RECREATE}`);
+  other.close();
+  await assert.rejects(async () => running.audit.append(system('event.after', 11)), /audit log cannot be written to, so the action was refused[^]*signature does not match/);
+  assert.equal(running.db.get<{ seq: number }>('SELECT MAX(seq) AS seq FROM audit_log')?.seq, 9, 'nothing was written over the cut');
+  assert.equal(running.verifyAudit().ok, false);
+  running.close();
 
   // What the file alone cannot show: the whole database replaced by an older, honest copy. A checkpoint kept
   // somewhere else shows it.
@@ -429,44 +439,197 @@ test('restart: sessions, locks, pending requests, invitations and the audit log 
 
 // --- Review of fe9d053 -----------------------------------------------------------------------------------
 
-/** Turns a current database back into one as the previous version of the server left it (schema 3). */
-function asSchema3(target: string): void {
+/** Turns a current database back into one as commit 2ac6785 left it (schema 4): the end of the log signed without the archive boundary, a plain development marker, no signed state. */
+function asSchema4(target: string): void {
   const db = new Db(target);
+  const head = db.get<{ seq: number; hash: string; count: number }>('SELECT seq, hash, count FROM audit_head') as { seq: number; hash: string; count: number };
+  db.exec(`DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version = 5;
+    DELETE FROM meta WHERE key = 'state'; INSERT INTO meta (key, value) VALUES ('used_in_development', '1');`);
+  db.run('UPDATE audit_head SET mac = ?, key_id = ?', legacyHeadMac(keys.current, head.seq, head.hash, head.count), keys.current.id);
+  db.close();
+}
+/** ...and one as the version before that left it (schema 3): nothing about the end of the log is signed. */
+function asSchema3(target: string): void {
+  asSchema4(target);
+  const db = new Db(target, MIGRATIONS.slice(0, 4));
   db.exec(`DROP INDEX companies_provider_account; DROP INDEX companies_name_key; ALTER TABLE companies DROP COLUMN name_key;
     ALTER TABLE audit_head DROP COLUMN count; ALTER TABLE audit_head DROP COLUMN mac; ALTER TABLE audit_head DROP COLUMN key_id;
     DELETE FROM schema_version WHERE version = 4; DELETE FROM meta WHERE key = 'used_in_development';`);
   db.close();
 }
+/** The version table as it is on disk, read without this code's help. */
+const versionOf = (target: string, _known?: number): number => {
+  const db = new DatabaseSync(target, { readOnly: true });
+  try {
+    return db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'schema_version'").get() ? Number((db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number | null }).version ?? 0) : 0;
+  } finally {
+    db.close();
+  }
+};
 const modeOf = (target: string) => (statSync(target).mode & 0o777).toString(8);
-
-test('upgrade: a database left by the previous version (schema 3) is brought to 4 in one step: the audit log is sealed as it stands, names are indexed, nothing is lost', async () => {
+/** A database with some real history: sample people, an activated account, audit entries. */
+async function withHistory(): Promise<{ secret: string; entries: number }> {
   h = await harness({}, undefined, { databasePath: file });
   const amira = await h.activate(AMIRA);
+  for (let n = 0; n < 6; n += 1) await h.stores.audit.append(system(`event.${n}`, n + 1));
   const entries = h.stores.verifyAudit().entries;
   await h.close();
   h = undefined;
-  asSchema3(file);
-  const old = new Db(file, MIGRATIONS.slice(0, 3));
-  assert.equal(old.schemaVersion(), 3);
-  old.close();
+  return { secret: amira.secret, entries };
+}
+const open5 = (extra: Partial<Parameters<typeof createSqliteStores>[0]> = {}) => createSqliteStores({ path: file, keys, mode: 'development', ...extra });
 
-  const stores = createSqliteStores({ path: file, keys, mode: 'development' });
-  assert.equal(stores.db.schemaVersion(), 4);
+test('upgrade: a schema-4 database keeps the end of its log exactly as that version signed it; a schema-3 one with entries is taken on only by the key holder, on record', async () => {
+  const { secret, entries } = await withHistory();
+
+  // --- From schema 4 (the previous commit): automatic, because the end of the log verifies as that version signed it.
+  asSchema4(file);
+  assert.equal(versionOf(file, 4), 4);
+  let stores = open5();
+  assert.equal(stores.db.schemaVersion(), 5);
   assert.deepEqual(stores.verifyAudit(), { ok: true, entries, archived: 0, problem: null });
-  assert.equal((await stores.directory.getUser('usr_amira'))?.totpSecret, amira.secret);
-  assert.deepEqual(stores.db.all<{ name_key: string }>('SELECT name_key FROM companies ORDER BY id').map((row) => row.name_key), ['castlebrook imports ltd', 'northfield trading ltd']);
-  await assert.rejects(async () => stores.directory.saveCompany({ id: 'co_copy', name: 'NORTHFIELD  trading ltd', providerKey: 'equals', providerAccountId: 'S00003', providerContactId: '' }), /company_name|name/);
+  assert.equal(stores.acceptedLogEnd, false);
+  assert.equal((await stores.directory.getUser('usr_amira'))?.totpSecret, secret);
   stores.close();
+  // It was a development database and stays one, though the old plain marker is gone.
+  const plain = new Db(file);
+  plain.run("DELETE FROM meta WHERE key = 'used_in_development'");
+  plain.close();
+  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /has been used in development mode/);
 
-  // Two companies that the old version allowed to share an account: the upgrade stops, says so, and changes nothing.
+  // A schema-4 database whose newest entries were cut off BEFORE the upgrade: the signed end is carried over, not
+  // recomputed from the tables, so the cut is still found.
+  asSchema4(file);
+  const cut = new Db(file, MIGRATIONS.slice(0, 4));
+  cut.exec(`${DROP_TRIGGERS} DELETE FROM audit_log WHERE seq > ${entries - 2}; ${RECREATE_TRIGGERS}`);
+  cut.close();
+  assert.throws(() => open5(), /The log ends at entry \d+, but entry \d+ was the last one written: the newest entries have been removed/);
+  // ...and one whose record of the end was edited too is not taken on at all.
+  const edited = new Db(file);
+  edited.exec(`UPDATE audit_head SET seq = ${entries - 2}, count = ${entries - 2}, hash = (SELECT hash FROM audit_log WHERE seq = ${entries - 2})`);
+  edited.close();
+  assert.throws(() => open5(), /newest entries have been removed|signature does not match/);
+});
+
+test('N5: nothing is signed on the word of the version table. A log cut short and "downgraded" is refused, in every variant, and so is every deleted or forged marker', async () => {
+  const { entries } = await withHistory();
+  const pristine = path.join(folder, 'pristine.sqlite');
+  const reset = () => {
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${file}${suffix}`, { force: true });
+    const db = new Db(pristine);
+    db.backupTo(file);
+    db.close();
+  };
+  const first = new Db(file);
+  first.backupTo(pristine);
+  first.close();
+  const attack = (sql: string, known = MIGRATIONS.length) => {
+    reset();
+    const db = new Db(file, MIGRATIONS.slice(0, known));
+    db.exec(sql);
+    db.close();
+  };
+  const CUT = `${DROP_TRIGGERS} DELETE FROM audit_log WHERE seq > ${entries - 3}; ${RECREATE_TRIGGERS}`;
+  const TO_4 = `DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version = 5;`;
+  const TO_3 = `${TO_4} DROP INDEX companies_provider_account; DROP INDEX companies_name_key; ALTER TABLE companies DROP COLUMN name_key; ALTER TABLE audit_head DROP COLUMN count; ALTER TABLE audit_head DROP COLUMN mac; ALTER TABLE audit_head DROP COLUMN key_id; DELETE FROM schema_version WHERE version = 4;`;
+  const NO_STATE = `DELETE FROM meta WHERE key = 'state';`;
+  const cli = (...args: string[]) => spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY }, encoding: 'utf8' });
+  const refusedWith = (pattern: RegExp, what: string) => {
+    const before = versionOf(file);
+    for (const mode of ['development', 'strict'] as const) assert.throws(() => createSqliteStores({ path: file, keys, mode }), mode === 'strict' ? /./ : pattern, `${what} (${mode})`);
+    // Nothing was run on it: not one migration.
+    assert.equal(versionOf(file), before, what);
+    assert.notEqual(cli('audit-verify').status, 0, what);
+  };
+
+  // The audit's attack: cut the newest entries, remove what migrations 4 and 5 added, and let the next start "upgrade" it.
+  attack(`${CUT} ${TO_3}`);
+  refusedWith(/version table says schema 3, but its signed record says 5: the database has been altered/, 'cut and downgraded to 3');
+  attack(`${CUT} ${TO_3} ${NO_STATE}`);
+  refusedWith(/end of this database’s audit log is not signed[^]*The server will not sign the end of a log it cannot vouch for[^]*npm run audit:reseal/, 'cut, downgraded to 3, state removed');
+  attack(`${CUT} ${TO_4} ${NO_STATE}`);
+  refusedWith(/audit log is not signed/, 'cut, downgraded to 4, state removed');
+  attack(`${CUT} ${TO_4} ${NO_STATE} UPDATE audit_head SET seq = ${entries - 3}, count = ${entries - 3}, hash = (SELECT hash FROM audit_log WHERE seq = ${entries - 3});`);
+  refusedWith(/audit log is not signed/, 'the same with the record of the end edited to match');
+  // Without cutting anything: the markers themselves.
+  attack(TO_4);
+  refusedWith(/version table says schema 4, but its signed record says 5/, 'version row removed');
+  attack(NO_STATE);
+  refusedWith(/lost the signed record of its state/, 'state removed');
+  attack(`UPDATE meta SET value = json_set(value, '$.dev', json(CASE WHEN json_extract(value, '$.dev') THEN 'false' ELSE 'true' END)) WHERE key = 'state'`);
+  refusedWith(/signed record of this database’s state[^]*does not verify/, 'development mark edited out of the state');
+  attack(`UPDATE meta SET value = json_set(value, '$.schema', 4) WHERE key = 'state'; ${TO_4}`);
+  refusedWith(/does not verify/, 'state edited to agree with a downgrade');
+  attack(`DELETE FROM meta WHERE key = 'key_check'`);
+  refusedWith(/lost the marker that says which encryption key/, 'key marker removed');
+  attack('DROP TABLE schema_version');
+  refusedWith(/version table says schema 0, but its signed record says 5/, 'version table removed');
+  attack(`${NO_STATE} DELETE FROM schema_version; DELETE FROM meta WHERE key = 'key_check'`);
+  refusedWith(/lost the marker/, 'every marker removed');
+  // The end of the log on a current database: unsigned, removed, or pointing at a cut log.
+  attack(`${CUT}`);
+  refusedWith(/newest entries have been removed/, 'cut');
+  attack(`${CUT} UPDATE audit_head SET mac = NULL, count = NULL, seq = ${entries - 3}, hash = (SELECT hash FROM audit_log WHERE seq = ${entries - 3})`);
+  refusedWith(/end of the log is not signed/, 'cut, end unsigned');
+  attack(`${CUT} DELETE FROM audit_head`);
+  refusedWith(/signed record of the end of the log is missing/, 'cut, end removed');
+
+  // An honest database from schema 3 (the first pushed version) with entries: refused in the same words, until the key
+  // holder accepts it. A wrong label accepts nothing; the right one works once and leaves its own record.
+  reset();
+  asSchema3(file);
+  assert.throws(() => open5(), /audit log is not signed[^]*its end is "[0-9a-f]{16}"/);
+  assert.equal(versionOf(file, 3), 3);
+  let label = '';
+  try {
+    open5();
+  } catch (error) {
+    label = /AUDIT_ACCEPT_LOG_END=([0-9a-f]{16})/.exec((error as Error).message)?.[1] ?? '';
+  }
+  assert.throws(() => open5({ acceptLogEnd: 'empty' }), /audit log is not signed/);
+  assert.throws(() => open5({ acceptLogEnd: `${label.slice(0, 15)}0` === label ? `${label.slice(0, 15)}1` : `${label.slice(0, 15)}0` }), /audit log is not signed/);
+  const adopted = open5({ acceptLogEnd: label });
+  assert.equal(adopted.acceptedLogEnd, true);
+  assert.deepEqual(adopted.verifyAudit(), { ok: true, entries: entries + 1, archived: 0, problem: null });
+  const record = (await adopted.audit.query({ limit: 1 }))[0];
+  assert.deepEqual([record?.action, record?.actor.type, record?.detail.entries, record?.detail.endedAtEntry], ['system.audit.resealed', 'system', String(entries), String(entries)]);
+  assert.match(record?.detail.reason ?? '', /brought from schema 3/);
+  adopted.close();
+  // The setting must then be removed: left in place it would accept a log cut back to exactly that entry.
+  assert.throws(() => open5({ acceptLogEnd: label }), /AUDIT_ACCEPT_LOG_END is set, but the end of the audit log is properly signed[^]*Remove the setting/);
+  open5().close();
+  // A schema-3 database with NO entries has nothing to accept, and upgrades by itself.
+  reset();
+  asSchema3(file);
+  const empty = new Db(file, MIGRATIONS.slice(0, 3));
+  empty.exec(`${DROP_TRIGGERS} DELETE FROM audit_log; DELETE FROM audit_head; ${RECREATE_TRIGGERS}`);
+  empty.close();
+  const fresh = open5();
+  assert.deepEqual(fresh.verifyAudit(), { ok: true, entries: 0, archived: 0, problem: null });
+  fresh.close();
+
+  // Through the command: the key holder accepts a schema-3 log, and it says what that can hide.
+  reset();
+  asSchema3(file);
+  const resealed = cli('audit-reseal');
+  assert.equal(resealed.status, 0, resealed.stderr);
+  assert.match(resealed.stdout, new RegExp(`accepted as it stood[^]*${entries + 1} entries[^]*can hide entries that were cut off`));
+  assert.equal(cli('audit-verify').status, 0);
+  assert.match(cli('audit-reseal').stdout, /properly signed\. Nothing was changed/);
+  // What can never be accepted: entries that were changed. Only the END of a log can be taken as it stands.
+  attack(`${DROP_TRIGGERS} UPDATE audit_log SET detail = '{}' WHERE seq = 2; UPDATE audit_head SET mac = NULL, count = NULL; ${RECREATE_TRIGGERS}`);
+  const altered = cli('audit-reseal');
+  assert.notEqual(altered.status, 0);
+  assert.match(altered.stderr, /cannot be accepted as it stands: Entry 2 [^]*has been changed/);
+
+  // Two companies on one provider account stop the upgrade from schema 3, by name.
+  reset();
   asSchema3(file);
   const clash = new Db(file, MIGRATIONS.slice(0, 3));
   clash.run("INSERT INTO companies (id, name, provider_key, provider_account_id, provider_contact_id) SELECT 'co_twin', 'Twin Ltd', provider_key, provider_account_id, provider_contact_id FROM companies WHERE id = 'co_northfield'");
   clash.close();
-  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'development' }), /UNIQUE constraint failed: companies\.provider_key, companies\.provider_account_id/);
-  const still = new Db(file, MIGRATIONS.slice(0, 3));
-  assert.equal(still.schemaVersion(), 3);
-  still.close();
+  assert.throws(() => open5({ acceptLogEnd: true }), /The companies “Northfield Trading Ltd” and “Twin Ltd” are mapped to the same provider account \(sample-account-0001\)[^]*Nothing was changed/);
+  assert.equal(versionOf(file, 3), 3);
 });
 
 test('M5: the database, its write-ahead files, its lock, its backup and its folder are for this user only, and a database others can read is refused', async () => {
@@ -601,7 +764,7 @@ test('L8: audit:verify, audit:checkpoint and db:backup open the database read-on
   for (const args of [['audit-verify'], ['backup', path.join(folder, 'old.sqlite')]]) {
     const run = spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env, encoding: 'utf8' });
     assert.equal(run.status, 2, args.join(' '));
-    assert.match(run.stderr, /schema version 3 and this version of the commands needs 4\. Start the server once/);
+    assert.match(run.stderr, /schema version 3 and this version of the commands needs 5\. Start the server once/);
   }
   const old = new Db(file, MIGRATIONS.slice(0, 3));
   assert.equal(old.schemaVersion(), 3);

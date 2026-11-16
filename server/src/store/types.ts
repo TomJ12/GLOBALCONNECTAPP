@@ -328,6 +328,8 @@ export interface AuditLog {
   append(entry: Omit<AuditEntry, 'id' | 'anonymous'>): Promise<void>;
   /** Newest first. */
   query(filter?: AuditFilter): Promise<AuditEntry[]>;
+  /** How many entries there are, and how many of them are in the archive. `query` reads both: they are one log. */
+  counts(): { live: number; archived: number };
 }
 
 /** Where a full segment of the main log goes. Durable in a real deployment. */

@@ -13,7 +13,9 @@
  *
  * audit:verify, audit:checkpoint and db:backup open the database READ-ONLY: they change nothing in it.
  *   npm run db:rotate-key           re-encrypt every authenticator key with DATA_ENCRYPTION_KEY
- *                                   (older keys in DATA_ENCRYPTION_KEY_PREVIOUS)
+ *                                   (older keys in DATA_ENCRYPTION_KEY_PREVIOUS). STOP THE SERVER FIRST.
+ *   npm run audit:reseal            the key holder accepts an audit log whose end is not signed, as it stands,
+ *                                   and that acceptance is recorded in the log. STOP THE SERVER FIRST.
  *
  * In development, with nothing set, they use the demo database
  * (.demo-data/globalconnect.sqlite) and the key file beside it.
@@ -23,6 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createSqliteStores } from '../store/sqlite';
+import { lockForServer } from '../store/sqlite/db';
 import type { AuditCheckpoint } from '../store/sqlite/audit';
 import { dataKeys } from '../store/sqlite/keys';
 
@@ -44,9 +47,20 @@ const keyFile = `${database}.dev-key`;
 const keyText = process.env.DATA_ENCRYPTION_KEY ?? (existsSync(keyFile) ? readFileSync(keyFile, 'utf8') : null);
 if (!keyText) fail('Set DATA_ENCRYPTION_KEY to the key the server uses for this database.');
 
+// The two commands that WRITE need the database to themselves: beside a running server, a rotation would leave
+// that server unable to read what it had just written, and unable to vouch for the end of its own audit log.
+const writes = command === 'rotate-key' || command === 'audit-reseal';
+let unlock = (): void => {};
+if (writes) {
+  try {
+    unlock = lockForServer(database);
+  } catch {
+    fail(`The server is running on ${database}. Stop it first: this command changes what the server relies on and cannot run beside it.`);
+  }
+}
 let stores;
 try {
-  stores = createSqliteStores({ path: database, readOnly: command !== 'rotate-key', keys: dataKeys(keyText as string, (process.env.DATA_ENCRYPTION_KEY_PREVIOUS ?? '').split(',').map((item) => item.trim()).filter(Boolean)) });
+  stores = createSqliteStores({ path: database, readOnly: !writes, acceptLogEnd: command === 'audit-reseal' ? true : undefined, keys: dataKeys(keyText as string, (process.env.DATA_ENCRYPTION_KEY_PREVIOUS ?? '').split(',').map((item) => item.trim()).filter(Boolean)) });
 } catch (error) {
   fail(error instanceof Error ? error.message : 'The database could not be opened.');
 }
@@ -83,15 +97,23 @@ try {
     if (existsSync(target)) fail(`${target} already exists. Choose a new file name.`);
     opened.db.backupTo(target);
     console.log(`Backup written to ${target}.\nIt holds everything the database does (password hashes, encrypted authenticator keys, the audit log). The encryption key is NOT in it: keep the key somewhere else, and keep it, or the backup's authenticator keys cannot be read.`);
+  } else if (command === 'audit-reseal') {
+    if (opened.acceptedLogEnd) {
+      const result = opened.verifyAudit();
+      console.log(`The audit log was accepted as it stood and its end is signed again: ${result.entries} entries, the last of them the record of this acceptance (system.audit.resealed).\nThis can hide entries that were cut off the end before you ran it: compare with your latest checkpoint or backup if you have one.`);
+    } else {
+      console.log('The end of the audit log is properly signed. Nothing was changed.');
+    }
   } else if (command === 'rotate-key') {
     const changed = opened.rotateKeys();
     console.log(`${changed} stored secret${changed === 1 ? '' : 's'} re-encrypted with the current key.\nKeep the old key in DATA_ENCRYPTION_KEY_PREVIOUS for as long as audit entries written under it must be verifiable.`);
   } else {
-    fail('Unknown command. Use audit-verify [--checkpoint <file>], audit-checkpoint <file>, backup <file> or rotate-key.');
+    fail('Unknown command. Use audit-verify [--checkpoint <file>], audit-checkpoint <file>, audit-reseal, backup <file> or rotate-key.');
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : 'The command failed.');
   process.exitCode = 1;
 } finally {
   opened.close();
+  unlock();
 }

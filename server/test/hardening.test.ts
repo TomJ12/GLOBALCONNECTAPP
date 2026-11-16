@@ -115,13 +115,37 @@ test('H3: the real process. Strict start exits without printing a code; in devel
     assert.match(output, /DEVELOPMENT OUTBOX: this email was NOT sent anywhere/);
     // The operator port does not answer on any non-loopback address of this machine; the public port does.
     const outside = Object.values(networkInterfaces()).flat().find((item) => item && !item.internal && item.family === 'IPv4')?.address;
+    // N12: and in development, with no demo gate, NEITHER does the public port: sample accounts and their codes stay on this machine.
+    assert.equal((await fetch('http://127.0.0.1:39411/healthz')).status, 200);
     if (outside) {
       await assert.rejects(post(`http://${outside}:39412`));
-      assert.equal((await fetch(`http://${outside}:39411/healthz`)).status, 200);
+      await assert.rejects(fetch(`http://${outside}:39411/healthz`));
     }
   } finally {
     child.kill();
   }
+});
+
+test('N12: development mode listens on this machine only unless it is behind the demo gate, or the operator says otherwise in so many words', () => {
+  const dev = (env: Record<string, string>) => loadConfig({ APP_ENV: 'development', ...env });
+  assert.deepEqual([dev({}).host, dev({}).openOnNetwork], ['127.0.0.1', false]);
+  for (const HOST of ['127.0.0.1', 'localhost', '::1', '127.0.0.2']) assert.equal(dev({ HOST }).openOnNetwork, false, HOST);
+  // Any other address without the gate is refused, and the refusal says what the choices are.
+  for (const HOST of ['0.0.0.0', '::', '192.168.1.20', '10.0.0.5']) {
+    assert.throws(() => dev({ HOST }), /Refusing to start in development mode on .* without the demo gate[^]*Leave HOST unset[^]*DEMO_ACCESS_PASSWORD[^]*DEV_OPEN_ON_NETWORK=1/, HOST);
+    assert.throws(() => dev({ HOST, DEV_OPEN_ON_NETWORK: 'yes' }), /without the demo gate/, 'only the exact value 1 counts');
+    assert.deepEqual([dev({ HOST, DEV_OPEN_ON_NETWORK: '1' }).host, dev({ HOST, DEV_OPEN_ON_NETWORK: '1' }).openOnNetwork], [HOST, true]);
+  }
+  // Behind the gate it may listen anywhere: that is what a container needs, and what Fly requires anyway.
+  const gated = dev({ HOST: '0.0.0.0', DEMO_ACCESS_PASSWORD: 'orchard-lantern-47-quay' });
+  assert.deepEqual([gated.host, gated.openOnNetwork], ['0.0.0.0', false]);
+  assert.equal(dev({ DEMO_ACCESS_PASSWORD: 'orchard-lantern-47-quay' }).host, '0.0.0.0');
+  // A GitHub Codespace forwards its port from this machine's own address: nothing to set.
+  assert.equal(dev({ CODESPACE_NAME: 'fuzzy-space', APP_URL: 'https://fuzzy-space-3001.app.github.dev' }).host, '127.0.0.1');
+  // Outside development the address is the operator's business, as before.
+  assert.equal(loadConfig(LIVE).host, '0.0.0.0');
+  // The override is said loudly at start-up.
+  assert.match(readFileSync(path.join(serverDir, 'src', 'main.ts'), 'utf8'), /if \(config\.openOnNetwork\) lines\.push\(`WARNING: DEV_OPEN_ON_NETWORK=1/);
 });
 
 // --- M1 ---------------------------------------------------------------------------------------
@@ -318,7 +342,10 @@ test('N1: a full live audit table is archived, never dropped: nothing is refused
   for (const n of [1, 2, 3, 4, 5]) await stores.audit.append(entry(n));
   // The older entries moved to the archive table, whole and in order; the newest are in the live table.
   assert.deepEqual(stores.db.all<{ action: string }>('SELECT action FROM audit_archive ORDER BY seq').map((row) => row.action), ['e1', 'e2', 'e3']);
-  assert.deepEqual((await stores.audit.query()).map((item) => item.action), ['e5', 'e4']);
+  assert.deepEqual(stores.db.all<{ action: string }>('SELECT action FROM audit_log ORDER BY seq').map((row) => row.action), ['e4', 'e5']);
+  // N6: live and archived are one log to whoever reads it: an entry does not leave the console's view by being archived.
+  assert.deepEqual((await stores.audit.query()).map((item) => item.action), ['e5', 'e4', 'e3', 'e2', 'e1']);
+  assert.deepEqual(stores.audit.counts(), { live: 2, archived: 3 });
   assert.equal(notices.length, 1);
   assert.match(notices[0] ?? '', /3 older entries were moved to the archive table.*Nothing was removed/);
   for (const n of [6, 7, 8, 9]) await stores.audit.append(entry(n));

@@ -21,6 +21,10 @@ export interface ProviderCredentials {
 export interface Config {
   port: number;
   host: string;
+  /** DEVELOPMENT ONLY: listening beyond this machine without the demo gate, by explicit choice (DEV_OPEN_ON_NETWORK=1). Said loudly at start-up. */
+  openOnNetwork: boolean;
+  /** The key holder's one-off acceptance of an audit log whose end is not signed (AUDIT_ACCEPT_LOG_END): the label of that exact log end. */
+  auditAcceptLogEnd: string | null;
   /** Only with APP_ENV=development. */
   development: boolean;
   /** Everything else. */
@@ -246,6 +250,18 @@ export function loadConfig(env: Env = process.env): Config {
     if (!appUrl.startsWith('https://') || !opsUrl.startsWith('https://')) throw new Error('A demo on a public address must be served over https: APP_URL (and OPS_URL, if set) must start with https://.');
   }
 
+  // In development the server shows sample accounts and prints activation codes, so by default it listens on this
+  // machine only (a GitHub Codespace forwards its port from here). Beyond this machine it must be behind the demo
+  // gate, unless that is waived in so many words.
+  const host = env.HOST ?? (development && !demoAccessPassword ? '127.0.0.1' : '0.0.0.0');
+  const openOnNetwork = development && !demoAccessPassword && !(host === 'localhost' || host === '::1' || /^127\./.test(host));
+  if (openOnNetwork && env.DEV_OPEN_ON_NETWORK !== '1') {
+    throw new Error(
+      `Refusing to start in development mode on ${host} without the demo gate: anyone who can reach this machine would see the sample accounts and their activation codes. ` +
+        'Leave HOST unset (the server then listens on this machine only, which is also what a GitHub Codespace needs), or set DEMO_ACCESS_PASSWORD, or, on a network you trust, set DEV_OPEN_ON_NETWORK=1.',
+    );
+  }
+
   const approvalHours = Number(env.PAYMENT_APPROVAL_HOURS ?? 48);
   if (!(approvalHours > 0 && approvalHours <= 24 * 30)) throw new Error('PAYMENT_APPROVAL_HOURS must be a number of hours between 0 and 720 (default 48).');
 
@@ -255,7 +271,9 @@ export function loadConfig(env: Env = process.env): Config {
     publicDemo,
     demoSetupCodes: env.DEMO_SETUP_CODES === '1',
     port,
-    host: env.HOST ?? '0.0.0.0',
+    host,
+    openOnNetwork,
+    auditAcceptLogEnd: env.AUDIT_ACCEPT_LOG_END?.trim() || null,
     development,
     strict,
     corsOrigins: (env.CORS_ORIGINS ?? '')

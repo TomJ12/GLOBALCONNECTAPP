@@ -24,11 +24,12 @@ case "${1:-}" in
   backup) shift; set -- src/cli/db.ts backup "$@" ;;
   audit-verify) shift; set -- src/cli/db.ts audit-verify "$@" ;;
   audit-checkpoint) shift; set -- src/cli/db.ts audit-checkpoint "$@" ;;
+  audit-reseal) shift; set -- src/cli/db.ts audit-reseal ;;
   rotate-key) shift; set -- src/cli/db.ts rotate-key ;;
   invite) shift; set -- src/cli/invite.ts "$@" ;;
   create-ops-admin) shift; set -- src/cli/create-ops-admin.ts "$@" ;;
   break-glass) shift; set -- src/cli/break-glass.ts "$@" ;;
-  *) echo "Usage: gc backup <file> | audit-verify [--checkpoint <file>] | audit-checkpoint <file> | rotate-key | invite <email> | create-ops-admin <email> \"Name\" | break-glass <action> <email> \"reason\"" >&2; exit 2 ;;
+  *) echo "Usage: gc backup <file> | audit-verify [--checkpoint <file>] | audit-checkpoint <file> | audit-reseal | rotate-key | invite <email> | create-ops-admin <email> \"Name\" | break-glass <action> <email> \"reason\"" >&2; exit 2 ;;
 esac
 if [ "$(id -u)" = "0" ]; then exec setpriv --reuid=node --regid=node --init-groups node --import tsx "$@"; fi
 exec node --import tsx "$@"

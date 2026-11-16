@@ -6,6 +6,7 @@ import { createRuntime, seedInvitations } from './startup';
 const config = loadConfig();
 const runtime = createRuntime(config);
 const { stores, registry, mailer } = runtime;
+if (stores.acceptedLogEnd) console.error('AUDIT_ACCEPT_LOG_END was used: the audit log was accepted as it stood and that is recorded in it. REMOVE THE SETTING NOW; the server will not start again while it is set.');
 const { app, admin, auth, opsAuth, held } = await buildApp({ config, stores, registry, mailer });
 // Held payments: at start-up every send that a crash or restart left unfinished is settled (by its idempotency key)
 // before the server takes requests; after that, once a minute, payments that waited too long expire and any send
@@ -52,6 +53,7 @@ if (config.development) {
       ? `Data is KEPT in the SQLite database ${config.databasePath}${config.dataEncryptionKey ? '' : ` (its development encryption key is in ${config.databasePath}.dev-key, beside it)`}.`
       : 'No DATABASE_PATH: the database is in memory and everything is forgotten when the server stops.',
   );
+  if (config.openOnNetwork) lines.push(`WARNING: DEV_OPEN_ON_NETWORK=1. This development server listens on ${config.host} WITHOUT the demo gate: anyone who can reach this machine sees the sample accounts and the codes printed below.`);
   if (!config.fourEyes) lines.push('FOUR-EYES APPROVAL IS OFF (FOUR_EYES=off): one staff member alone can make sensitive changes.');
   if (config.demoAccessPassword) lines.push('THE DEMO GATE IS ON: nothing but /healthz is served until a visitor has typed the demo password.');
   if (config.publicDemo && !config.demoSetupCodes) {

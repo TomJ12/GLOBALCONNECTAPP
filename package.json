@@ -70,7 +70,8 @@
     "audit:verify": "npm --prefix server run audit:verify --",
     "db:backup": "npm --prefix server run db:backup --",
     "db:rotate-key": "npm --prefix server run db:rotate-key",
-    "audit:checkpoint": "npm --prefix server run audit:checkpoint --"
+    "audit:checkpoint": "npm --prefix server run audit:checkpoint --",
+    "audit:reseal": "npm --prefix server run audit:reseal"
   },
   "private": true,
   "jest": {

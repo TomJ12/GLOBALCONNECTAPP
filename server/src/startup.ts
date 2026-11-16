@@ -102,6 +102,7 @@ export function createRuntime(config: Config, options: RuntimeOptions = {}): Run
     path: file ?? ':memory:',
     keys,
     mode: config.development ? 'development' : 'strict',
+    acceptLogEnd: config.auditAcceptLogEnd ?? undefined,
     now: options.now,
     audit: options.audit,
     // Sample people and companies exist only in development, and only in a database that has none.

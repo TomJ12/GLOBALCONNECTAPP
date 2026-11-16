@@ -1474,6 +1474,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
           return Number.isNaN(at) ? undefined : at + (end ? 86_400_000 - 1 : 0);
         };
         const entries = await stores.audit.query({ actor, target, action: act, from: day(from, false), to: day(to, true), limit: 500 });
+        const held = stores.audit.counts();
         return send(
           reply,
           200,
@@ -1481,8 +1482,8 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             chromeOf(ctx, 'Audit log'),
             h`<div class="card"><form method="get" action="/ops/audit"><div class="row"><label>Actor <input name="actor" value="${actor}"></label><label>Target <input name="target" value="${target}"></label><label>Action <input name="action" value="${act}"></label><label>From (UTC) <input type="date" name="from" value="${from}"></label><label>To (UTC) <input type="date" name="to" value="${to}"></label><button class="quiet">Filter</button></div></form></div>
 <div class="card"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th><th>Source</th><th>Detail</th></tr>${entries.map(
-              (entry) => h`<tr${/^ops\.(staff\.new|break_glass)/.test(entry.action) ? h` class="alert"` : ''}><td>${when(entry.at)}</td><td>${entry.actor.label} <span class="muted">(${entry.anonymous ? 'not identified' : entry.actor.type})</span></td><td>${entry.action}</td><td>${entry.target ? entry.target.label : ''}</td><td>${tag(entry.outcome === 'success', 'success', 'failure')}</td><td>${entry.source}</td><td>${Object.entries(entry.detail).map(([key, value]) => h`<div>${key}: ${value}</div>`)}</td></tr>`,
-            )}</table>${entries.length === 0 && h`<p class="muted">No entries match.</p>`}<p class="muted">Newest first, at most 500 entries. Entries cannot be changed or removed. Failures by people who were not identified (a wrong password, for example) are kept separately: only the most recent, and only a limited number per source address.</p></div>`,
+              (entry) => h`<tr${/^(ops\.(staff\.new|break_glass)|system\.audit\.resealed)/.test(entry.action) ? h` class="alert"` : ''}><td>${when(entry.at)}</td><td>${entry.actor.label} <span class="muted">(${entry.anonymous ? 'not identified' : entry.actor.type})</span></td><td>${entry.action}</td><td>${entry.target ? entry.target.label : ''}</td><td>${tag(entry.outcome === 'success', 'success', 'failure')}</td><td>${entry.source}</td><td>${Object.entries(entry.detail).map(([key, value]) => h`<div>${key}: ${value}</div>`)}</td></tr>`,
+            )}</table>${entries.length === 0 && h`<p class="muted">No entries match.</p>`}<p class="muted">The log holds ${String(held.live + held.archived)} ${held.live + held.archived === 1 ? 'entry' : 'entries'}; ${String(held.archived)} of the oldest are in the archive, and are searched and shown here like the rest.</p><p class="muted">Newest first, at most 500 entries. Entries cannot be changed or removed. Failures by people who were not identified (a wrong password, for example) are kept separately: only the most recent, and only a limited number per source address.</p></div>`,
           ),
         );
       });

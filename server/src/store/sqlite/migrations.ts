@@ -124,4 +124,11 @@ ALTER TABLE companies ADD COLUMN name_key TEXT;
 CREATE UNIQUE INDEX companies_provider_account ON companies (provider_key, provider_account_id);
 CREATE UNIQUE INDEX companies_name_key ON companies (name_key);
 `,
+  // 5: how far the archive reaches becomes part of the signed end of the audit log; payments sent straight to the
+  // provider (no approval rule) are recorded by key BEFORE the provider is asked. The store also writes its keyed
+  // record of the database's state (schema version, whether it was ever used in development) in this step.
+  `
+ALTER TABLE audit_head ADD COLUMN archived_through INTEGER;
+CREATE TABLE direct_payments (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+`,
 ];

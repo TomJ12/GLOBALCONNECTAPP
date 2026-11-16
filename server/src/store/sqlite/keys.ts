@@ -68,10 +68,18 @@ export function open(keys: DataKeys, sealed: string, context: string): string {
   const key = keys.all.find((item) => item.id === keyId);
   if (scheme !== 'gcm1' || !iv || !body || !tag) throw new Error('A stored secret is not in the expected encrypted form.');
   if (!key) throw new Error(`A stored secret was encrypted with a key this server was not given (key id ${keyId}). Set DATA_ENCRYPTION_KEY, or DATA_ENCRYPTION_KEY_PREVIOUS, to the key it was encrypted with.`);
-  const decipher = createDecipheriv('aes-256-gcm', key.key, Buffer.from(iv, 'base64'));
+  // The full 16-byte tag, nothing shorter: a tag cut down by whoever edited the row must not be accepted as a weaker one.
+  const authTag = Buffer.from(tag, 'base64');
+  if (authTag.length !== 16) throw new Error('A stored secret is not in the expected encrypted form.');
+  const decipher = createDecipheriv('aes-256-gcm', key.key, Buffer.from(iv, 'base64'), { authTagLength: 16 });
   decipher.setAAD(Buffer.from(context));
-  decipher.setAuthTag(Buffer.from(tag, 'base64'));
+  decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(Buffer.from(body, 'base64')), decipher.final()]).toString('utf8');
+}
+
+/** A keyed signature over `value` for one purpose. Only the holder of the data key can make one that verifies. */
+export function macOf(key: DataKey, purpose: string, value: string): string {
+  return createHmac('sha256', Buffer.from(hkdfSync('sha256', key.key, Buffer.alloc(0), purpose, 32))).update(value).digest('hex');
 }
 
 export const sealedKeyId = (sealed: string): string => sealed.split(':')[1] ?? '';
