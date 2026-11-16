@@ -14,6 +14,8 @@ import type { CompanyRecord, ProviderKey } from '../store/types';
 
 export interface ProviderAdapter extends ProviderClient {
   readonly capabilities: Capabilities;
+  /** Every server-side adapter must be able to say whether a payee's destination has changed (see @/api/digest). */
+  beneficiaryDigestSource(beneficiaryId: string): Promise<string | null>;
 }
 
 export type ProviderMapping = Pick<CompanyRecord, 'providerAccountId' | 'providerContactId'>;

@@ -36,6 +36,19 @@ const AUDIT_COLUMNS = `
   hash TEXT NOT NULL,
   key_id TEXT NOT NULL`;
 
+/** The four triggers that make the audit tables append-only, exactly as they must be found in the database (`audit:verify` compares). */
+export const AUDIT_TRIGGERS: Record<string, string> = {
+  audit_log_no_update: `CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: entries cannot be changed'); END`,
+  audit_log_no_delete: `CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log
+WHEN NOT EXISTS (SELECT 1 FROM audit_archive a WHERE a.seq = OLD.seq AND a.hash = OLD.hash AND a.id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: entries cannot be removed'); END`,
+  audit_archive_no_update: `CREATE TRIGGER audit_archive_no_update BEFORE UPDATE ON audit_archive
+BEGIN SELECT RAISE(ABORT, 'audit_archive is append-only: entries cannot be changed'); END`,
+  audit_archive_no_delete: `CREATE TRIGGER audit_archive_no_delete BEFORE DELETE ON audit_archive
+BEGIN SELECT RAISE(ABORT, 'audit_archive is append-only: entries cannot be removed'); END`,
+};
+
 export const MIGRATIONS: string[] = [
   // 1: accounts, directory, auth state, approval requests, audit log.
   `
@@ -82,17 +95,9 @@ CREATE TABLE audit_archive (seq INTEGER PRIMARY KEY, ${AUDIT_COLUMNS}, archived_
 -- The end of the chain, so that removing the newest entries is detectable too.
 CREATE TABLE audit_head (id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL, hash TEXT NOT NULL) STRICT;
 
--- Append-only, enforced by the database as well as by the code having no such statement.
-CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
-BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: entries cannot be changed'); END;
--- A live entry may leave only by having been copied, unchanged, to the archive.
-CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log
-WHEN NOT EXISTS (SELECT 1 FROM audit_archive a WHERE a.seq = OLD.seq AND a.hash = OLD.hash AND a.id = OLD.id)
-BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: entries cannot be removed'); END;
-CREATE TRIGGER audit_archive_no_update BEFORE UPDATE ON audit_archive
-BEGIN SELECT RAISE(ABORT, 'audit_archive is append-only: entries cannot be changed'); END;
-CREATE TRIGGER audit_archive_no_delete BEFORE DELETE ON audit_archive
-BEGIN SELECT RAISE(ABORT, 'audit_archive is append-only: entries cannot be removed'); END;
+-- Append-only, enforced by the database as well as by the code having no such statement. A live entry may leave
+-- only by having been copied, unchanged, to the archive.
+${Object.values(AUDIT_TRIGGERS).join(';\n')};
 `,
   // 2: payment approvals. The company's policy, and the payments the server holds until they are approved.
   `
@@ -107,5 +112,16 @@ CREATE INDEX held_payments_status ON held_payments (json_extract(data, '$.status
   // 3: ops console confirmations. A used confirmation token is remembered until it would have expired, so it works once.
   `
 CREATE TABLE ops_confirmations (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+`,
+  // 4: the end of the audit log is signed (count and MAC, filled in by the store, which has the key); no two
+  // companies can share a provider account or a name, whatever the code checked first (name_key is the name as
+  // it is compared: filled in by the store).
+  `
+ALTER TABLE audit_head ADD COLUMN count INTEGER;
+ALTER TABLE audit_head ADD COLUMN mac TEXT;
+ALTER TABLE audit_head ADD COLUMN key_id TEXT;
+ALTER TABLE companies ADD COLUMN name_key TEXT;
+CREATE UNIQUE INDEX companies_provider_account ON companies (provider_key, provider_account_id);
+CREATE UNIQUE INDEX companies_name_key ON companies (name_key);
 `,
 ];

@@ -49,6 +49,7 @@ const HOLD_LABELS: Record<PaymentHoldState, { label: string; tone: PillTone }> =
   expired: { label: 'Expired, not sent', tone: 'neutral' },
   payee_changed: { label: 'Payee changed, not sent', tone: 'danger' },
   failed: { label: 'Failed', tone: 'danger' },
+  mismatch: { label: 'Sent, but not as approved: contact support', tone: 'danger' },
 };
 const statusOf = (payment: Pick<Payment, 'status' | 'held'>) =>
   payment.held ? (payment.held.state === 'awaiting_approval' && payment.held.canApprove ? STATUS_LABELS.awaiting_approval : HOLD_LABELS[payment.held.state]) : STATUS_LABELS[payment.status];

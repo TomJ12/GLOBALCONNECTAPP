@@ -11,6 +11,13 @@
  * twice: a payment in `sending` is settled by that same key (look it up; if
  * the provider does not have it, ask again with the same key) before anything
  * else can happen to it, and it is never sent under another key.
+ *
+ * ONE SERVER PROCESS. The server holds a lock on its database while it runs
+ * (store/sqlite/db.ts), so at start-up no other process can be in the middle
+ * of sending: every `sending` payment found then is settled at once.
+ *
+ * Every change of a payment's state is written together with its audit entry,
+ * in one database transaction.
  */
 import Big from 'big.js';
 
@@ -22,7 +29,7 @@ import type { Config } from '../config';
 import { randomToken, sha256 } from '../crypto';
 import { ApiError } from '../errors';
 import type { ProviderAdapter } from '../providers/adapter';
-import { approvalsRequiredOf, type AuditParty, type CompanyRecord, type HeldPaymentPeople, type HeldPaymentRecord, type Stores, type UserRecord } from '../store/types';
+import { approvalsRequiredOf, type AuditInput, type AuditParty, type CompanyMember, type CompanyRecord, type HeldPaymentPeople, type HeldPaymentRecord, type Stores, type UserRecord } from '../store/types';
 
 export interface Actor {
   user: UserRecord;
@@ -61,9 +68,13 @@ const STATUS: Record<HeldPaymentRecord['status'], PaymentStatus> = {
   expired: 'cancelled',
   payee_changed: 'cancelled',
 };
-/** The fields of a payee that decide where money goes. A change to any of them after creation blocks the payment. */
-const payeeSignature = (payee: Beneficiary): string =>
-  canonicalJson([payee.id, payee.name, payee.entityType, payee.currency, payee.bankCountry, payee.accountNumber, payee.sortCode, payee.iban, payee.bic, payee.routingNumber]);
+/** How many approvals a waiting payment needs NOW: the rule it was created under, or the company's rule today if that is stricter. A loosened rule never lowers it. */
+const requiredNow = (record: HeldPaymentRecord, company: Pick<CompanyRecord, 'approvalsRequired'> | null): number => Math.max(record.approvalsRequired, company ? approvalsRequiredOf(company) : 0);
+const mappingOf = (company: CompanyRecord) => ({ providerKey: company.providerKey, providerAccountId: company.providerAccountId, providerContactId: company.providerContactId });
+const sameMapping = (a: ReturnType<typeof mappingOf>, b: ReturnType<typeof mappingOf>): boolean => a.providerKey === b.providerKey && a.providerAccountId === b.providerAccountId && a.providerContactId === b.providerContactId;
+/** What identifies a request to create a payment: the same idempotency key with anything else is a different request. */
+export const requestHashOf = (input: { beneficiaryId: string; amount: string; currency: string; reference: string; reason: string }): string =>
+  sha256(canonicalJson([input.beneficiaryId, input.amount, input.currency, input.reference, input.reason]));
 
 export class HeldPayments {
   constructor(private readonly deps: HeldPaymentsDeps) {}
@@ -72,9 +83,9 @@ export class HeldPayments {
   detailOf(record: HeldPaymentRecord): Record<string, string> {
     return { payment: record.id, amount: record.amount, currency: record.currency, payee: record.payee.id };
   }
-  private async audit(action: string, outcome: 'success' | 'failure', actor: AuditParty, source: string, record: HeldPaymentRecord, detail: Record<string, string> = {}): Promise<void> {
-    const company = await this.deps.stores.directory.getCompany(record.companyId);
-    await this.deps.stores.audit.append({ at: this.deps.now(), actor, target: { type: 'company', id: record.companyId, label: company?.name ?? record.companyId }, action, outcome, source, detail: { ...this.detailOf(record), ...detail } });
+  /** An audit entry about a payment, to be written in the same transaction as the change it records. */
+  private entry(action: string, outcome: 'success' | 'failure', actor: AuditParty, source: string, record: HeldPaymentRecord, company: Pick<CompanyRecord, 'name'> | null, detail: Record<string, string> = {}): AuditInput {
+    return { at: this.deps.now(), actor, target: { type: 'company', id: record.companyId, label: company?.name ?? record.companyId }, action, outcome, source, detail: { ...this.detailOf(record), ...detail } };
   }
 
   /** Whether this company's payments are held for approval. */
@@ -84,22 +95,15 @@ export class HeldPayments {
 
   // --- Reading ---------------------------------------------------------------------------------
 
-  /** The company's active members by id, with their role. */
-  private async members(companyId: string): Promise<Map<string, { user: UserRecord; role: UserRole }>> {
-    const { directory } = this.deps.stores;
-    const found = new Map<string, { user: UserRecord; role: UserRole }>();
-    for (const membership of await directory.listMemberships()) {
-      if (membership.companyId !== companyId) continue;
-      const user = await directory.getUser(membership.userId);
-      if (user) found.set(user.id, { user, role: membership.role });
-    }
-    return found;
+  /** The company's members by id. Names, roles and whether they can act: no credential is read for a list. */
+  private async members(companyId: string): Promise<Map<string, CompanyMember>> {
+    return new Map((await this.deps.stores.directory.listMembers(companyId)).map((member) => [member.userId, member]));
   }
 
-  private view(record: HeldPaymentRecord, viewer: Actor, members: Map<string, { user: UserRecord; role: UserRole }>, names: Map<string, string>): Payment {
+  private view(record: HeldPaymentRecord, viewer: Actor, members: Map<string, CompanyMember>, names: Map<string, string>): Payment {
     const awaiting = record.status === 'awaiting_approval' && this.deps.now() < record.expiresAt;
     const approved = new Set(record.approvals.map((item) => item.userId));
-    const approvers = [...members.values()].filter(({ user, role }) => usable(user) && CAN_APPROVE.includes(role) && user.id !== record.createdBy && !approved.has(user.id));
+    const approvers = [...members.values()].filter((member) => member.active && CAN_APPROVE.includes(member.role) && member.userId !== record.createdBy && !approved.has(member.userId));
     return {
       id: record.id,
       shortReference: `GC-${record.id.slice(3, 11).toUpperCase()}`,
@@ -108,21 +112,22 @@ export class HeldPayments {
       beneficiaryId: record.payee.id,
       beneficiaryName: record.payee.name,
       reference: record.reference,
-      status: STATUS[record.status],
+      // Sent, but not as it was approved: nobody should take that for a normal payment.
+      status: record.mismatch ? 'unknown' : STATUS[record.status],
       route: null,
       fee: null,
       estimatedArrival: null,
       createdAt: new Date(record.createdAt).toISOString(),
       held: {
-        state: (record.status === 'sent' ? 'sending' : record.status) as PaymentHoldState,
+        state: (record.mismatch ? 'mismatch' : record.status === 'sent' ? 'sending' : record.status) as PaymentHoldState,
         createdBy: names.get(record.createdBy) ?? 'Someone no longer on this account',
         createdByYou: record.createdBy === viewer.user.id,
-        approvalsRequired: record.approvalsRequired,
+        approvalsRequired: requiredNow(record, viewer.company),
         approvals: record.approvals.map((item) => ({ by: names.get(item.userId) ?? 'Someone no longer on this account', at: new Date(item.at).toISOString() })),
         expiresAt: new Date(record.expiresAt).toISOString(),
         canApprove: awaiting && CAN_APPROVE.includes(viewer.role) && viewer.user.id !== record.createdBy && !approved.has(viewer.user.id),
         canCancel: awaiting && (viewer.user.id === record.createdBy || viewer.role === 'admin'),
-        approvers: awaiting ? approvers.map(({ user }) => user.name) : [],
+        approvers: awaiting ? approvers.map((member) => member.name) : [],
       },
     };
   }
@@ -131,7 +136,7 @@ export class HeldPayments {
     const members = await this.members(viewer.company.id);
     const names = new Map<string, string>();
     const nameOf = async (userId: string): Promise<void> => {
-      if (!names.has(userId)) names.set(userId, members.get(userId)?.user.name ?? (await this.deps.stores.directory.getUser(userId))?.name ?? 'Someone no longer on this account');
+      if (!names.has(userId)) names.set(userId, members.get(userId)?.name ?? (await this.deps.stores.directory.getUser(userId))?.name ?? 'Someone no longer on this account');
     };
     return {
       one: async (record: HeldPaymentRecord): Promise<Payment> => {
@@ -145,7 +150,7 @@ export class HeldPayments {
   async listPayments(viewer: Actor): Promise<Payment[]> {
     await this.expireDue(viewer.company.id);
     const view = await this.viewer(viewer);
-    const records = (await this.deps.stores.payments.list({ companyId: viewer.company.id })).filter((record) => record.status !== 'sent' && this.deps.now() - record.statusAt < SHOWN_MS);
+    const records = (await this.deps.stores.payments.list({ companyId: viewer.company.id })).filter((record) => (record.status !== 'sent' || Boolean(record.mismatch)) && this.deps.now() - record.statusAt < SHOWN_MS);
     return Promise.all(records.map((record) => view.one(record)));
   }
 
@@ -158,12 +163,13 @@ export class HeldPayments {
       records.map(async (record) => {
         const payment = await view.one(record);
         const hold = payment.held as NonNullable<Payment['held']>;
-        const remaining = record.approvalsRequired - record.approvals.length;
+        const required = hold.approvalsRequired;
+        const remaining = Math.max(0, required - record.approvals.length);
         const steps: ApprovalStep[] = [
           { label: `Created by ${hold.createdBy}`, status: 'done', at: payment.createdAt },
           ...hold.approvals.map((item): ApprovalStep => ({ label: `Approved by ${item.by}`, status: 'done', at: item.at })),
           ...Array.from({ length: remaining }, (_, index): ApprovalStep => ({
-            label: record.approvalsRequired === 1 ? 'Approval by someone else' : `Approval ${record.approvals.length + index + 1} of ${record.approvalsRequired}`,
+            label: required === 1 ? 'Approval by someone else' : `Approval ${record.approvals.length + index + 1} of ${required}`,
             status: index === 0 && hold.canApprove ? 'waiting_for_you' : 'waiting',
             at: null,
           })),
@@ -177,9 +183,10 @@ export class HeldPayments {
   async findByKey(viewer: Actor, idempotencyKey: string): Promise<Payment | null | undefined> {
     const record = await this.deps.stores.payments.findByKey(viewer.company.id, idempotencyKey);
     if (!record) return undefined;
-    if (record.status === 'sent' && record.sendKey) {
+    if (record.status === 'sent' && record.sendKey && !record.mismatch) {
       const sendKey = record.sendKey;
-      const sent = await this.deps.withProvider(viewer.company, (provider) => provider.findPaymentByIdempotencyKey(sendKey));
+      const target = await this.sendTarget(record);
+      const sent = target ? await this.deps.withProvider(target, (provider) => provider.findPaymentByIdempotencyKey(sendKey)) : null;
       if (sent) return sent;
     }
     return (await this.viewer(viewer)).one(record);
@@ -193,18 +200,51 @@ export class HeldPayments {
 
   // --- Creating --------------------------------------------------------------------------------
 
-  async create(actor: Actor, input: { beneficiaryId: string; amount: string; currency: string; reference: string; reason: string }, idempotencyKey: string): Promise<Payment> {
+  /** The provider's digest of where a payee's money goes (see @/api/digest), or null when the payee is gone. */
+  private async digest(company: CompanyRecord, payeeId: string): Promise<string | null> {
+    const source = await this.deps.withProvider(company, (provider) => provider.beneficiaryDigestSource(payeeId));
+    return source === null ? null : sha256(source);
+  }
+
+  /**
+   * The payment this idempotency key already made here, if it did. The SAME
+   * request (same person, same payee, amount, currency, reference and reason)
+   * gets the original back. The same key with anything else, or from anyone
+   * else, is refused, without a word about the payment it belongs to.
+   * Whatever the company's rule is now: a key that was held is never sent again.
+   */
+  async replay(actor: Actor, input: Parameters<typeof requestHashOf>[0], idempotencyKey: string, source: string): Promise<Payment | null> {
+    const record = await this.deps.stores.payments.findByKey(actor.company.id, idempotencyKey);
+    if (!record) return null;
+    if (record.createdBy !== actor.user.id || record.requestHash !== requestHashOf(input)) throw new ApiError('validation', { fields: ['idempotencyKey'] });
+    // Recorded with what the payment IS, not with what was sent this time (they are the same, by the check above).
+    await this.deps.stores.audit.append(this.entry('client.payment.create', 'success', partyOf(actor.user), source, record, actor.company, { held: 'yes', replay: 'yes', status: record.status }));
+    return (await this.viewer(actor)).one(record);
+  }
+
+  /** Holds a new payment. `replay` has already found that this key holds none. */
+  async create(actor: Actor, input: Parameters<typeof requestHashOf>[0], idempotencyKey: string, source: string): Promise<Payment> {
     const { stores, now } = this.deps;
     const policy = approvalsRequiredOf(actor.company);
     if (policy === 0) throw new Error('This company does not hold payments for approval.');
-    let record = await stores.payments.findByKey(actor.company.id, idempotencyKey);
-    if (!record) {
-      const payees = await this.deps.withProvider(actor.company, (provider) => provider.listBeneficiaries());
-      const payee = payees.items.find((item) => item.id === input.beneficiaryId);
-      if (!payee) throw new ApiError('validation', { fields: ['beneficiaryId'] });
-      if (payee.currency !== input.currency) throw new ApiError('validation', { fields: ['currency'] });
-      const at = now();
-      ({ record } = await stores.payments.create({
+    // The key may have been used BEFORE the company had a rule, and gone straight to the provider then. That payment is the answer.
+    const direct = await this.deps.withProvider(actor.company, (provider) => provider.findPaymentByIdempotencyKey(idempotencyKey));
+    if (direct) {
+      // Returned only for the same request. (Who made it was not recorded here: it was never held. Every member of
+      // the company can see that payment in any case.)
+      const same = new Big(direct.amount).eq(input.amount) && direct.currency === input.currency && direct.beneficiaryId === input.beneficiaryId && direct.reference === input.reference;
+      if (!same) throw new ApiError('validation', { fields: ['idempotencyKey'] });
+      return direct;
+    }
+    const payees = await this.deps.withProvider(actor.company, (provider) => provider.listBeneficiaries());
+    const payee = payees.items.find((item) => item.id === input.beneficiaryId);
+    if (!payee) throw new ApiError('validation', { fields: ['beneficiaryId'] });
+    if (payee.currency !== input.currency) throw new ApiError('validation', { fields: ['currency'] });
+    const payeeDigest = await this.digest(actor.company, payee.id);
+    if (payeeDigest === null) throw new ApiError('validation', { fields: ['beneficiaryId'] });
+    const at = now();
+    const { record, created } = await stores.payments.create(
+      {
         id: `hp_${randomToken().slice(0, 20)}`,
         companyId: actor.company.id,
         idempotencyKey,
@@ -216,6 +256,8 @@ export class HeldPayments {
         reference: input.reference,
         reason: input.reason,
         payee,
+        payeeDigest,
+        requestHash: requestHashOf(input),
         approvalsRequired: policy,
         approvals: [],
         status: 'awaiting_approval',
@@ -223,18 +265,34 @@ export class HeldPayments {
         closedBy: null,
         note: null,
         sendKey: null,
+        sendMapping: null,
         providerPaymentId: null,
-      }));
+      },
+      (stored) => this.entry('client.payment.create', 'success', partyOf(actor.user), source, stored, actor.company, { key: sha256(idempotencyKey).slice(0, 16), held: 'yes', approvalsRequired: String(policy), status: 'awaiting_approval' }),
+    );
+    // Two of the same request at the same moment: the second finds the first's payment, and is held to the same rule as any replay.
+    if (!created) {
+      const again = await this.replay(actor, input, idempotencyKey, source);
+      if (again) return again;
     }
     return (await this.viewer(actor)).one(record);
   }
 
   // --- Deciding --------------------------------------------------------------------------------
 
-  private close(id: string, status: 'rejected' | 'cancelled' | 'expired' | 'payee_changed', closedBy: string | null, note: string | null): Promise<HeldPaymentRecord | null> {
+  /** Closes a payment that is still waiting, and records it, in one transaction. One that is being sent, or was, is past stopping. */
+  private async close(id: string, status: 'rejected' | 'cancelled' | 'expired' | 'payee_changed', closedBy: string | null, note: string | null, audit: (stored: HeldPaymentRecord, company: CompanyRecord | null) => AuditInput): Promise<HeldPaymentRecord | null> {
     const at = this.deps.now();
-    // Only a payment that is still waiting can be closed: one that is being sent, or was, is past stopping.
-    return this.deps.stores.payments.update(id, [], (current) => (current.status === 'awaiting_approval' ? { ...current, status, statusAt: at, closedBy, note } : null));
+    let company: CompanyRecord | null = null;
+    return this.deps.stores.payments.update(
+      id,
+      [],
+      (current, context) => {
+        company = context.company;
+        return current.status === 'awaiting_approval' ? { ...current, status, statusAt: at, closedBy, note } : null;
+      },
+      (stored) => audit(stored, company),
+    );
   }
 
   /** Expires what has waited too long. Returns how many. */
@@ -243,10 +301,8 @@ export class HeldPayments {
     let expired = 0;
     for (const record of await this.deps.stores.payments.list({ companyId, status: 'awaiting_approval' })) {
       if (record.expiresAt > at) continue;
-      const closed = await this.close(record.id, 'expired', null, null);
-      if (!closed) continue;
-      expired += 1;
-      await this.audit('system.payment.expire', 'success', SYSTEM, '', closed, { createdAt: new Date(closed.createdAt).toISOString() });
+      const closed = await this.close(record.id, 'expired', null, null, (stored, company) => this.entry('system.payment.expire', 'success', SYSTEM, '', stored, company, { createdAt: new Date(stored.createdAt).toISOString() }));
+      if (closed) expired += 1;
     }
     return expired;
   }
@@ -269,120 +325,177 @@ export class HeldPayments {
     const record = await this.forDecision(actor, id);
     const mine = record.approvals.some((item) => item.userId === actor.user.id);
     // Asking again after one's own final approval reports where the payment has got to; it approves nothing.
-    if (mine && (record.status === 'sending' || record.status === 'sent' || record.status === 'failed')) return this.resultOf(record);
+    if (mine && (record.status === 'sending' || record.status === 'sent' || record.status === 'failed')) return this.resultOf(record, actor.company);
     if (record.status === 'expired') throw new ApiError('validation', { reason: 'payment_expired' });
     if (record.status !== 'awaiting_approval') throw new ApiError('validation', { reason: 'not_awaiting_approval' });
     if (record.createdBy === actor.user.id) throw new ApiError('forbidden', { reason: 'creator_cannot_approve' });
     if (mine) throw new ApiError('forbidden', { reason: 'already_approved' });
 
-    if (record.approvals.length + 1 >= record.approvalsRequired) {
-      // This would be the last approval: what the provider knows is checked now, immediately before the state change.
-      const payees = await this.deps.withProvider(actor.company, (provider) => provider.listBeneficiaries());
-      const payee = payees.items.find((item) => item.id === record.payee.id);
-      if (!payee || payeeSignature(payee) !== payeeSignature(record.payee)) {
-        const closed = await this.close(record.id, 'payee_changed', null, payee ? 'payee details changed' : 'payee removed');
-        if (closed) await this.audit('system.payment.blocked', 'success', SYSTEM, source, closed, { reason: payee ? 'payee_changed' : 'payee_removed' });
-        throw new ApiError('validation', { reason: 'payee_changed' });
-      }
-      const balances = await this.deps.withProvider(actor.company, (provider) => provider.listBalances());
-      const available = balances.find((item) => item.currency === record.currency)?.amount ?? '0';
-      if (new Big(available).lt(record.amount)) throw new ApiError('insufficient_funds');
+    // EVERY approval checks the provider itself, before it is recorded: whether it turns out to be the last one is
+    // only known inside the transaction below (another approval may land at the same moment), and a payment must
+    // never be sent on the strength of a check that nobody ran.
+    const checkedAgainst = mappingOf(actor.company);
+    const digest = await this.digest(actor.company, record.payee.id);
+    if (digest !== record.payeeDigest) {
+      const reason = digest === null ? 'payee_removed' : 'payee_changed';
+      await this.close(record.id, 'payee_changed', null, digest === null ? 'payee removed' : 'payee details changed', (stored, company) => this.entry('system.payment.blocked', 'success', SYSTEM, source, stored, company, { reason }));
+      throw new ApiError('validation', { reason: 'payee_changed' });
     }
+    const balances = await this.deps.withProvider(actor.company, (provider) => provider.listBalances());
+    const funded = !new Big(balances.find((item) => item.currency === record.currency)?.amount ?? '0').lt(record.amount);
 
-    // ONE transaction: the payment, the creator and the approver are read, checked and the new state written.
+    // ONE transaction: the payment, its company, the creator, the approver and every earlier approver are read,
+    // checked, and the new state written together with its audit entries.
     let refusal: ApiError | null = null;
     const refuse = (error: ApiError): null => ((refusal = error), null);
     const at = now();
-    const saved = await stores.payments.update(record.id, [record.createdBy, actor.user.id], (current, people: HeldPaymentPeople) => {
-      if (current.status !== 'awaiting_approval') return refuse(new ApiError('validation', { reason: 'not_awaiting_approval' }));
-      if (current.expiresAt <= at) return refuse(new ApiError('validation', { reason: 'payment_expired' }));
-      if (current.createdBy === actor.user.id) return refuse(new ApiError('forbidden', { reason: 'creator_cannot_approve' }));
-      if (current.approvals.some((item) => item.userId === actor.user.id)) return refuse(new ApiError('forbidden', { reason: 'already_approved' }));
-      const approver = people.get(actor.user.id);
-      if (!approver || !usable(approver.user) || !approver.role || !CAN_APPROVE.includes(approver.role)) return refuse(new ApiError('forbidden'));
-      const creator = people.get(current.createdBy);
-      if (!creator || !usable(creator.user) || !creator.role || !CAN_CREATE.includes(creator.role)) return refuse(new ApiError('validation', { reason: 'creator_unavailable' }));
-      const approvals = [...current.approvals, { userId: actor.user.id, at }];
-      if (approvals.length < current.approvalsRequired) return { ...current, approvals };
-      // The last one. From here the payment can only be sent, under this key and no other.
-      return { ...current, approvals, status: 'sending', statusAt: at, sendKey: `gc-${sha256(`held-payment:${current.id}`).slice(0, 40)}` };
-    });
+    let company: CompanyRecord | null = null;
+    let dropped: NonNullable<HeldPaymentRecord['droppedApprovals']> = [];
+    let required = record.approvalsRequired as number;
+    const saved = await stores.payments.update(
+      record.id,
+      (current) => [current.createdBy, actor.user.id, ...current.approvals.map((item) => item.userId)],
+      (current, context: HeldPaymentPeople) => {
+        company = context.company;
+        if (current.status !== 'awaiting_approval') return refuse(new ApiError('validation', { reason: 'not_awaiting_approval' }));
+        if (current.expiresAt <= at) return refuse(new ApiError('validation', { reason: 'payment_expired' }));
+        if (current.createdBy === actor.user.id) return refuse(new ApiError('forbidden', { reason: 'creator_cannot_approve' }));
+        if (current.approvals.some((item) => item.userId === actor.user.id)) return refuse(new ApiError('forbidden', { reason: 'already_approved' }));
+        // The checks above were made against a payee digest and a provider account. Both must still be what is committed.
+        if (!context.company || context.company.deactivatedAt || !sameMapping(mappingOf(context.company), checkedAgainst) || current.payeeDigest !== record.payeeDigest) return refuse(new ApiError('validation', { reason: 'not_awaiting_approval' }));
+        const approver = context.get(actor.user.id);
+        if (!approver || !usable(approver.user) || !approver.role || !CAN_APPROVE.includes(approver.role)) return refuse(new ApiError('forbidden'));
+        const creator = context.get(current.createdBy);
+        if (!creator || !usable(creator.user) || !creator.role || !CAN_CREATE.includes(creator.role)) return refuse(new ApiError('validation', { reason: 'creator_unavailable' }));
+        // An earlier approval counts only while the person who gave it could still give it.
+        dropped = [];
+        const kept = current.approvals.filter((item) => {
+          const person = context.get(item.userId);
+          const reason = !person ? 'account removed' : !usable(person.user) ? 'account disabled' : !person.role ? 'removed from the company' : !CAN_APPROVE.includes(person.role) ? 'no longer an approver' : null;
+          if (reason) dropped.push({ ...item, droppedAt: at, reason });
+          return reason === null;
+        });
+        const approvals = [...kept, { userId: actor.user.id, at }];
+        required = requiredNow(current, context.company);
+        const next = { ...current, approvals, droppedApprovals: [...(current.droppedApprovals ?? []), ...dropped] };
+        if (approvals.length < required) return next;
+        // The last one. It moves to `sending` only because THIS request found the money there.
+        if (!funded) return refuse(new ApiError('insufficient_funds'));
+        // From here the payment can only be sent: under this key and no other, to this provider account and no other.
+        return { ...next, status: 'sending', statusAt: at, sendKey: `gc-${sha256(`held-payment:${current.id}`).slice(0, 40)}`, sendMapping: mappingOf(context.company) };
+      },
+      (stored) => [
+        ...dropped.map((item) => this.entry('system.payment.approval_dropped', 'success', SYSTEM, source, stored, company, { approver: item.userId, reason: item.reason })),
+        this.entry('client.payment.approve', 'success', partyOf(actor.user), source, stored, company, { approvals: `${stored.approvals.length} of ${required}`, approvalsRemaining: String(Math.max(0, required - stored.approvals.length)), status: STATUS[stored.status] }),
+        ...(stored.status === 'sending' ? [this.entry('client.payment.send', 'success', partyOf(actor.user), source, stored, company, { key: sha256(stored.sendKey as string).slice(0, 16) })] : []),
+      ],
+    );
     if (!saved) {
       if ((refusal as ApiError | null)?.options.reason === 'payment_expired') await this.expireDue(actor.company.id);
       throw refusal ?? new ApiError('not_found');
     }
-    if (saved.status !== 'sending') return this.resultOf(saved);
-    await this.audit('client.payment.send', 'success', partyOf(actor.user), source, saved, { key: sha256(saved.sendKey as string).slice(0, 16) });
-    return this.resultOf(await this.send(saved, source));
+    if (saved.status !== 'sending') return { status: 'awaiting_approval', approvalsRemaining: Math.max(1, required - saved.approvals.length) };
+    return this.resultOf(await this.send(saved, source), company);
   }
 
-  private resultOf(record: HeldPaymentRecord): ApprovalResult {
-    const remaining = Math.max(0, record.approvalsRequired - record.approvals.length);
-    // `unknown`: approved, and the provider has been asked, but its answer has not been seen yet.
-    return { status: record.status === 'sending' ? 'unknown' : STATUS[record.status], approvalsRemaining: remaining };
+  private resultOf(record: HeldPaymentRecord, company: CompanyRecord | null): ApprovalResult {
+    const remaining = record.status === 'awaiting_approval' ? Math.max(1, requiredNow(record, company) - record.approvals.length) : 0;
+    // `unknown`: approved, and the provider has been asked, but its answer has not been seen yet (or does not match).
+    return { status: record.status === 'sending' || record.mismatch ? 'unknown' : STATUS[record.status], approvalsRemaining: remaining };
   }
 
-  async reject(actor: Actor, id: string, note: string | null): Promise<void> {
+  async reject(actor: Actor, id: string, note: string | null, source: string): Promise<void> {
     const record = await this.forDecision(actor, id);
     if (record.status === 'expired') throw new ApiError('validation', { reason: 'payment_expired' });
-    if (record.status !== 'awaiting_approval' || !(await this.close(record.id, 'rejected', actor.user.id, note))) throw new ApiError('validation', { reason: 'not_awaiting_approval' });
+    const closed = record.status === 'awaiting_approval' && (await this.close(record.id, 'rejected', actor.user.id, note, (stored, company) => this.entry('client.payment.reject', 'success', partyOf(actor.user), source, stored, company, note ? { note } : {})));
+    if (!closed) throw new ApiError('validation', { reason: 'not_awaiting_approval' });
   }
 
-  async cancel(actor: Actor, id: string): Promise<void> {
+  async cancel(actor: Actor, id: string, source: string): Promise<void> {
     const record = await this.forDecision(actor, id);
     // Its creator, or an administrator of the company. Nobody else.
     if (record.createdBy !== actor.user.id && actor.role !== 'admin') throw new ApiError('forbidden');
     if (record.status === 'expired') throw new ApiError('validation', { reason: 'payment_expired' });
-    if (record.status !== 'awaiting_approval' || !(await this.close(record.id, 'cancelled', actor.user.id, null))) throw new ApiError('validation', { reason: 'not_awaiting_approval' });
+    const closed = record.status === 'awaiting_approval' && (await this.close(record.id, 'cancelled', actor.user.id, null, (stored, company) => this.entry('client.payment.cancel', 'success', partyOf(actor.user), source, stored, company)));
+    if (!closed) throw new ApiError('validation', { reason: 'not_awaiting_approval' });
   }
 
   // --- Sending ---------------------------------------------------------------------------------
 
-  private async finish(record: HeldPaymentRecord, status: 'sent' | 'failed', source: string, providerPaymentId: string | null, note: string | null): Promise<HeldPaymentRecord> {
-    const at = this.deps.now();
-    const saved = await this.deps.stores.payments.update(record.id, [], (current) => (current.status === 'sending' ? { ...current, status, statusAt: at, providerPaymentId, note } : null));
-    if (!saved) return (await this.deps.stores.payments.get(record.id)) ?? record;
-    await this.audit('system.payment.send_outcome', status === 'sent' ? 'success' : 'failure', SYSTEM, source, saved, { outcome: status, ...(note ? { reason: note } : {}) });
-    return saved;
+  /** The provider account a payment in `sending` belongs to: the one fixed when it was approved, wherever the company points now. */
+  private async sendTarget(record: HeldPaymentRecord): Promise<CompanyRecord | null> {
+    const company = await this.deps.stores.directory.getCompany(record.companyId);
+    return company ? { ...company, ...(record.sendMapping ?? {}) } : null;
   }
 
-  /** Asks the provider to make a payment that is in `sending`, under its one key. */
+  /** What differs between what the provider says it made and what was approved, or null. */
+  private mismatchOf(record: HeldPaymentRecord, made: Payment): string | null {
+    const wrong = [
+      !new Big(made.amount).eq(record.amount) && `amount ${made.amount} instead of ${record.amount}`,
+      made.currency !== record.currency && `currency ${made.currency} instead of ${record.currency}`,
+      made.beneficiaryId !== record.payee.id && 'a different payee',
+    ].filter(Boolean);
+    return wrong.length > 0 ? wrong.join('; ') : null;
+  }
+
+  private async finish(record: HeldPaymentRecord, status: 'sent' | 'failed', source: string, made: Payment | null, note: string | null): Promise<HeldPaymentRecord> {
+    const at = this.deps.now();
+    const mismatch = made ? this.mismatchOf(record, made) : null;
+    let company: CompanyRecord | null = null;
+    const saved = await this.deps.stores.payments.update(
+      record.id,
+      [],
+      (current, context) => {
+        company = context.company;
+        return current.status === 'sending' ? { ...current, status, statusAt: at, providerPaymentId: made?.id ?? null, note, mismatch } : null;
+      },
+      (stored) => [
+        this.entry('system.payment.send_outcome', status === 'sent' ? 'success' : 'failure', SYSTEM, source, stored, company, { outcome: status, ...(note ? { reason: note } : {}) }),
+        // The provider made something other than what was approved. Nothing can undo that from here; it must be seen.
+        ...(mismatch ? [this.entry('system.payment.send_mismatch', 'failure', SYSTEM, source, stored, company, { mismatch, providerPayment: made?.id ?? '' })] : []),
+      ],
+    );
+    return saved ?? (await this.deps.stores.payments.get(record.id)) ?? record;
+  }
+
+  /** Asks the provider to make a payment that is in `sending`, under its one key, on the account fixed at approval. */
   private async send(record: HeldPaymentRecord, source: string): Promise<HeldPaymentRecord> {
-    const company = await this.deps.stores.directory.getCompany(record.companyId);
+    const target = await this.sendTarget(record);
     const sendKey = record.sendKey;
-    if (!company || !sendKey || record.status !== 'sending') return record;
+    if (!target || !sendKey || record.status !== 'sending') return record;
     await this.deps.beforeSend?.(record);
     try {
-      const payment = await this.deps.withProvider(company, (provider) =>
+      const payment = await this.deps.withProvider(target, (provider) =>
         provider.createPayment({ beneficiaryId: record.payee.id, amount: record.amount, currency: record.currency as Payment['currency'], reference: record.reference, reason: record.reason, idempotencyKey: sendKey }),
       );
-      return await this.finish(record, 'sent', source, payment.id, null);
+      return await this.finish(record, 'sent', source, payment, null);
     } catch (error) {
       // A plain refusal (not enough money, details not accepted) is final: the provider did not make the payment.
       if (isProviderError(error) && ['validation', 'insufficient_funds', 'forbidden', 'not_found'].includes(error.kind)) return this.finish(record, 'failed', source, null, error.kind);
       // Anything else (no answer, an unreadable one, a busy or signed-out provider): we do not know. It stays `sending`.
-      await this.audit('system.payment.send_outcome', 'failure', SYSTEM, source, record, { outcome: 'unknown', reason: isProviderError(error) ? error.kind : 'error' });
+      await this.deps.stores.audit.append(this.entry('system.payment.send_outcome', 'failure', SYSTEM, source, record, target, { outcome: 'unknown', reason: isProviderError(error) ? error.kind : 'error' }));
       return record;
     }
   }
 
-  /** Settles a payment in `sending`: if the provider has it under its key, it was sent; if not, it is asked again with the SAME key. */
+  /** Settles a payment in `sending`: if the provider has it under its key, it was sent; if not, it is asked again with the SAME key, on the SAME account. */
   async settle(record: HeldPaymentRecord, source: string): Promise<HeldPaymentRecord> {
-    const company = await this.deps.stores.directory.getCompany(record.companyId);
+    const target = await this.sendTarget(record);
     const sendKey = record.sendKey;
-    if (!company || !sendKey || record.status !== 'sending') return record;
+    if (!target || !sendKey || record.status !== 'sending') return record;
     let found: Payment | null;
     try {
-      found = await this.deps.withProvider(company, (provider) => provider.findPaymentByIdempotencyKey(sendKey));
+      found = await this.deps.withProvider(target, (provider) => provider.findPaymentByIdempotencyKey(sendKey));
     } catch {
       return record; // Could not ask. It stays as it is and will be looked at again.
     }
-    return found ? this.finish(record, 'sent', source, found.id, null) : this.send(record, source);
+    return found ? this.finish(record, 'sent', source, found, null) : this.send(record, source);
   }
 
   /**
    * Run at start-up and periodically: expires what has waited too long, and
-   * settles every unfinished send. At start-up nothing is in flight, so every
+   * settles every unfinished send. At start-up nothing is in flight (this is
+   * the only server process on the database: it holds the lock), so every
    * `sending` payment is settled at once (`all`).
    */
   async sweep(options: { all?: boolean } = {}): Promise<{ expired: number; settled: number }> {

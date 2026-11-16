@@ -43,6 +43,8 @@ const ISSUER = 'Global Connect';
 const RECOVERY_CODE_COUNT = 10;
 const MAX_CHALLENGE_ATTEMPTS = 5;
 
+/** How often, at most, a session's "last seen" time is written. */
+export const SEEN_WRITE_MS = 60_000;
 export const partyOf = (user: UserRecord): AuditParty => ({ type: 'client', id: user.id, label: user.email });
 /** The neutral reason of a refusal, for the audit log. Never the submitted value. */
 export const reasonOf = (error: unknown): string => (error instanceof ApiError ? (error.options.reason ?? error.kind) : 'error');
@@ -340,6 +342,9 @@ export class AuthService {
       await this.revoke(tokenHash, found.id);
       throw new ApiError('unauthorized');
     }
+    // "Last seen" is written at most once a minute per session, not on every request: each write is flushed to disk.
+    // (So a session can end up to a minute EARLY after its last request, never late.)
+    if (now - found.lastSeenAt < SEEN_WRITE_MS) return this.contextFor(tokenHash, found, user);
     // Only an existing session is touched: one revoked a moment ago is not written back.
     const session = await this.stores.auth.sessions.mutate(tokenHash, (current) => (current ? { ...current, lastSeenAt: now } : undefined));
     if (!session) throw new ApiError('unauthorized');

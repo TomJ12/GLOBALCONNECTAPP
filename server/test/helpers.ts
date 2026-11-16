@@ -107,7 +107,7 @@ function withLatency<T extends object>(target: T, hook?: (operation: string) => 
 }
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory(), options: HarnessOptions = {}): Promise<Harness> {
-  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, ...overrides };
+  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, ...overrides };
   const clock = options.clock ?? {
     now: Date.UTC(2026, 10, 11, 10, 0, 0),
     advance(ms: number) {
@@ -136,9 +136,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
   const built = await buildApp({ config, stores, registry, mailer: outbox, now, logStream: { write: (line) => void logs.push(line) }, maxRateWindows: options.maxRateWindows, maxHeldQuotes: options.maxHeldQuotes, beforeSend: options.beforeSend });
   const { app, auth, opsAuth, opsRoutes, held } = built;
   const policy: Harness['policy'] = async (companyId, approvalsRequired) => {
-    const company = await stores.directory.getCompany(companyId);
-    if (!company) throw new Error(`no company ${companyId}`);
-    await stores.directory.saveCompany({ ...company, approvalsRequired });
+    if (!(await stores.directory.updateCompany(companyId, (company) => ({ ...company, approvalsRequired })))) throw new Error(`no company ${companyId}`);
   };
   const admin = built.admin as NonNullable<typeof built.admin>;
   const mailedCode = (email: string): string => {

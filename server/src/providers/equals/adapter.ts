@@ -7,9 +7,10 @@
  * capabilities say so and the matching methods refuse.
  */
 import { Big } from 'big.js';
-import type { z } from 'zod';
+import { z } from 'zod';
 
 import { ProviderError } from '@/api/errors';
+import { payeeDigestSource } from '@/api/payeeDigest';
 import type {
   AccountDetails,
   ApprovalResult,
@@ -362,6 +363,24 @@ export class EqualsAdapter implements ProviderAdapter {
   async listBeneficiaries(): Promise<ListResult<Beneficiary>> {
     const rows = await this.all(rawRecipients, '/v2/recipients');
     return { items: rows.items.filter((row) => row.status === 'AUTHORISED').map(mapRecipient), truncated: rows.truncated };
+  }
+
+  /**
+   * Everything the provider holds about one recipient, unfiltered (no schema
+   * drops a field here) and normalised for comparison. Only `createdAt` and
+   * `updatedAt` are left out. A recipient that is no longer authorised is as
+   * good as gone.
+   */
+  async beneficiaryDigestSource(beneficiaryId: string): Promise<string | null> {
+    const whole = z.object({ count: z.number(), rows: z.array(z.record(z.string(), z.unknown())) });
+    const rows = await this.all(whole, '/v2/recipients');
+    const row = rows.items.find((item) => item.id === beneficiaryId);
+    if (!row) {
+      // Not finding it in a list that was cut short proves nothing either way: refuse rather than guess.
+      if (rows.truncated) throw new ProviderError('server', { detail: 'recipient list too long to verify a payee' });
+      return null;
+    }
+    return row.status === 'AUTHORISED' ? payeeDigestSource(row, ['createdAt', 'updatedAt']) : null;
   }
 
   /** Two calls, as documented: validate the details, then confirm the recipient so it can be paid. */

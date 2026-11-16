@@ -12,6 +12,10 @@ const { app, admin, auth, opsAuth, held } = await buildApp({ config, stores, reg
 // still unanswered is looked at again.
 const settle = (all: boolean) => held.sweep({ all }).catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'payment sweep failed'));
 await settle(true);
+// Requests that were approved in the ops console and then interrupted while being carried out are not guessed at:
+// they are shown on the Approvals page to be finished or closed. Said here too, so it is not missed.
+const interrupted = await stores.ops.approvals.count({ status: 'applying' });
+if (interrupted > 0) console.error(`${interrupted} approved ${interrupted === 1 ? 'request was' : 'requests were'} interrupted while being carried out. Open the ops console, Approvals, to finish or close ${interrupted === 1 ? 'it' : 'them'}.`);
 setInterval(() => void settle(false), 60_000).unref();
 
 await app.listen({ port: config.port, host: config.host });

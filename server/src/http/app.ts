@@ -347,6 +347,8 @@ export async function buildApp(deps: AppDeps) {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       byAccount(`user:${context.user.id}`, config.writeRequestsPerMinute);
       byAccount(`session:${context.session.id}`, config.writeRequestsPerMinute);
+    } else {
+      byAccount(`read:${context.session.id}`, config.readRequestsPerMinute);
     }
     return context;
   };
@@ -530,11 +532,13 @@ export async function buildApp(deps: AppDeps) {
        * who, for which company, what (amount, currency, payee id) and a hash of
        * the idempotency key. Never a token or a code.
        */
-      const audited = async <T>(request: FastifyRequest, context: CompanyContext, action: StepUpAction, detail: Record<string, string>, run: () => Promise<T>, after: (result: T) => Record<string, string> = () => ({})): Promise<T> => {
+      const audited = async <T>(request: FastifyRequest, context: CompanyContext, action: StepUpAction, detail: Record<string, string>, run: () => Promise<T>, after: (result: T) => Record<string, string> | null = () => ({})): Promise<T> => {
         const target = { type: 'company' as const, id: context.company.id, label: context.company.name };
         try {
           const result = await run();
-          await auth.record(`client.${action}`, 'success', partyOf(context.user), request.ip, { ...detail, ...after(result) }, target);
+          // null: the success was already recorded, in the same transaction as the change itself (held payments).
+          const more = after(result);
+          if (more !== null) await auth.record(`client.${action}`, 'success', partyOf(context.user), request.ip, { ...detail, ...more }, target);
           return result;
         } catch (error) {
           const reason = error instanceof ApiError ? reasonOf(error) : isProviderError(error) ? (error.reason ?? error.kind) : 'error';
@@ -642,12 +646,18 @@ export async function buildApp(deps: AppDeps) {
           async () => {
             assertAmount(input.amount, input.currency);
             await authorize(request, context, 'payment.create', { ...(request.body as object), idempotencyKey });
+            // A key that already made a held payment here is answered from that payment, whatever the company's rule is
+            // now: it is never sent a second time by another route. (The same key with a different body is refused.)
+            const again = await held.replay(context, input, idempotencyKey, request.ip);
+            if (again) return again;
             await assertOwnPayee(context, input.beneficiaryId);
             // With an approval policy the payment is HELD here: nothing is sent to the provider until it is approved.
-            if (held.holds(context.company)) return held.create(context, input, idempotencyKey);
+            // (If this key went straight to the provider before the company had a rule, that payment is returned.)
+            if (held.holds(context.company)) return held.create(context, input, idempotencyKey, request.ip);
             return withProvider(context, (provider) => provider.createPayment({ ...input, idempotencyKey }));
           },
-          (payment) => ({ payment: payment.id, status: payment.status, ...(payment.held ? { held: 'yes', approvalsRequired: String(payment.held.approvalsRequired) } : {}) }),
+          // A held payment's creation is recorded with the payment itself; here, what the provider made is recorded as it is.
+          (payment) => (payment.held ? null : { payment: payment.id, status: payment.status, amount: payment.amount, currency: payment.currency, payee: payment.beneficiaryId }),
         );
       });
       api.get('/payments/by-key/:key', async (request) => {
@@ -682,18 +692,21 @@ export async function buildApp(deps: AppDeps) {
             async () => {
               await authorize(request, context, action, { paymentId });
               if (action === 'payment.approve') return held.approve(context, paymentId, request.ip);
-              if (action === 'payment.reject') await held.reject(context, paymentId, note);
-              else await held.cancel(context, paymentId);
+              if (action === 'payment.reject') await held.reject(context, paymentId, note, request.ip);
+              else await held.cancel(context, paymentId, request.ip);
               return { ok: true };
             },
-            (result): Record<string, string> => ('approvalsRemaining' in result ? { approvalsRemaining: String(result.approvalsRemaining), status: result.status } : {}),
+            // Recorded by the service, in the same transaction as the decision. (A repeated "approve" that only reports
+            // where the payment has got to changes nothing and is not an approval.)
+            () => null,
           );
         }
         // Not held here: a payment that was already pending at the provider. It can be approved or rejected there, not cancelled.
         const provider = await providerOf(context);
         if (action === 'payment.cancel') throw new ApiError('not_found');
         if (!provider.capabilities.paymentApprovals) throw new ApiError('validation', { reason: 'not_supported' });
-        return audited(request, context, action, { payment: paymentId }, async () => {
+        // The provider's own approval: who created it there is not known to this server (see README), but who acts here is.
+        return audited(request, context, action, { payment: paymentId, external: 'yes' }, async () => {
           await authorize(request, context, action, { paymentId });
           await assertOwnPendingPayment(context, paymentId);
           if (action === 'payment.approve') return withProvider(context, () => provider.approvePayment(paymentId));

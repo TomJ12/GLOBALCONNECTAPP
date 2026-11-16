@@ -15,7 +15,7 @@
  * starts it with APP_ENV=development, which is the explicit opt-in.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -41,16 +41,29 @@ if (major < 22 || (major === 22 && minor < 13)) {
 
 // LOCAL DEMO ONLY: everything is kept in this git-ignored SQLite database so it survives a restart.
 // Its development encryption key is generated once and kept in a file beside it (<database>.dev-key).
-const database = process.env.DATABASE_PATH ?? path.join(root, '.demo-data', 'globalconnect.sqlite');
+const demoFolder = path.join(root, '.demo-data');
+const database = process.env.DATABASE_PATH ?? path.join(demoFolder, 'globalconnect.sqlite');
 // Earlier versions of this project kept the demo accounts in a JSON file. It is no longer read.
-const oldFile = process.env.DATA_FILE ?? path.join(root, '.demo-data', 'accounts.json');
+const oldFile = process.env.DATA_FILE ?? path.join(demoFolder, 'accounts.json');
 if (process.argv.includes('--reset')) {
-  for (const file of [database, `${database}-wal`, `${database}-shm`, `${database}.dev-key`, oldFile]) rmSync(file, { force: true });
+  // This command deletes files, so it only ever touches the demo folder: never whatever DATABASE_PATH happens to name.
+  const inDemoFolder = (file) => path.dirname(path.resolve(file)) === demoFolder;
+  if (!inDemoFolder(database) || !inDemoFolder(oldFile)) {
+    console.error(`npm run demo:reset only ever deletes the demo database in ${demoFolder}.\nDATABASE_PATH (or DATA_FILE) points somewhere else, and nothing was deleted. Unset it and run the command again, or delete that file yourself if you mean to.`);
+    process.exit(1);
+  }
+  for (const file of [database, `${database}-wal`, `${database}-shm`, `${database}.dev-key`, `${database}.lock`, oldFile]) rmSync(file, { force: true });
   // Audit segments the old JSON store archived beside its file.
-  const folder = path.dirname(oldFile);
-  if (existsSync(folder)) for (const name of readdirSync(folder)) if (name.startsWith(`${path.basename(oldFile)}.audit-`)) rmSync(path.join(folder, name), { force: true });
+  if (existsSync(demoFolder)) for (const name of readdirSync(demoFolder)) if (name.startsWith(`${path.basename(oldFile)}.audit-`)) rmSync(path.join(demoFolder, name), { force: true });
   console.log(`Removed ${database}. The next npm run demo starts with fresh sample accounts.`);
   process.exit(0);
+}
+// The server refuses a database, or a folder, that other users of this machine could read. The demo's own folder
+// and files (made by an earlier version with looser permissions, perhaps) are put right here.
+if (path.dirname(path.resolve(database)) === demoFolder && process.platform !== 'win32') {
+  mkdirSync(demoFolder, { recursive: true, mode: 0o700 });
+  chmodSync(demoFolder, 0o700);
+  for (const name of readdirSync(demoFolder)) if (name.startsWith(path.basename(database))) chmodSync(path.join(demoFolder, name), 0o600);
 }
 
 // Checked BEFORE the web build, which takes a minute: silently starting with fresh accounts

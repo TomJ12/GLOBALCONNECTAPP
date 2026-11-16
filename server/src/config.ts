@@ -86,6 +86,8 @@ export interface Config {
   authRequestsPerNetworkPerMinute: number;
   /** State-changing requests per minute for one signed-in client (per user and per session). Sign-out is exempt. */
   writeRequestsPerMinute: number;
+  /** Reads (GET) a signed-in session may make per minute. Generous: it is a ceiling on scraping and on load, not a throttle on use. */
+  readRequestsPerMinute: number;
 
   providers: ProviderCredentials;
 }
@@ -289,6 +291,7 @@ export function loadConfig(env: Env = process.env): Config {
     authRequestsPerMinute: 30,
     authRequestsPerNetworkPerMinute: 90,
     writeRequestsPerMinute: 60,
+    readRequestsPerMinute: 600,
     providers,
   };
 }

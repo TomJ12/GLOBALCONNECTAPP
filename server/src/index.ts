@@ -6,6 +6,9 @@
  */
 import { nodeVersionProblem } from './nodeVersion';
 
+// Everything this process creates (the database, its write-ahead files, key files) is for this user only.
+process.umask(0o077);
+
 const problem = nodeVersionProblem();
 if (problem) {
   console.error(problem);

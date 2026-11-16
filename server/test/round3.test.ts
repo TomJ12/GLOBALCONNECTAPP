@@ -95,14 +95,28 @@ async function approved(requester: Staff, approver: Staff, url: string, form: Re
 
 // --- demo:reset --------------------------------------------------------------------------------------
 
-test('demo:reset removes the database, its write-ahead files, its development key and any old JSON file', () => {
+test('demo:reset only ever deletes the demo database: a DATABASE_PATH or DATA_FILE that points anywhere else is refused and nothing is deleted', () => {
   const folder = mkdtempSync(path.join(tmpdir(), 'gc-reset-'));
-  const database = path.join(folder, 'globalconnect.sqlite');
+  const script = path.join(serverDir, '..', 'scripts', 'demo.mjs');
   try {
-    for (const name of ['globalconnect.sqlite', 'globalconnect.sqlite-wal', 'globalconnect.sqlite-shm', 'globalconnect.sqlite.dev-key', 'accounts.json', 'accounts.json.audit-0001']) writeFileSync(path.join(folder, name), 'x');
-    const reset = spawnSync(process.execPath, [path.join(serverDir, '..', 'scripts', 'demo.mjs'), '--reset'], { env: { PATH: process.env.PATH ?? '', DATABASE_PATH: database, DATA_FILE: path.join(folder, 'accounts.json') }, encoding: 'utf8' });
-    assert.equal(reset.status, 0);
-    assert.deepEqual(readdirSync(folder), []);
+    const names = ['precious.sqlite', 'precious.sqlite-wal', 'precious.sqlite.dev-key', 'accounts.json'];
+    for (const name of names) writeFileSync(path.join(folder, name), 'x');
+    for (const env of [{ DATABASE_PATH: path.join(folder, 'precious.sqlite') }, { DATA_FILE: path.join(folder, 'accounts.json') }, { DATABASE_PATH: path.join(serverDir, '..', '.demo-data', '..', 'precious.sqlite') }, { DATABASE_PATH: path.join(serverDir, '..', '.demo-data', 'nested', 'x.sqlite') }]) {
+      const reset = spawnSync(process.execPath, [script, '--reset'], { env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8' });
+      assert.equal(reset.status, 1, JSON.stringify(env));
+      assert.match(reset.stderr, /only ever deletes the demo database[^]*nothing was deleted/);
+    }
+    assert.deepEqual(readdirSync(folder).sort(), [...names].sort());
+    // What it does delete: the demo database beside the script's own project folder, with everything that belongs to it.
+    const project = path.join(folder, 'project');
+    const demo = path.join(project, '.demo-data');
+    mkdirSync(path.join(project, 'scripts'), { recursive: true });
+    mkdirSync(demo);
+    writeFileSync(path.join(project, 'scripts', 'demo.mjs'), readFileSync(script));
+    for (const name of ['globalconnect.sqlite', 'globalconnect.sqlite-wal', 'globalconnect.sqlite-shm', 'globalconnect.sqlite.dev-key', 'globalconnect.sqlite.lock', 'accounts.json', 'accounts.json.audit-0001']) writeFileSync(path.join(demo, name), 'x');
+    const reset = spawnSync(process.execPath, [path.join(project, 'scripts', 'demo.mjs'), '--reset'], { env: { PATH: process.env.PATH ?? '' }, encoding: 'utf8' });
+    assert.equal(reset.status, 0, reset.stderr);
+    assert.deepEqual(readdirSync(demo), []);
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }
@@ -607,12 +621,19 @@ test('N9: if the activation email cannot be sent after a reset cleared the crede
     const id = idOf(asked.location);
     const failed = await boss.act(`/ops/approvals/${id}/approve`);
     assert.equal(failed.status, 500, url);
-    // Credentials are gone, nothing was sent, and the request is waiting again rather than stuck or marked done.
+    // Credentials are gone and nothing was sent. The request is neither "done" nor back to "never approved": it is
+    // marked as approved-but-interrupted, shown on the Approvals page, and cannot be approved a second time.
     assert.equal(await read(), null);
     assert.equal(h.outbox.sent.length, url.includes('staff') ? 1 : 0);
-    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'pending');
+    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
+    assert.match((await boss.browser.get('/ops/approvals')).body, /Approved, but not finished/);
+    assert.equal((await boss.act(`/ops/approvals/${id}/approve`)).status, 409);
+    // The requester cannot finish their own request; the approver can, and only what is missing is done.
+    assert.equal((await admin.act(`/ops/approvals/${id}/resume`)).status, 403);
+    assert.equal((await boss.act(`/ops/approvals/${id}/resume`)).status, 500, 'the mail still fails: still interrupted');
+    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
     failing = false;
-    assert.equal((await boss.act(`/ops/approvals/${id}/approve`)).status, 303, `${url} retried`);
+    assert.equal((await boss.act(`/ops/approvals/${id}/resume`)).status, 303, `${url} finished`);
     assert.equal((await h.stores.ops.approvals.get(id))?.status, 'approved');
     assert.equal(h.outbox.sent.length, url.includes('staff') ? 2 : 1);
   }

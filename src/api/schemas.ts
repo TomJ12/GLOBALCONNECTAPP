@@ -203,7 +203,7 @@ export const payment: z.ZodType<Payment> = z.object({
   createdAt: text,
   held: z
     .object({
-      state: z.enum(['awaiting_approval', 'sending', 'rejected', 'cancelled', 'expired', 'payee_changed', 'failed']),
+      state: z.enum(['awaiting_approval', 'sending', 'rejected', 'cancelled', 'expired', 'payee_changed', 'failed', 'mismatch']),
       createdBy: text,
       createdByYou: z.boolean(),
       approvalsRequired: z.number().int().min(1).max(2),

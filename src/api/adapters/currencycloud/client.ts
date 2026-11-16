@@ -3,7 +3,9 @@
  * requests. The same class serves the mock (in-memory transport) and, later, a
  * real HTTP transport. Every response is validated with zod before mapping.
  */
-import type { z } from 'zod';
+import { z } from 'zod';
+
+import { payeeDigestSource } from '../../payeeDigest';
 
 import { ProviderError } from '../../errors';
 import type { ProviderClient } from '../../provider';
@@ -323,6 +325,21 @@ export class CurrencycloudClient implements ProviderClient {
     const at = this.now();
     for (const payee of items) this.payeeCache.set(payee.id, { at, payee });
     return { items, truncated: rows.truncated };
+  }
+
+  /**
+   * Everything the provider holds about one payee, read fresh and unfiltered
+   * (no schema drops a field here), normalised for comparison. `created_at`
+   * and `updated_at` are the only fields left out.
+   */
+  async beneficiaryDigestSource(beneficiaryId: string): Promise<string | null> {
+    try {
+      const raw = await this.call(z.record(z.string(), z.unknown()), 'GET', `/v2/beneficiaries/${encodeURIComponent(beneficiaryId)}`);
+      return payeeDigestSource(raw, ['created_at', 'updated_at']);
+    } catch (error) {
+      if (error instanceof ProviderError && error.kind === 'not_found') return null;
+      throw error;
+    }
   }
 
   async createBeneficiary(input: NewBeneficiary): Promise<Beneficiary> {

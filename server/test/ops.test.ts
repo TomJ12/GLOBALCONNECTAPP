@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
 import { assertStaffRemovalAllowed, CONFIRM_TTL_MS, OpsError } from '../src/ops/console';
-import type { OpsRole } from '../src/store/types';
+import { StoreConflict, type OpsRole } from '../src/store/types';
 import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
 
 let h: Harness;
@@ -290,7 +290,8 @@ test('ops: every action needs its confirmation (bound to session, action and pay
   const toCancel = location(await admin.act('/ops/users/usr_dana/memberships', { companyId: 'co_castlebrook', role: 'creator' }));
   assert.ok(toApprove && toReject && toCancel);
 
-  const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate)/.test(route.url));
+  // (Finishing or closing an interrupted request needs one that was interrupted: those two have their own test.)
+  const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate)/.test(route.url) && !/\/(resume|abandon)$/.test(route.url));
   assert.ok(actions.length >= 23, `only ${actions.length} action routes`);
   const urlOf = (route: string) =>
     route.startsWith('/ops/approvals')
@@ -378,7 +379,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
     const reply = await admin.act(urlOf(route.url), formOf(route.url, n));
     assert.equal(reply.status, 303, `${route.url} -> ${reply.status} ${reply.body.slice(-400)}`);
     const entries = await done();
-    assert.equal(entries.length, before + (route.url.endsWith('/approve') ? 2 : 1), route.url);
+    assert.equal(entries.length, before + (route.url.endsWith('/approve') ? 3 : 1), route.url); // approving: the decision, the change itself, and its completion
     assert.equal(entries[0]?.source, '127.0.0.1');
     assert.equal(entries[0]?.detail.confirmed, 'yes', `${route.url}: the entry says it was confirmed`);
     if (!route.url.startsWith('/ops/approvals') && reply.location.startsWith('/ops/approvals/')) {
@@ -992,9 +993,9 @@ test('ops: a company\'s payment approval rule is changed by request, approved on
   const id = idOf(asked.location);
   assert.equal(await rule(), 1);
   const request = await h.stores.ops.approvals.get(id);
-  assert.match(request?.summary ?? '', /Change payment approvals for company “Northfield Trading Ltd” \(co_northfield\) from 1 to 2 required\. .*payments already waiting for approval are NOT affected and keep the rule they were created under/);
+  assert.match(request?.summary ?? '', /Change payment approvals for company “Northfield Trading Ltd” \(co_northfield\) from 1 to 2 required\. A stricter rule applies at once, to payments already waiting for approval as well as to new ones\./);
   assert.match(request?.warnings.join(' ') ?? '', /NOT ENOUGH APPROVERS: with 2 approvals required/);
-  assert.match((await admin.browser.get(`/ops/approvals/${id}`)).body, /NOT affected/);
+  assert.match((await admin.browser.get(`/ops/approvals/${id}`)).body, /A stricter rule applies at once/);
   // Another ops USER cannot approve it, nor can the requester; an ops admin can.
   assert.equal((await pat.act(`/ops/approvals/${id}/approve`)).status, 403);
   assert.equal((await olu.act(`/ops/approvals/${id}/approve`)).status, 403);
@@ -1177,3 +1178,242 @@ test('ops behind the demo gate: sign-in, CSRF and the confirmation flow work unc
 });
 
 void DANA;
+
+// --- Review of fe9d053 -----------------------------------------------------------------------------------
+
+/** A client of Northfield, signed in to the client API. */
+async function client(email: string) {
+  const secret = (await h.activate(email)).secret;
+  const reply = await h.login(email, secret);
+  const token = reply.json.token as string;
+  if (!reply.json.session) assert.equal((await h.call('POST', '/v1/session/company', { token, body: { companyId: 'co_northfield' } })).status, 200);
+  const grant = async (action: string, payload: unknown) => (await h.call('POST', '/v1/step-up', { token, body: { action, payload, code: h.freshCode(secret) } })).json.token as string;
+  return { token, secret, grant };
+}
+const NORTHFIELD = { name: 'Northfield Trading Ltd', provider: 'provider-a', providerAccountId: 'sample-account-0001', providerContactId: 'sample-contact-0001' };
+const MOVED = { ...NORTHFIELD, providerAccountId: 'sample-account-0003', providerContactId: 'sample-contact-0003' };
+
+test('H3: a company edit that is waiting for the provider does not undo a deactivation or a change of approval rule made meanwhile', async () => {
+  h = await harness({ fourEyes: false });
+  const { admin, second } = await pair();
+  const real = h.registry.accountExists.bind(h.registry);
+  // Confirming runs the checks twice: once to describe the action again, once to carry it out. The second is held.
+  let hold = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let waiting!: () => void;
+  const reached = new Promise<void>((resolve) => (waiting = resolve));
+  h.registry.accountExists = async (...args: Parameters<typeof real>) => {
+    if (hold > 0 && (hold -= 1) === 0) {
+      waiting();
+      await gate;
+    }
+    return real(...args);
+  };
+  const page = await admin.browser.post('/ops/companies/co_northfield', MOVED);
+  const token = confirmTokenOf(page.body);
+  assert.ok(token, page.body.slice(-300));
+  // The edit is confirmed and is now asking the provider whether the new account exists...
+  hold = 2;
+  const editing = admin.browser.post('/ops/companies/co_northfield', { ...MOVED, _confirm: token as string, password: OPS_PASSWORD });
+  await reached;
+  // ...and while it waits, a colleague deactivates the company and its approval rule is raised.
+  assert.equal((await second.act('/ops/companies/co_northfield/deactivate')).status, 303);
+  assert.equal((await second.act('/ops/companies/co_northfield/approvals', { approvalsRequired: '2' })).status, 303);
+  const between = await h.stores.directory.getCompany('co_northfield');
+  assert.ok(between?.deactivatedAt);
+  assert.equal(between?.approvalsRequired, 2);
+  release();
+  assert.equal((await editing).status, 303);
+  // Only what the edit is about was written.
+  const after = await h.stores.directory.getCompany('co_northfield');
+  assert.deepEqual([after?.providerAccountId, after?.providerContactId, after?.deactivatedAt, after?.approvalsRequired], ['sample-account-0003', 'sample-contact-0003', between?.deactivatedAt, 2]);
+
+  // The store itself: a change is applied to the row as it is at that moment, and only the columns that differ are written.
+  const directory = h.stores.directory;
+  await Promise.all([
+    directory.updateCompany('co_castlebrook', (current) => ({ ...current, approvalsRequired: 2 })),
+    directory.updateCompany('co_castlebrook', (current) => ({ ...current, deactivatedAt: 5 })),
+    directory.updateCompany('co_castlebrook', (current) => ({ ...current, name: 'Castlebrook Imports (UK) Ltd' })),
+  ]);
+  const castlebrook = await directory.getCompany('co_castlebrook');
+  assert.deepEqual([castlebrook?.approvalsRequired, castlebrook?.deactivatedAt, castlebrook?.name], [2, 5, 'Castlebrook Imports (UK) Ltd']);
+  // Saving a company is for NEW companies only: it can no longer overwrite one that exists.
+  await assert.rejects(async () => directory.saveCompany({ ...(castlebrook as NonNullable<typeof castlebrook>), deactivatedAt: null }));
+  assert.equal((await directory.getCompany('co_castlebrook'))?.deactivatedAt, 5);
+});
+
+test('M3: a company cannot be re-pointed, by request or by approval, while one of its payments is being sent; the request says how many are waiting', async () => {
+  h = await harness();
+  const { admin, second } = await pair();
+  const amira = await client(AMIRA);
+  const dana = await client(DANA);
+  const body = { beneficiaryId: 'sample-beneficiary-harbour', amount: '125.00', currency: 'GBP', reference: 'INV-1', reason: 'Invoice' };
+  const key = 'key-repoint-000001';
+  const created = await h.call('POST', '/v1/payments', { token: amira.token, body, headers: { 'idempotency-key': key, 'x-step-up-token': await amira.grant('payment.create', { ...body, idempotencyKey: key }) } });
+  assert.equal(created.json.status, 'awaiting_approval');
+  const id = created.json.id as string;
+
+  // Asked for while the payment only waits for approval: allowed, and the request says what happens to that payment.
+  const asked = await admin.act('/ops/companies/co_northfield', MOVED);
+  assert.match(asked.location, /^\/ops\/approvals\//);
+  const request = idOf(asked.location);
+  assert.match((await h.stores.ops.approvals.get(request))?.warnings.join(' ') ?? '', /1 payment of this company is waiting for approval\. After the re-point it can no longer be approved/);
+  assert.match((await second.browser.get(asked.location)).body, /1 payment of this company is waiting for approval/);
+
+  // The payment is approved and sent, and the provider's answer is lost: it is "being sent".
+  h.providerA.paymentFault = 'lost_response';
+  const approved = await h.call('POST', `/v1/payments/${id}/approve`, { token: dana.token, headers: { 'x-step-up-token': await dana.grant('payment.approve', { paymentId: id }) } });
+  assert.equal(approved.json.status, 'unknown');
+  assert.equal((await h.stores.payments.get(id))?.status, 'sending');
+  // Approving the re-point now is refused, nothing is changed, nobody is signed out, and the request waits.
+  const refused = await second.act(`/ops/approvals/${request}/approve`);
+  assert.equal(refused.status, 409);
+  assert.match(refused.body, /1 payment of this company is being sent to the provider and the outcome is not known yet/);
+  assert.equal((await h.stores.ops.approvals.get(request))?.status, 'pending');
+  assert.equal((await h.stores.directory.getCompany('co_northfield'))?.providerAccountId, 'sample-account-0001');
+  assert.equal((await h.call('GET', '/v1/balances', { token: amira.token })).status, 200);
+  // A new request is refused outright.
+  assert.equal((await second.act('/ops/companies/co_northfield', { ...MOVED, name: 'Northfield Trading Limited' })).status, 409);
+  assert.equal((await h.stores.ops.approvals.list()).length, 1);
+
+  // Once the send is settled (found at the provider under its key), the same request can be approved.
+  h.clock.advance(31_000);
+  assert.deepEqual(await h.held.sweep(), { expired: 0, settled: 1 });
+  assert.equal((await h.stores.payments.get(id))?.status, 'sent');
+  assert.equal((await second.act(`/ops/approvals/${request}/approve`)).status, 303);
+  assert.equal((await h.stores.directory.getCompany('co_northfield'))?.providerAccountId, 'sample-account-0003');
+});
+
+test('M7: one provider account, one company, and one company per name, are rules of the database: two approvals at the same moment make one company', async () => {
+  h = await harness({}, undefined, { storeLatency: true });
+  const { admin, second } = await pair();
+  const count = async () => (await h.stores.directory.listCompanies()).length;
+  const race = async (first: Record<string, string>, other: Record<string, string>) => {
+    const before = await count();
+    const requests: string[] = [];
+    for (const form of [first, other]) requests.push(idOf((await admin.act('/ops/companies', form)).location));
+    assert.ok(requests.every((id) => id.startsWith('req_')), 'both requests pass the checks while neither company exists');
+    const boss = [second, await staff(`boss${before}@globalconnect.example`, 'ops_admin')];
+    const replies = await Promise.all(requests.map((id, index) => (boss[index] as Staff).act(`/ops/approvals/${id}/approve`)));
+    assert.deepEqual(replies.map((reply) => reply.status).sort(), [303, 409]);
+    assert.equal(await count(), before + 1);
+    // The one that lost is told why in plain words, did nothing, and waits (it can be rejected).
+    const lost = requests[replies.findIndex((reply) => reply.status === 409)] as string;
+    assert.match(replies.find((reply) => reply.status === 409)?.body ?? '', /already (used by|the name of) another company|already/i);
+    assert.equal((await h.stores.ops.approvals.get(lost))?.status, 'pending');
+  };
+  // The same provider account under two names; then the same name (but for case, spacing and width) on two accounts.
+  await race({ name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' }, { name: 'Tideway Holdings Ltd', provider: 'provider-b', providerAccountId: 'S00002' });
+  await race({ name: 'Harbour Mills Ltd', provider: 'provider-b', providerAccountId: 'S00003' }, { name: '  harbour   MILLS ltd', provider: 'provider-a', providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0002' });
+
+  // When the check in code is passed by both (here: it is shown the companies as they were a moment earlier), the
+  // database refuses the second, and staff are told so in plain words, not shown an error page.
+  const late = idOf((await admin.act('/ops/companies', { name: 'Later Ltd', provider: 'provider-a', providerAccountId: 'sample-account-0003', providerContactId: 'sample-contact-0003' })).location);
+  // (Whichever of the two accounts the second race left free.)
+  const free: Record<string, string> = (await h.stores.directory.listCompanies()).some((item) => item.providerAccountId === 'S00003') ? { provider: 'provider-a', providerAccountId: 'sample-account-0002', providerContactId: 'sample-contact-0002' } : { provider: 'provider-b', providerAccountId: 'S00003' };
+  const twin = idOf((await admin.act('/ops/companies', { name: 'late  LTD', ...free })).location);
+  assert.ok(late.startsWith('req_') && twin.startsWith('req_'));
+  const stale = await h.stores.directory.listCompanies();
+  await h.stores.directory.saveCompany({ id: 'co_early', name: 'Early Ltd', providerKey: 'currencycloud', providerAccountId: 'sample-account-0003', providerContactId: 'sample-contact-0003' });
+  await h.stores.directory.saveCompany({ id: 'co_late', name: 'Late Ltd', providerKey: 'equals', providerAccountId: 'S00009', providerContactId: '' });
+  const listCompanies = h.stores.directory.listCompanies.bind(h.stores.directory);
+  h.stores.directory.listCompanies = async () => stale;
+  for (const [id, words] of [[late, /provider account/], [twin, /Another company already has that name/]] as const) {
+    const refused = await second.act(`/ops/approvals/${id}/approve`);
+    assert.equal(refused.status, 409, refused.body.slice(-300));
+    assert.match(refused.body, words);
+    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'pending');
+  }
+  h.stores.directory.listCompanies = listCompanies;
+  assert.equal(await count(), 6);
+
+  // The same rules straight at the store, where no check in code stands in front of them.
+  const directory = h.stores.directory;
+  const fresh = { id: 'co_x', name: 'Xylo Ltd', providerKey: 'equals' as const, providerAccountId: 'S00010', providerContactId: '' };
+  await directory.saveCompany(fresh);
+  await assert.rejects(async () => directory.saveCompany({ ...fresh, id: 'co_y', name: 'Yarrow Ltd' }), (error) => error instanceof StoreConflict && error.what === 'company_account');
+  await assert.rejects(async () => directory.saveCompany({ ...fresh, id: 'co_y', name: 'XYLO  ltd', providerAccountId: 'S00011' }), (error) => error instanceof StoreConflict && error.what === 'company_name');
+  await assert.rejects(async () => directory.updateCompany('co_castlebrook', (current) => ({ ...current, providerAccountId: 'S00010' })), (error) => error instanceof StoreConflict && error.what === 'company_account');
+  await assert.rejects(async () => directory.updateCompany('co_castlebrook', (current) => ({ ...current, name: 'xylo ltd' })), (error) => error instanceof StoreConflict && error.what === 'company_name');
+  assert.equal((await directory.getCompany('co_castlebrook'))?.name, 'Castlebrook Imports Ltd');
+});
+
+test('L3: an approved request that was interrupted is neither "approved" nor forgotten: it is finished once, or closed, and both are on record', async () => {
+  h = await harness();
+  const { admin, second } = await pair();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  // The process dies after the change was made and before the request was recorded as done.
+  const realMutate = h.stores.ops.approvals.mutate.bind(h.stores.ops.approvals);
+  let crash = true;
+  h.stores.ops.approvals.mutate = (async (key: string, change: any, audit: any) =>
+    realMutate(
+      key,
+      (current: any) => {
+        const next = change(current);
+        if (crash && current?.status === 'applying' && next?.status === 'approved') throw new Error('the process stopped here');
+        return next;
+      },
+      audit,
+    )) as typeof realMutate;
+
+  const cases: [string, Record<string, string>, string, () => Promise<number>][] = [
+    ['/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' }, 'ops.company.create', async () => (await h.stores.directory.listCompanies()).filter((item) => item.name === 'Tideway Ltd').length],
+    ['/ops/users', { name: 'Chidi Eze', email: 'chidi@tideway.example', company1: 'co_northfield', role1: 'creator' }, 'ops.client.create', async () => ((await h.stores.directory.findUserByEmail('chidi@tideway.example')) ? 1 : 0)],
+    ['/ops/staff', { name: 'New Colleague', email: 'new@globalconnect.example', role: 'ops' }, 'ops.staff.invite', async () => ((await h.stores.ops.users.findByEmail('new@globalconnect.example')) ? 1 : 0)],
+  ];
+  for (const [url, form, action, made] of cases) {
+    crash = true;
+    const id = idOf((await admin.act(url, form)).location);
+    assert.match(id, /^req_/, url);
+    const mailsBefore = h.outbox.sent.length;
+    assert.equal((await second.act(`/ops/approvals/${id}/approve`)).status, 500, url);
+    // The change was made; the request says so honestly: approved, not finished.
+    assert.equal(await made(), 1, url);
+    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
+    const mails = h.outbox.sent.length - mailsBefore;
+    // The approver's decision is already on record; the change itself is not yet recorded as done.
+    assert.deepEqual((await audit('ops.approval.begin')).filter((entry) => entry.detail.request === id).map((entry) => [entry.actor.label, entry.detail.action, entry.detail.passwordChecked ?? '']), [[second.email, action.slice(4), PASSWORD_APPROVALS.includes(action) ? 'yes' : '']]);
+    assert.equal((await audit(action)).filter((entry) => entry.detail.request === id).length, 0);
+    const list = (await second.browser.get('/ops/approvals')).body;
+    assert.match(list, /Approved, but not finished/);
+    // It cannot be approved, rejected or cancelled as if it were still waiting; the requester and a non-admin cannot finish it.
+    assert.equal((await second.act(`/ops/approvals/${id}/approve`)).status, 409);
+    assert.equal((await second.act(`/ops/approvals/${id}/reject`)).status, 409);
+    assert.equal((await admin.act(`/ops/approvals/${id}/cancel`)).status, 409);
+    assert.equal((await admin.act(`/ops/approvals/${id}/resume`)).status, 403);
+    assert.equal((await olu.act(`/ops/approvals/${id}/resume`)).status, 403);
+    assert.equal((await olu.act(`/ops/approvals/${id}/abandon`)).status, 403);
+    // Finishing it does only what is missing: no second company, person or staff member.
+    crash = false;
+    const page = await second.browser.post(`/ops/approvals/${id}/resume`);
+    assert.match(page.body, /It may be partly done\. Carrying it out again repeats only what is missing/);
+    assert.equal(/name="password"/.test(page.body), PASSWORD_APPROVALS.includes(action), 'the same password re-check as approving it');
+    assert.equal((await second.act(`/ops/approvals/${id}/resume`)).status, 303, url);
+    assert.equal(await made(), 1, url);
+    // (An invitation whose email may or may not have left is sent again, with a new link; the earlier link stops working.)
+    assert.equal(h.outbox.sent.length - mailsBefore, mails + (action === 'ops.staff.invite' ? 1 : 0), url);
+    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'approved');
+    assert.deepEqual((await audit(action)).filter((entry) => entry.detail.request === id).map((entry) => [entry.outcome, entry.detail.approvedBy]), [['success', second.email]]);
+    assert.deepEqual((await audit('ops.approval.approve')).filter((entry) => entry.detail.request === id).map((entry) => entry.detail.resumed), ['yes']);
+    assert.equal((await second.act(`/ops/approvals/${id}/resume`)).status, 409);
+  }
+
+  // Closing one instead: final, on record with who closed it, and it undoes nothing.
+  crash = true;
+  const id = idOf((await admin.act('/ops/companies/co_castlebrook/approvals', { approvalsRequired: '2' })).location);
+  assert.equal((await second.act(`/ops/approvals/${id}/approve`)).status, 500);
+  assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
+  assert.equal((await second.act(`/ops/approvals/${id}/abandon`)).status, 303);
+  assert.equal((await h.stores.ops.approvals.get(id))?.status, 'rejected');
+  assert.equal((await h.stores.directory.getCompany('co_castlebrook'))?.approvalsRequired, 2, 'what was done stays done');
+  assert.deepEqual((await audit('ops.approval.abandon')).filter((entry) => entry.outcome === 'success').map((entry) => [entry.actor.label, entry.detail.request, entry.detail.approvedBy, entry.detail.note]), [[second.email, id, second.email, 'closed while being carried out; it may be partly done']]);
+  assert.equal((await second.act(`/ops/approvals/${id}/resume`)).status, 409);
+  assert.equal((await second.act(`/ops/approvals/${id}/abandon`)).status, 409);
+
+  // A refusal is different from an interruption: when the checks no longer pass, nothing was done and the request simply waits.
+  const taken = idOf((await admin.act('/ops/companies', { name: 'Late Ltd', provider: 'provider-b', providerAccountId: 'S00003' })).location);
+  await h.stores.directory.saveCompany({ id: 'co_first', name: 'First Ltd', providerKey: 'equals', providerAccountId: 'S00003', providerContactId: '' });
+  assert.equal((await second.act(`/ops/approvals/${taken}/approve`)).status, 409);
+  assert.equal((await h.stores.ops.approvals.get(taken))?.status, 'pending');
+});

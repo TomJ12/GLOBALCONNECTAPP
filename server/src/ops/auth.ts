@@ -12,7 +12,7 @@
  * store's atomic operations.
  */
 import type { Config } from '../config';
-import { reasonOf, secondsToNextCode, type Invitation } from '../auth/service';
+import { reasonOf, secondsToNextCode, SEEN_WRITE_MS, type Invitation } from '../auth/service';
 import { isKnownSource, Lockout, withKnownSource } from '../auth/lockout';
 import {
   checkTotp,
@@ -272,6 +272,8 @@ export class OpsAuthService {
       await this.ops.sessions.delete(tokenHash);
       throw new ApiError('unauthorized');
     }
+    // Written at most once a minute per session (see the client service): the session can end up to a minute early, never late.
+    if (now - found.lastSeenAt < SEEN_WRITE_MS) return { session: found, token, user };
     // Only an existing session is touched: one revoked a moment ago is not written back.
     const session = await this.ops.sessions.mutate(tokenHash, (current) => (current ? { ...current, lastSeenAt: now } : undefined));
     if (!session) throw new ApiError('unauthorized');

@@ -1,5 +1,5 @@
 /** A keyed table over SQLite: one JSON document per key, looked up by key or by an indexed field. */
-import type { Table, Where } from '../types';
+import type { AuditInput, AuditWith, Table, Where } from '../types';
 import type { Db } from './db';
 import { open, seal, type DataKeys } from './keys';
 
@@ -8,6 +8,16 @@ export interface TableOptions<T> {
   indexed?: (keyof T & string)[];
   /** A field that holds a secret and is stored encrypted. */
   secret?: { field: keyof T & string; keys: DataKeys };
+  /** Where `mutate` writes the audit entries it is given, inside its own transaction. */
+  audit?: { appendNow(entry: AuditInput): void };
+}
+
+/** Writes what `audit` returns for `stored`, in the transaction the caller has open. */
+export function writeAudit<T>(log: { appendNow(entry: AuditInput): void } | undefined, audit: AuditWith<T> | undefined, stored: T): void {
+  if (!audit) return;
+  if (!log) throw new Error('This table was not given an audit log to write to.');
+  const entries = audit(stored);
+  for (const entry of entries === null ? [] : Array.isArray(entries) ? entries : [entries]) log.appendNow(entry);
 }
 
 export class SqlTable<T extends object> implements Table<T> {
@@ -73,7 +83,7 @@ export class SqlTable<T extends object> implements Table<T> {
   async list(where: Where<T> = {}, filter?: (row: T) => boolean): Promise<T[]> {
     return this.select(where, filter).map(({ row }) => row);
   }
-  async mutate(key: string, change: (current: T | null) => T | null | undefined): Promise<T | null> {
+  async mutate(key: string, change: (current: T | null) => T | null | undefined, audit?: AuditWith<T | null>): Promise<T | null> {
     // One transaction, holding the write lock from before the read: no other connection can change the row in between.
     return this.db.tx(() => {
       const found = this.db.get<{ data: string }>(`SELECT data FROM ${this.name} WHERE key = ?`, key);
@@ -82,11 +92,36 @@ export class SqlTable<T extends object> implements Table<T> {
       if (next === undefined) return current;
       if (next === null) {
         this.db.run(`DELETE FROM ${this.name} WHERE key = ?`, key);
+        writeAudit(this.options.audit, audit, null);
         return null;
       }
       this.db.run(`INSERT INTO ${this.name} (key, data) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET data = excluded.data`, key, this.encode(key, next));
+      writeAudit(this.options.audit, audit, next);
       return next;
     });
+  }
+  /**
+   * Re-encrypts the secret of every row that was not made with the current
+   * key. In the caller's transaction; a row that cannot be decrypted stops
+   * everything, and the error says which row.
+   */
+  rotateSecrets(currentKeyId: string): number {
+    const { secret } = this.options;
+    if (!secret) return 0;
+    let changed = 0;
+    for (const row of this.db.all<{ key: string; data: string }>(`SELECT key, data FROM ${this.name}`)) {
+      const sealed = (JSON.parse(row.data) as Record<string, unknown>)[secret.field];
+      if (typeof sealed !== 'string' || sealed.split(':')[1] === currentKeyId) continue;
+      let value: T;
+      try {
+        value = this.decode(row.key, row.data);
+      } catch (error) {
+        throw new Error(`The secret in table ${this.name}, row ${row.key}, could not be decrypted (${error instanceof Error ? error.message : 'unknown error'}). Nothing was changed.`);
+      }
+      this.db.run(`UPDATE ${this.name} SET data = ? WHERE key = ?`, this.encode(row.key, value), row.key);
+      changed += 1;
+    }
+    return changed;
   }
   async take(key: string): Promise<T | null> {
     // A single statement: the row is returned to exactly one caller, and gone.

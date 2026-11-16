@@ -25,6 +25,7 @@ import { equalsFactory } from './providers/equals/adapter';
 import type { EqualsTransport } from './providers/equals/raw';
 import { seedDirectory } from './store/seed';
 import { createSqliteStores, type SeedCode, type SqliteStores } from './store/sqlite';
+import { lockForServer } from './store/sqlite/db';
 import type { AuditOptions } from './store/sqlite/audit';
 import { dataKeys, newDataKey, type DataKeys } from './store/sqlite/keys';
 import type { ActivationRecord, OpsRole, Table } from './store/types';
@@ -71,15 +72,42 @@ export function createRuntime(config: Config, options: RuntimeOptions = {}): Run
   }
   if (config.strict && !config.databasePath) throw new Error('DATABASE_PATH must be set.');
   const mailer = options.mailer ?? new ConsoleOutbox();
-  if (config.databasePath) mkdirSync(path.dirname(path.resolve(config.databasePath)), { recursive: true });
-  const stores = createSqliteStores({
-    path: config.databasePath ? path.resolve(config.databasePath) : ':memory:',
-    keys: keysFor(config),
+  // (Outside development the key comes from the environment only, so checking it writes nothing.)
+  const strictKeys = config.strict ? keysFor(config) : null;
+  // Refused before anything is opened or created: a strict start without live provider wires leaves no file behind.
+  const missing = (['currencycloud', 'equals'] as const).filter((name) => !options.transports?.[name]);
+  if (config.strict && missing.length > 0) {
+    throw new Error(`Refusing to start: ${missing.join(' and ')} would be served by an in-memory MOCK with sample data. Supply live provider transports or, for a local demonstration, set APP_ENV=development.`);
+  }
+  const file = config.databasePath ? path.resolve(config.databasePath) : null;
+  // The folder is made for this user only; one that already exists and is open to others is refused when the database is opened.
+  if (file) mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const keys = strictKeys ?? keysFor(config);
+  // One server process per database (see lockForServer). Released when the stores are closed, or when the process dies.
+  const unlock = file ? lockForServer(file) : () => {};
+  let stores: SqliteStores;
+  try {
+    stores = openStores();
+  } catch (error) {
+    unlock();
+    throw error;
+  }
+  const close = stores.close.bind(stores);
+  stores.close = () => {
+    close();
+    unlock();
+  };
+  function openStores(): SqliteStores {
+    return createSqliteStores({
+    path: file ?? ':memory:',
+    keys,
+    mode: config.development ? 'development' : 'strict',
     now: options.now,
     audit: options.audit,
     // Sample people and companies exist only in development, and only in a database that has none.
     seed: config.development ? seedDirectory() : undefined,
-  });
+    });
+  }
   const registry = new ProviderRegistry({
     currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: options.transports?.currencycloud, now: options.now }),
     equals: equalsFactory({ credentials: config.providers.equals, transport: options.transports?.equals, keys: stores.providerKeys, now: options.now }),

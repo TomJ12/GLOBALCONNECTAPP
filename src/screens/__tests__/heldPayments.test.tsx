@@ -97,6 +97,9 @@ describe('payments held for approval', () => {
     expect(paymentStatusLabel(mine)).toBe('Waiting for approval');
     expect(paymentStatusLabel({ status: 'cancelled', held: hold({ state: 'expired' }) })).toBe('Expired, not sent');
     expect(paymentStatusLabel({ status: 'cancelled', held: hold({ state: 'payee_changed' }) })).toBe('Payee changed, not sent');
+    // Sent, but the provider's record is not what was approved: never shown as an ordinary sent payment.
+    expect(paymentStatusLabel({ status: 'unknown', held: hold({ state: 'mismatch' }) })).toBe('Sent, but not as approved: contact support');
+    expect(schemas.payment.safeParse({ ...mine, status: 'unknown', held: hold({ state: 'mismatch' }) }).success).toBe(true);
     expect(paymentStatusLabel({ status: 'cancelled', held: hold({ state: 'rejected' }) })).toBe('Rejected');
     expect(paymentStatusLabel({ status: 'processing', held: hold({ state: 'sending' }) })).toBe('Approved, sending');
     expect(paymentStatusLabel({ status: 'cancelled' })).toBe('Cancelled');

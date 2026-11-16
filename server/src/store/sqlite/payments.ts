@@ -1,9 +1,10 @@
 /** Held payments over SQLite: one JSON document per payment, every change inside one write-locked transaction. */
 import { createHash } from 'node:crypto';
 
-import type { HeldPaymentRecord, HeldPaymentStatus, HeldPaymentStore } from '../types';
+import type { AuditInput, AuditWith, HeldPaymentRecord, HeldPaymentStatus, HeldPaymentStore } from '../types';
 import type { Db } from './db';
 import type { SqlDirectory } from './directory';
+import { writeAudit } from './tables';
 
 const read = (row: { data: string } | undefined): HeldPaymentRecord | null => (row ? (JSON.parse(row.data) as HeldPaymentRecord) : null);
 
@@ -11,6 +12,7 @@ export class SqlHeldPayments implements HeldPaymentStore {
   constructor(
     private readonly db: Db,
     private readonly directory: SqlDirectory,
+    private readonly audit: { appendNow(entry: AuditInput): void },
   ) {}
 
   /** The row key: the company and the creator's idempotency key. The primary key makes a second row with it impossible. */
@@ -18,12 +20,13 @@ export class SqlHeldPayments implements HeldPaymentStore {
     return createHash('sha256').update(JSON.stringify([companyId, idempotencyKey])).digest('hex');
   }
 
-  async create(record: HeldPaymentRecord): Promise<{ record: HeldPaymentRecord; created: boolean }> {
+  async create(record: HeldPaymentRecord, audit?: AuditWith<HeldPaymentRecord>): Promise<{ record: HeldPaymentRecord; created: boolean }> {
     const key = this.keyOf(record.companyId, record.idempotencyKey);
     return this.db.tx(() => {
       const existing = read(this.db.get<{ data: string }>('SELECT data FROM held_payments WHERE key = ?', key));
       if (existing) return { record: existing, created: false };
       this.db.run('INSERT INTO held_payments (key, data) VALUES (?, ?)', key, JSON.stringify(record));
+      writeAudit(this.audit, audit, record);
       return { record, created: true };
     });
   }
@@ -42,15 +45,18 @@ export class SqlHeldPayments implements HeldPaymentStore {
       .all<{ data: string }>(`SELECT data FROM held_payments${conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''} ORDER BY rowid DESC`, ...params)
       .map((row) => read(row) as HeldPaymentRecord);
   }
-  async update(id: string, userIds: string[], change: Parameters<HeldPaymentStore['update']>[2]): Promise<HeldPaymentRecord | null> {
-    // The payment, the people and their roles are read under the write lock and the new state is written before it is released.
+  async update(id: string, userIds: string[] | ((current: HeldPaymentRecord) => string[]), change: Parameters<HeldPaymentStore['update']>[2], audit?: AuditWith<HeldPaymentRecord>): Promise<HeldPaymentRecord | null> {
+    // The payment, its company, the people and their roles are read under the write lock, and the new state and its
+    // audit entries are written before the lock is released.
     return this.db.tx(() => {
       const current = read(this.db.get<{ data: string }>("SELECT data FROM held_payments WHERE json_extract(data, '$.id') = ?", id));
       if (!current) return null;
-      const people = new Map(userIds.map((userId) => [userId, this.directory.personIn(userId, current.companyId)]));
-      const next = change(structuredClone(current), { get: (userId) => people.get(userId) ?? null });
+      const ids = typeof userIds === 'function' ? userIds(current) : userIds;
+      const people = new Map(ids.map((userId) => [userId, this.directory.personIn(userId, current.companyId)]));
+      const next = change(structuredClone(current), { company: this.directory.companyNow(current.companyId), get: (userId) => people.get(userId) ?? null });
       if (!next) return null;
       this.db.run("UPDATE held_payments SET data = ? WHERE json_extract(data, '$.id') = ?", JSON.stringify(next), id);
+      writeAudit(this.audit, audit, next);
       return next;
     });
   }

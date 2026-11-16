@@ -1,7 +1,8 @@
 /** The SQLite store itself: migrations, transactions under a crash and under real concurrency, encryption at rest, the audit chain, restarts. */
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -12,10 +13,11 @@ import { MINIMUM_NODE, nodeVersionProblem } from '../src/nodeVersion';
 import { createRuntime, keysFor } from '../src/startup';
 import { seedDirectory } from '../src/store/seed';
 import { createSqliteStores } from '../src/store/sqlite';
-import { Db } from '../src/store/sqlite/db';
+import type { AuditCheckpoint } from '../src/store/sqlite/audit';
+import { Db, lockForServer } from '../src/store/sqlite/db';
 import { dataKeys, newDataKey } from '../src/store/sqlite/keys';
-import { MIGRATIONS } from '../src/store/sqlite/migrations';
-import { AMIRA, BEN, harness, PASSWORD, TEST_DATA_KEY, type Harness } from './helpers';
+import { AUDIT_TRIGGERS, MIGRATIONS } from '../src/store/sqlite/migrations';
+import { AMIRA, BEN, DANA, harness, PASSWORD, TEST_DATA_KEY, type Harness } from './helpers';
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tsx = path.join(serverDir, 'node_modules', '.bin', 'tsx');
@@ -214,7 +216,9 @@ test('encryption: authenticator keys cannot be read from the file, survive a res
   // A ciphertext moved to another row does not decrypt there.
   const moved = createSqliteStores({ path: file, keys });
   moved.db.run("UPDATE users SET totp_secret = (SELECT totp_secret FROM users WHERE id = 'usr_amira') WHERE id = 'usr_dana'");
-  await assert.rejects(moved.directory.getUser('usr_dana'));
+  // (L6: the key is decrypted when it is read, not when the person is loaded: listing people opens no secret.)
+  assert.equal((await moved.directory.getUser('usr_dana'))?.email, DANA);
+  await assert.rejects(async () => (await moved.directory.getUser('usr_dana'))?.totpSecret);
   moved.close();
 });
 
@@ -277,36 +281,99 @@ test('audit: the database rejects any change or removal; audit:verify passes on 
   assert.equal(honest.status, 0, honest.stderr);
   assert.match(honest.stdout, /Audit log verified: 10 entries/);
 
-  // Someone with the FILE can drop the triggers. What they change is then found by the chain.
+  // Someone with the FILE can drop the triggers, change what they like, and put the triggers back exactly as they were.
   const backup = path.join(folder, 'copy.sqlite');
-  const tamper = (sql: string) => {
+  const DROP = Object.keys(AUDIT_TRIGGERS).map((name) => `DROP TRIGGER ${name};`).join(' ');
+  const RECREATE = `${Object.values(AUDIT_TRIGGERS).join('; ')};`;
+  const copyOf = (source = file) => {
     rmSync(backup, { force: true });
-    const db = new Db(file);
+    const db = new Db(source);
     db.backupTo(backup);
     db.close();
-    const copy = new Db(backup);
-    copy.exec('DROP TRIGGER audit_log_no_update; DROP TRIGGER audit_log_no_delete; DROP TRIGGER audit_archive_no_update; DROP TRIGGER audit_archive_no_delete;');
-    copy.exec(sql);
-    copy.close();
-    const result = createSqliteStores({ path: backup, keys });
-    const verdict = result.verifyAudit();
+  };
+  const verdictOf = (target: string, checkpoint?: AuditCheckpoint) => {
+    const result = createSqliteStores({ path: target, keys, readOnly: true });
+    const verdict = result.verifyAudit(checkpoint);
     result.close();
     return verdict;
   };
+  const tamper = (sql: string, restore = RECREATE) => {
+    copyOf();
+    const copy = new Db(backup);
+    copy.exec(DROP);
+    copy.exec(sql);
+    copy.exec(restore);
+    copy.close();
+    return verdictOf(backup);
+  };
   assert.equal(tamper('SELECT 1').ok, true, 'the copy itself verifies');
+  // What they changed is found by the chain...
   assert.match(tamper(`UPDATE audit_log SET detail = '{"note":"y"}' WHERE action = 'event.9'`).problem ?? '', /event\.9\) has been changed since it was written/);
   assert.match(tamper(`UPDATE audit_archive SET actor_label = 'someone else' WHERE action = 'event.2'`).problem ?? '', /event\.2\) has been changed/);
   assert.match(tamper(`DELETE FROM audit_log WHERE action = 'event.9'`).problem ?? '', /Entry 9 is missing/);
-  assert.match(tamper(`DELETE FROM audit_log WHERE action = 'event.10'`).problem ?? '', /the newest entries have been removed/);
   assert.match(tamper(`UPDATE audit_log SET at = at + 1 WHERE action = 'event.8'`).problem ?? '', /event\.8\) has been changed/);
+  // ...and cutting the newest entries off is found by the signed record of the end of the log, which cannot be
+  // rewritten to match without the key: not edited, not copied from the entry that is now last, not removed.
+  assert.match(tamper(`DELETE FROM audit_log WHERE action = 'event.10'`).problem ?? '', /the newest entries have been removed/);
+  const cutOff = `DELETE FROM audit_log WHERE action = 'event.10';`;
+  assert.match(tamper(`${cutOff} UPDATE audit_head SET seq = 9, count = 9, hash = (SELECT hash FROM audit_log WHERE seq = 9)`).problem ?? '', /end of the log has been altered: its signature does not match\. Entries may have been removed/);
+  assert.match(tamper(`${cutOff} UPDATE audit_head SET seq = 9, count = NULL, mac = NULL, hash = (SELECT hash FROM audit_log WHERE seq = 9)`).problem ?? '', /end of the log is not signed/);
+  assert.match(tamper(`${cutOff} DELETE FROM audit_head`).problem ?? '', /signed record of the end of the log is missing/);
+  assert.match(tamper('DELETE FROM audit_log; DELETE FROM audit_archive; DELETE FROM audit_head').problem ?? '', /signed record of the end of the log is missing/);
+  assert.match(tamper('DELETE FROM audit_log; DELETE FROM audit_archive').problem ?? '', /The log ends at entry none, but entry 10 was the last one written/);
+  // An entry removed from the archive, with the numbering closed up, is found by the count as well as the chain.
+  assert.equal(tamper(`DELETE FROM audit_archive WHERE seq = (SELECT MIN(seq) FROM audit_archive)`).ok, false);
+  // Triggers left off, or put back as something that refuses nothing, are reported even when no entry was touched.
+  assert.match(tamper('SELECT 1', 'SELECT 1').problem ?? '', /The trigger audit_log_no_update, which stops audit entries being changed or removed, is missing/);
+  assert.match(tamper('SELECT 1', `${RECREATE.replace(AUDIT_TRIGGERS.audit_log_no_delete as string, "CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log WHEN 1 = 0 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: entries cannot be removed'); END")}`).problem ?? '', /The trigger audit_log_no_delete, .* has been altered/);
+  // An entry added by someone without the key does not make a cut-off log look whole again.
+  copyOf();
+  const forged = new Db(backup);
+  forged.exec(`${DROP} ${cutOff} UPDATE sqlite_sequence SET seq = 9 WHERE name = 'audit_log'; UPDATE audit_head SET seq = 9, count = 9, hash = (SELECT hash FROM audit_log WHERE seq = 9); ${RECREATE}`);
+  forged.close();
+  const reopened = createSqliteStores({ path: backup, keys });
+  await reopened.audit.append(system('event.after', 11));
+  assert.equal(reopened.db.get<{ seq: number }>('SELECT MAX(seq) AS seq FROM audit_log')?.seq, 10, 'the new entry took the place of the one removed');
+  assert.match(reopened.verifyAudit().problem ?? '', /end of the log is not signed/, 'writing on does not re-sign a record that was not valid');
+  reopened.close();
+
+  // What the file alone cannot show: the whole database replaced by an older, honest copy. A checkpoint kept
+  // somewhere else shows it.
+  const older = path.join(folder, 'older.sqlite');
+  copyOf();
+  renameSync(backup, older);
+  const later = createSqliteStores({ path: file, keys, audit: { liveLimit: 6, notice: () => {} } });
+  await later.audit.append(system('event.11', 11));
+  await later.audit.append(system('event.12', 12));
+  const checkpoint = later.audit.checkpoint(12);
+  later.close();
+  assert.equal(verdictOf(file, checkpoint).ok, true);
+  assert.equal(verdictOf(older).ok, true, 'an older copy is a valid log in itself');
+  assert.match(verdictOf(older, checkpoint).problem ?? '', /no longer contains what it contained at the checkpoint of 1970-01-01T00:00:00\.012Z \(entry 12, 12 entries\): it has been cut back or replaced by an older copy/);
+  assert.match(verdictOf(file, { ...checkpoint, seq: 11, count: 11 }).problem ?? '', /checkpoint file is not one this server made, or it has been altered/);
+  // The same through the commands: the checkpoint is a file outside the database, for this user only, never overwritten.
+  const checkpointFile = path.join(folder, 'audit.checkpoint');
+  const run = (...args: string[]) => spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY }, encoding: 'utf8' });
+  const made = run('audit-checkpoint', checkpointFile);
+  assert.equal(made.status, 0, made.stderr);
+  assert.equal(statSync(checkpointFile).mode & 0o777, 0o600);
+  const again = run('audit-checkpoint', checkpointFile);
+  assert.equal(again.status, 2);
+  assert.match(again.stderr, /already exists/);
+  const withCheckpoint = run('audit-verify', '--checkpoint', checkpointFile);
+  assert.equal(withCheckpoint.status, 0, withCheckpoint.stderr);
+  assert.match(withCheckpoint.stdout, /Audit log verified: 12 entries[^]*Everything recorded at the checkpoint/);
+  const rolledBack = spawnSync(tsx, ['src/cli/db.ts', 'audit-verify', '--checkpoint', checkpointFile], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: older, DATA_ENCRYPTION_KEY: TEST_DATA_KEY }, encoding: 'utf8' });
+  assert.equal(rolledBack.status, 1);
+  assert.match(rolledBack.stderr, /AUDIT LOG VERIFICATION FAILED[^]*replaced by an older copy/);
 
   // The command itself fails, loudly, on the real file once it has been altered.
   const db = new Db(file);
-  db.exec(`DROP TRIGGER audit_log_no_update; UPDATE audit_log SET outcome = 'failure' WHERE action = 'event.7'`);
+  db.exec(`DROP TRIGGER audit_log_no_update; UPDATE audit_log SET outcome = 'failure' WHERE action = 'event.12'; ${AUDIT_TRIGGERS.audit_log_no_update as string}`);
   db.close();
   const found = cli();
   assert.equal(found.status, 1);
-  assert.match(found.stderr, /AUDIT LOG VERIFICATION FAILED after 6 good entries[^]*event\.7\) has been changed/);
+  assert.match(found.stderr, /AUDIT LOG VERIFICATION FAILED after 11 good entries[^]*event\.12\) has been changed/);
 });
 
 test('db:backup writes a complete, consistent copy while the database is open, and refuses to overwrite', async () => {
@@ -358,4 +425,210 @@ test('restart: sessions, locks, pending requests, invitations and the audit log 
   assert.ok(verdict.ok && verdict.entries >= entries);
   // The sample people were not seeded a second time over the real ones.
   assert.ok((await h.stores.directory.getUser('usr_amira'))?.activatedAt);
+});
+
+// --- Review of fe9d053 -----------------------------------------------------------------------------------
+
+/** Turns a current database back into one as the previous version of the server left it (schema 3). */
+function asSchema3(target: string): void {
+  const db = new Db(target);
+  db.exec(`DROP INDEX companies_provider_account; DROP INDEX companies_name_key; ALTER TABLE companies DROP COLUMN name_key;
+    ALTER TABLE audit_head DROP COLUMN count; ALTER TABLE audit_head DROP COLUMN mac; ALTER TABLE audit_head DROP COLUMN key_id;
+    DELETE FROM schema_version WHERE version = 4; DELETE FROM meta WHERE key = 'used_in_development';`);
+  db.close();
+}
+const modeOf = (target: string) => (statSync(target).mode & 0o777).toString(8);
+
+test('upgrade: a database left by the previous version (schema 3) is brought to 4 in one step: the audit log is sealed as it stands, names are indexed, nothing is lost', async () => {
+  h = await harness({}, undefined, { databasePath: file });
+  const amira = await h.activate(AMIRA);
+  const entries = h.stores.verifyAudit().entries;
+  await h.close();
+  h = undefined;
+  asSchema3(file);
+  const old = new Db(file, MIGRATIONS.slice(0, 3));
+  assert.equal(old.schemaVersion(), 3);
+  old.close();
+
+  const stores = createSqliteStores({ path: file, keys, mode: 'development' });
+  assert.equal(stores.db.schemaVersion(), 4);
+  assert.deepEqual(stores.verifyAudit(), { ok: true, entries, archived: 0, problem: null });
+  assert.equal((await stores.directory.getUser('usr_amira'))?.totpSecret, amira.secret);
+  assert.deepEqual(stores.db.all<{ name_key: string }>('SELECT name_key FROM companies ORDER BY id').map((row) => row.name_key), ['castlebrook imports ltd', 'northfield trading ltd']);
+  await assert.rejects(async () => stores.directory.saveCompany({ id: 'co_copy', name: 'NORTHFIELD  trading ltd', providerKey: 'equals', providerAccountId: 'S00003', providerContactId: '' }), /company_name|name/);
+  stores.close();
+
+  // Two companies that the old version allowed to share an account: the upgrade stops, says so, and changes nothing.
+  asSchema3(file);
+  const clash = new Db(file, MIGRATIONS.slice(0, 3));
+  clash.run("INSERT INTO companies (id, name, provider_key, provider_account_id, provider_contact_id) SELECT 'co_twin', 'Twin Ltd', provider_key, provider_account_id, provider_contact_id FROM companies WHERE id = 'co_northfield'");
+  clash.close();
+  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'development' }), /UNIQUE constraint failed: companies\.provider_key, companies\.provider_account_id/);
+  const still = new Db(file, MIGRATIONS.slice(0, 3));
+  assert.equal(still.schemaVersion(), 3);
+  still.close();
+});
+
+test('M5: the database, its write-ahead files, its lock, its backup and its folder are for this user only, and a database others can read is refused', async () => {
+  const before = process.umask(0o022);
+  try {
+    // Made through the server's own start-up, under an ordinary umask.
+    const nested = path.join(folder, 'made', 'here', 'data.sqlite');
+    const runtime = createRuntime({ ...loadConfig({ APP_ENV: 'development' }), databasePath: nested });
+    await runtime.stores.audit.append(system('event.1'));
+    assert.equal(modeOf(path.dirname(nested)), '700');
+    for (const suffix of ['', '-wal', '-shm', '.dev-key', '.lock']) assert.equal(modeOf(`${nested}${suffix}`), '600', suffix);
+    const backup = path.join(folder, 'made', 'backup.sqlite');
+    runtime.stores.db.backupTo(backup);
+    assert.equal(modeOf(backup), '600');
+    runtime.stores.close();
+    // The same through the commands, which set their own umask.
+    const env = { PATH: process.env.PATH ?? '', DATABASE_PATH: nested };
+    const viaCli = path.join(folder, 'made', 'cli.sqlite');
+    const copied = spawnSync(tsx, ['src/cli/db.ts', 'backup', viaCli], { cwd: serverDir, env, encoding: 'utf8' });
+    assert.equal(copied.status, 0, copied.stderr);
+    assert.equal(modeOf(viaCli), '600');
+
+    // A database file, or a folder, that other users of the machine can read or write: refused, with the command that puts it right.
+    for (const [target, mode, wanted] of [[nested, 0o644, 0o600], [nested, 0o660, 0o600], [path.dirname(nested), 0o755, 0o700], [path.dirname(nested), 0o770, 0o700]] as const) {
+      chmodSync(target, mode);
+      const refusal = new RegExp(`${target.replace(/[.]/g, '\\.')} can be read or changed by other users of this machine \\(its permissions are ${mode.toString(8)}; they must be ${wanted.toString(8)}\\)[^]*chmod ${wanted.toString(8)} `);
+      assert.throws(() => createRuntime({ ...loadConfig({ APP_ENV: 'development' }), databasePath: nested }), refusal);
+      assert.throws(() => new Db(nested), refusal);
+      const cli = spawnSync(tsx, ['src/cli/db.ts', 'audit-verify'], { cwd: serverDir, env, encoding: 'utf8' });
+      assert.equal(cli.status, 2);
+      assert.match(cli.stderr, refusal);
+      chmodSync(target, wanted);
+    }
+    createRuntime({ ...loadConfig({ APP_ENV: 'development' }), databasePath: nested }).stores.close();
+  } finally {
+    process.umask(before);
+  }
+});
+
+test('one server process per database: a second start on the same file is refused until the first has stopped; the commands are not', () => {
+  const config = { ...loadConfig({ APP_ENV: 'development' }), databasePath: file };
+  const first = createRuntime(config);
+  assert.throws(() => createRuntime(config), /Another Global Connect server process is already running on .*data\.sqlite\. Only one may use a database at a time/);
+  // A real second process is refused in the same way, and the maintenance commands still run beside a live server.
+  const script = `import('./src/startup.ts').then(async ({ createRuntime }) => { const { loadConfig } = await import('./src/config.ts'); createRuntime({ ...loadConfig({ APP_ENV: 'development' }), databasePath: process.env.FILE }); }).catch((error) => { console.error(error.message); process.exit(3); });`;
+  const second = spawnSync(tsx, ['-e', script], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', FILE: file }, encoding: 'utf8' });
+  assert.equal(second.status, 3, second.stderr);
+  assert.match(second.stderr, /Another Global Connect server process is already running/);
+  assert.equal(spawnSync(tsx, ['src/cli/db.ts', 'audit-verify'], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: file }, encoding: 'utf8' }).status, 0);
+  first.stores.close();
+  const third = createRuntime(config);
+  // A failed start does not keep the lock.
+  third.stores.close();
+  assert.throws(() => createRuntime({ ...config, dataEncryptionKey: OTHER_KEY }), /not the key this database was written with/);
+  createRuntime(config).stores.close();
+});
+
+test('L1, L10: a database without its key marker is refused whatever key is offered, and one that was ever used in development is refused outside it', () => {
+  createSqliteStores({ path: file, keys }).close();
+  const raw = new Db(file);
+  const marker = raw.get<{ value: string }>("SELECT value FROM meta WHERE key = 'key_check'")?.value as string;
+  raw.run("DELETE FROM meta WHERE key = 'key_check'");
+  raw.close();
+  // Deleting the marker used to let ANY key in, which then wrote its own marker.
+  for (const offered of [dataKeys(OTHER_KEY), keys]) assert.throws(() => createSqliteStores({ path: file, keys: offered }), /lost the marker that says which encryption key it was written with[^]*Refusing to open it/);
+  const check = new Db(file);
+  assert.equal(check.get("SELECT 1 FROM meta WHERE key = 'key_check'"), undefined, 'and no marker was written');
+  check.run("INSERT INTO meta (key, value) VALUES ('key_check', ?)", marker);
+  check.close();
+
+  // Not yet used in development: strict opens it, again and again.
+  createSqliteStores({ path: file, keys, mode: 'strict' }).close();
+  createSqliteStores({ path: file, keys, mode: 'strict' }).close();
+  // The commands (no mode, read-only) leave no mark either.
+  createSqliteStores({ path: file, keys, readOnly: true }).close();
+  createSqliteStores({ path: file, keys, mode: 'development', readOnly: true }).close();
+  createSqliteStores({ path: file, keys, mode: 'strict' }).close();
+  // One start in development (sample people, activation codes kept readable for them) and it is a development database for good.
+  const dev = createSqliteStores({ path: file, keys, mode: 'development', seed: seedDirectory() });
+  dev.close();
+  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /has been used in development mode[^]*cannot be used outside development: start with a new database/);
+  createSqliteStores({ path: file, keys, mode: 'development' }).close();
+  createSqliteStores({ path: file, keys, readOnly: true }).close();
+});
+
+test('L5: key rotation is all or nothing: a secret that cannot be decrypted stops it, names the row, and leaves every other row as it was', async () => {
+  h = await harness({}, undefined, { databasePath: file });
+  await h.activate(AMIRA);
+  const invitation = await h.invite(BEN);
+  await h.call('POST', '/v1/activation/password', { body: { activationCode: invitation, password: PASSWORD } });
+  await h.close();
+  h = undefined;
+  const raw = new Db(file);
+  // One in-progress activation's stored secret is damaged.
+  const row = raw.get<{ key: string; data: string }>('SELECT key, data FROM activations LIMIT 1') as { key: string; data: string };
+  const damaged = row.data.replace(/("pendingTotpSecret":"gcm1:[^:]+:[^:]+:.{5})(.)/, (_all, head: string, char: string) => `${head}${char === 'A' ? 'B' : 'A'}`);
+  assert.notEqual(damaged, row.data);
+  raw.run('UPDATE activations SET data = ? WHERE key = ?', damaged, row.key);
+  const state = () => JSON.stringify([raw.all('SELECT id, totp_secret FROM users ORDER BY id'), raw.all('SELECT * FROM meta ORDER BY key'), raw.all('SELECT * FROM audit_head'), raw.all('SELECT key, data FROM activations ORDER BY key')]);
+  const before = state();
+  const env = { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: OTHER_KEY, DATA_ENCRYPTION_KEY_PREVIOUS: TEST_DATA_KEY };
+  const rotate = spawnSync(tsx, ['src/cli/db.ts', 'rotate-key'], { cwd: serverDir, env, encoding: 'utf8' });
+  assert.equal(rotate.status, 1, rotate.stdout);
+  assert.match(rotate.stderr, new RegExp(`The secret in table activations, row ${row.key}, could not be decrypted[^]*Nothing was changed`));
+  // Amira's key was NOT left re-encrypted under the new key while the rest stayed under the old one.
+  assert.equal(state(), before);
+  raw.close();
+  const stores = createSqliteStores({ path: file, keys });
+  assert.equal(stores.verifyAudit().ok, true);
+  stores.close();
+});
+
+test('L8: audit:verify, audit:checkpoint and db:backup open the database read-only: they do not upgrade it, mark it or write to it', async () => {
+  const stores = createSqliteStores({ path: file, keys, mode: 'strict' });
+  await stores.audit.append(system('event.1'));
+  stores.close();
+  const digest = () => createHash('sha256').update(readFileSync(file)).digest('hex');
+  const before = digest();
+  const env = { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY };
+  for (const args of [['audit-verify'], ['audit-checkpoint', path.join(folder, 'cp.json')], ['backup', path.join(folder, 'b.sqlite')], ['audit-verify', '--checkpoint', path.join(folder, 'cp.json')]]) {
+    const run = spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env, encoding: 'utf8' });
+    assert.equal(run.status, 0, `${args.join(' ')}: ${run.stderr}`);
+  }
+  assert.equal(digest(), before);
+  // A read-only connection really cannot write.
+  const readOnly = createSqliteStores({ path: file, keys, readOnly: true });
+  assert.throws(() => readOnly.db.run("INSERT INTO meta (key, value) VALUES ('x', 'y')"), /readonly|read-only/i);
+  await assert.rejects(async () => readOnly.audit.append(system('event.2')), /readonly|read-only/i);
+  readOnly.close();
+  // A database from the previous version is NOT upgraded by a command: that is the server's job, at its next start.
+  asSchema3(file);
+  for (const args of [['audit-verify'], ['backup', path.join(folder, 'old.sqlite')]]) {
+    const run = spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env, encoding: 'utf8' });
+    assert.equal(run.status, 2, args.join(' '));
+    assert.match(run.stderr, /schema version 3 and this version of the commands needs 4\. Start the server once/);
+  }
+  const old = new Db(file, MIGRATIONS.slice(0, 3));
+  assert.equal(old.schemaVersion(), 3);
+  old.close();
+});
+
+test('L6: "last seen" is written at most once a minute per session, and reads are limited per session', async () => {
+  h = await harness({ readRequestsPerMinute: 5 }, undefined, { databasePath: file });
+  const amira = await h.activate(AMIRA);
+  const token = (await h.login(AMIRA, amira.secret)).json.token as string;
+  const seen = () => (JSON.parse((h as Harness).stores.db.get<{ data: string }>('SELECT data FROM sessions')?.data ?? '{}') as { lastSeenAt: number }).lastSeenAt;
+  const first = seen();
+  h.clock.advance(20_000);
+  assert.equal((await h.call('GET', '/v1/balances', { token })).status, 200);
+  h.clock.advance(20_000);
+  assert.equal((await h.call('GET', '/v1/balances', { token })).status, 200);
+  assert.equal(seen(), first, 'two requests within the minute: no write');
+  h.clock.advance(21_000);
+  assert.equal((await h.call('GET', '/v1/balances', { token })).status, 200);
+  assert.equal(seen(), first + 61_000);
+  // Reads: five a minute here. The sixth is refused, for this session only, and the limit lifts with time.
+  const other = (await h.login(AMIRA, amira.secret)).json.token as string;
+  const statuses: number[] = [];
+  h.clock.advance(61_000);
+  for (let n = 0; n < 7; n += 1) statuses.push((await h.call('GET', '/v1/balances', { token })).status);
+  assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429, 429]);
+  assert.equal((await h.call('GET', '/v1/balances', { token: other })).status, 200);
+  h.clock.advance(61_000);
+  assert.equal((await h.call('GET', '/v1/balances', { token })).status, 200);
 });

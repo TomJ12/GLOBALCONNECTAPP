@@ -8,6 +8,8 @@ if [ "$(id -u)" = "0" ]; then
   mkdir -p "$DATA_DIR"
   chown -R node:node "$DATA_DIR"
   chmod 0700 "$DATA_DIR"
+  # The server refuses a database that anyone else could read; files from an older image may have been created looser.
+  find "$DATA_DIR" -maxdepth 1 -type f -exec chmod 0600 {} +
   # For the operator commands (`gc ...` from `fly ssh console`): a shell opened that way may not have the app's
   # secrets in its environment. The few they need are kept in a file only root can read, in the machine's own
   # temporary storage (never on the data volume, never in the image).

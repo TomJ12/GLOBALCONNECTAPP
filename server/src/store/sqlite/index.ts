@@ -23,7 +23,7 @@ import type {
   Table,
   UserRecord,
 } from '../types';
-import { SqlAuditLog, type AuditOptions, type AuditVerification } from './audit';
+import { SqlAuditLog, type AuditCheckpoint, type AuditOptions, type AuditVerification } from './audit';
 import { Db } from './db';
 import { SqlDirectory, SqlOpsDirectory } from './directory';
 import { open, seal, sealedKeyId, type DataKeys } from './keys';
@@ -51,13 +51,17 @@ export interface SqliteOptions {
   audit?: AuditOptions;
   /** People and companies to start with, used only when the database has none. */
   seed?: DirectoryData;
+  /** How the server is running. A database used in development is marked, and refused in strict mode ever after. */
+  mode?: 'development' | 'strict';
+  /** Open without changing anything (no migration, no marker): for audit:verify and db:backup. */
+  readOnly?: boolean;
 }
 
 export interface SqliteStores extends Stores {
   db: Db;
   audit: SqlAuditLog;
   seedCodes: Table<SeedCode>;
-  verifyAudit(): AuditVerification;
+  verifyAudit(checkpoint?: AuditCheckpoint): AuditVerification;
   /** Re-encrypts every stored secret with the current key. Returns how many were changed. */
   rotateKeys(): number;
   /** Removes rows that are over: expired invitations, challenges and permissions, idle unlocked counters, sessions past their absolute life. */
@@ -66,23 +70,50 @@ export interface SqliteStores extends Stores {
 }
 
 export function createSqliteStores(options: SqliteOptions): SqliteStores {
-  const db = new Db(options.path);
   const now = options.now ?? Date.now;
   const { keys } = options;
-  // The wrong key is refused here, at start-up, rather than discovered at somebody's sign-in.
   const KEY_CHECK = 'meta:key_check';
+  // What the migrations need that SQL alone cannot do. Each runs inside its migration's own transaction, so a
+  // database either has the schema AND these, or neither.
+  const db = new Db(options.path, {
+    readOnly: options.readOnly,
+    onMigrate(version, opened) {
+      // 1: the key marker is made ONCE, when the schema is. A database that later turns up without it is refused,
+      //    so deleting the marker does not let a different key in.
+      if (version === 1) opened.run("INSERT INTO meta (key, value) VALUES ('key_check', ?)", seal(keys, 'global-connect', KEY_CHECK).text);
+      // 4: the end of the audit log is signed as it stands, and company names get their compared form.
+      if (version === 4) {
+        new SqlAuditLog(opened, keys, { ...options.audit, notice: () => {} }).sealHead();
+        new SqlDirectory(opened, keys).backfillNameKeys();
+      }
+    },
+  });
+  const refuse = (message: string): never => {
+    db.close();
+    throw new Error(message);
+  };
+  // The wrong key is refused here, at start-up, rather than discovered at somebody's sign-in.
   const marker = db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'key_check'")?.value;
   const mark = () => db.run("INSERT INTO meta (key, value) VALUES ('key_check', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", seal(keys, 'global-connect', KEY_CHECK).text);
-  if (marker === undefined) mark();
-  else {
+  if (marker === undefined) {
+    refuse('This database has lost the marker that says which encryption key it was written with, so the key cannot be checked. Refusing to open it. Restore the database from a backup.');
+  } else {
     try {
       if (open(keys, marker, KEY_CHECK) !== 'global-connect') throw new Error('mismatch');
     } catch {
-      db.close();
-      throw new Error('DATA_ENCRYPTION_KEY is not the key this database was written with. Nothing was changed. Set the right key (or, after a rotation, list the older one in DATA_ENCRYPTION_KEY_PREVIOUS).');
+      refuse('DATA_ENCRYPTION_KEY is not the key this database was written with. Nothing was changed. Set the right key (or, after a rotation, list the older one in DATA_ENCRYPTION_KEY_PREVIOUS).');
     }
   }
-  const directory = new SqlDirectory(db, keys);
+  // A database that has ever held development data (sample accounts, readable activation codes for them, a key
+  // kept in a file beside it) is never used as a real one.
+  const usedInDevelopment = db.get("SELECT 1 FROM meta WHERE key = 'used_in_development'") !== undefined;
+  if (options.mode === 'strict' && usedInDevelopment) {
+    refuse('This database has been used in development mode (it holds sample accounts and readable activation codes for them). It cannot be used outside development: start with a new database.');
+  }
+  if (options.mode === 'development' && !usedInDevelopment && !options.readOnly) db.run("INSERT INTO meta (key, value) VALUES ('used_in_development', '1')");
+
+  const audit = new SqlAuditLog(db, keys, options.audit);
+  const directory = new SqlDirectory(db, keys, audit);
   const opsUsers = new SqlOpsDirectory(db, keys);
 
   const activations = new SqlTable<ActivationRecord>(db, 'activations', { indexed: ['userId'], secret: { field: 'pendingTotpSecret', keys } });
@@ -94,12 +125,10 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const stepUps = new SqlTable<StepUpRecord>(db, 'step_ups', { indexed: ['userId', 'sessionId'] });
   const attempts = new SqlTable<AttemptRecord>(db, 'attempts', { indexed: ['subject'] });
   const opsAttempts = new SqlTable<AttemptRecord>(db, 'ops_attempts', { indexed: ['subject'] });
-  const approvals = new SqlTable<ApprovalRecord>(db, 'ops_approvals', { indexed: ['status'] });
+  const approvals = new SqlTable<ApprovalRecord>(db, 'ops_approvals', { indexed: ['status'], audit });
   const confirmations = new SqlTable<{ expiresAt: number }>(db, 'ops_confirmations');
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
-  const audit = new SqlAuditLog(db, keys, options.audit);
-
   if (options.seed && !db.get('SELECT 1 FROM users LIMIT 1') && !db.get('SELECT 1 FROM companies LIMIT 1')) {
     const { seed } = options;
     db.tx(() => {
@@ -112,27 +141,21 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const IDLE_COUNTER_MS = 2 * 60 * 60_000;
   return {
     db,
-    payments: new SqlHeldPayments(db, directory),
+    payments: new SqlHeldPayments(db, directory, audit),
     directory,
     auth: { activations, challenges, sessions, stepUps, attempts },
     ops: { users: opsUsers, activations: opsActivations, challenges: opsChallenges, sessions: opsSessions, attempts: opsAttempts, approvals, confirmations },
     audit,
     providerKeys,
     seedCodes,
-    verifyAudit: () => audit.verify(),
+    verifyAudit: (checkpoint) => audit.verify(checkpoint),
     rotateKeys() {
       return db.tx(() => {
         let changed = directory.rotateKeys() + opsUsers.rotateKeys();
         if (sealedKeyId(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'key_check'")?.value ?? '') !== keys.current.id) mark();
-        // Reading decrypts with whichever key made the row; writing encrypts with the current one.
-        for (const [name, table] of [['activations', activations], ['ops_activations', opsActivations]] as const) {
-          for (const row of db.all<{ key: string; data: string }>(`SELECT key, data FROM ${name}`)) {
-            const sealed = (JSON.parse(row.data) as { pendingTotpSecret?: string | null }).pendingTotpSecret;
-            if (typeof sealed !== 'string' || sealed.split(':')[1] === keys.current.id) continue;
-            void table.mutate(row.key, (current) => current);
-            changed += 1;
-          }
-        }
+        audit.resignHead();
+        // All or nothing: a row that cannot be decrypted throws, naming the row, and the whole rotation is rolled back.
+        changed += activations.rotateSecrets(keys.current.id) + opsActivations.rotateSecrets(keys.current.id);
         return changed;
       });
     },

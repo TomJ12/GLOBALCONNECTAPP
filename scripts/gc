@@ -2,7 +2,8 @@
 # Operator commands inside the demo container, for use from `fly ssh console`:
 #
 #   gc backup /data/backup.sqlite          a consistent copy of the database
-#   gc audit-verify                        check the audit log's hash chain
+#   gc audit-verify [--checkpoint <file>]  check the audit log's hash chain
+#   gc audit-checkpoint <file>             write a signed note of where the log ends now
 #   gc invite someone@client.example       email (= print in the log) a client activation link
 #   gc create-ops-admin a@b.example "Name" first ops admins (while fewer than two exist)
 #   gc break-glass <action> <email> "why"
@@ -21,12 +22,13 @@ fi
 cd /app/server
 case "${1:-}" in
   backup) shift; set -- src/cli/db.ts backup "$@" ;;
-  audit-verify) shift; set -- src/cli/db.ts audit-verify ;;
+  audit-verify) shift; set -- src/cli/db.ts audit-verify "$@" ;;
+  audit-checkpoint) shift; set -- src/cli/db.ts audit-checkpoint "$@" ;;
   rotate-key) shift; set -- src/cli/db.ts rotate-key ;;
   invite) shift; set -- src/cli/invite.ts "$@" ;;
   create-ops-admin) shift; set -- src/cli/create-ops-admin.ts "$@" ;;
   break-glass) shift; set -- src/cli/break-glass.ts "$@" ;;
-  *) echo "Usage: gc backup <file> | audit-verify | invite <email> | create-ops-admin <email> \"Name\" | break-glass <action> <email> \"reason\"" >&2; exit 2 ;;
+  *) echo "Usage: gc backup <file> | audit-verify [--checkpoint <file>] | audit-checkpoint <file> | rotate-key | invite <email> | create-ops-admin <email> \"Name\" | break-glass <action> <email> \"reason\"" >&2; exit 2 ;;
 esac
 if [ "$(id -u)" = "0" ]; then exec setpriv --reuid=node --regid=node --init-groups node --import tsx "$@"; fi
 exec node --import tsx "$@"

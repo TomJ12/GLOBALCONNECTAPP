@@ -1,8 +1,8 @@
 /** Regression tests for the security review findings (H3, H4 config, M1-M9, L1-L3, L6). Each was confirmed to fail with its fix reverted. */
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { networkInterfaces } from 'node:os';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { networkInterfaces, tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -21,7 +21,7 @@ let h: Harness;
 afterEach(async () => h?.close());
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/var/lib/globalconnect/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
+const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: path.join(mkdtempSync(path.join(tmpdir(), 'gc-live-')), 'data.sqlite'), DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
 const from = (address: string) => ({ 'x-forwarded-for': address });
 const login = (email: string, password: string, address?: string) => h.call('POST', '/v1/auth/login', { body: { email, password }, headers: address ? from(address) : {} });
 async function signedIn(email: string) {
@@ -78,6 +78,8 @@ test('H3/H4/H1: outside development the server refuses to start without a mailer
   assert.throws(() => createRuntime(strict, { mailer }), /Refusing to start: currencycloud and equals would be served by an in-memory MOCK/);
   const wire = { request: async () => ({ status: 500, body: '' }) };
   assert.throws(() => createRuntime(strict, { mailer, transports: { currencycloud: wire } }), /Refusing to start: equals would be served/);
+  // A refused start touches nothing: no database, no lock, no folder is left where a real one is meant to go.
+  assert.deepEqual(readdirSync(path.dirname(LIVE.DATABASE_PATH)), []);
   // With live wires and a mailer it starts, and with no sample people or companies.
   const runtime = createRuntime(strict, { mailer, transports: { currencycloud: wire, equals: wire } });
   assert.deepEqual(runtime.registry.mocked(), []);

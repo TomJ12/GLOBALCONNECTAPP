@@ -20,13 +20,14 @@
  * in memory only, bounded and rate limited, so they can neither fill nor
  * push anything out of the log proper. They do not survive a restart.
  */
-import { randomBytes } from 'node:crypto';
+import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { canonicalJson } from '@/api/canonical';
 
-import type { AuditEntry, AuditFilter, AuditLog, AuditParty } from '../types';
+import type { AuditEntry, AuditFilter, AuditInput, AuditLog, AuditParty } from '../types';
 import type { Db, Row } from './db';
-import { chainHash, type DataKeys } from './keys';
+import { chainHash, type DataKey, type DataKeys } from './keys';
+import { AUDIT_TRIGGERS } from './migrations';
 
 export interface AuditOptions {
   /** Entries kept in the live table; beyond this the oldest are moved to the archive. */
@@ -48,6 +49,23 @@ export interface AuditVerification {
 }
 
 const GENESIS = '0'.repeat(64);
+
+type HeadRow = { seq: number; hash: string; count: number | null; mac: string | null; key_id: string | null };
+/** Where the log ended at some moment, signed with the chain key. Kept in a file outside the database. */
+export interface AuditCheckpoint {
+  seq: number;
+  hash: string;
+  count: number;
+  at: number;
+  keyId: string;
+  mac: string;
+}
+const macKey = (key: DataKey, purpose: string): Buffer => Buffer.from(hkdfSync('sha256', key.key, Buffer.alloc(0), purpose, 32));
+const headMac = (key: DataKey, seq: number, hash: string, count: number): string => createHmac('sha256', macKey(key, 'gc-audit-head')).update(canonicalJson([seq, hash, count])).digest('hex');
+const checkpointMac = (key: DataKey, body: Omit<AuditCheckpoint, 'mac'>): string =>
+  createHmac('sha256', macKey(key, 'gc-audit-checkpoint')).update(canonicalJson([body.seq, body.hash, body.count, body.at, body.keyId])).digest('hex');
+const safeEqualHex = (a: string, b: string): boolean => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const squash = (sql: string): string => sql.replace(/\s+/g, ' ').trim();
 const ANONYMOUS_LABEL_LENGTH = 80;
 const FIELDS = 'id, at, actor_type, actor_id, actor_label, target_type, target_id, target_label, action, outcome, source, detail, prev_hash, hash, key_id';
 
@@ -91,7 +109,15 @@ export class SqlAuditLog implements AuditLog {
     this.live = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM audit_log')?.n ?? 0;
   }
 
-  async append(entry: Omit<AuditEntry, 'id' | 'anonymous'>): Promise<void> {
+  async append(entry: AuditInput): Promise<void> {
+    this.appendNow(entry);
+  }
+
+  /**
+   * The same, for the store's own use inside a transaction it has open: the
+   * entry is written (or not) together with the state change it records.
+   */
+  appendNow(entry: AuditInput): void {
     const id = `evt_${randomBytes(9).toString('base64url')}`;
     if (entry.actor.id === null && entry.actor.type !== 'system' && entry.outcome === 'failure') {
       const window = this.windows.get(entry.source);
@@ -123,17 +149,66 @@ export class SqlAuditLog implements AuditLog {
     };
     // The end of the chain is read and moved on under the write lock, so two writers cannot both extend the same entry.
     this.db.tx(() => {
-      const previous = this.db.get<{ hash: string }>('SELECT hash FROM audit_head WHERE id = 1')?.hash ?? GENESIS;
+      const head = this.head();
+      const previous = head?.hash ?? GENESIS;
       const hash = chainHash(this.keys.current, previous, content(row));
       this.db.run(
         `INSERT INTO audit_log (${FIELDS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         row.id, row.at, row.actor_type, row.actor_id, row.actor_label, row.target_type, row.target_id, row.target_label, row.action, row.outcome, row.source, row.detail, previous, hash, this.keys.current.id,
       );
       const seq = this.db.get<{ seq: number }>('SELECT seq FROM audit_log WHERE id = ?', row.id)?.seq ?? 0;
-      this.db.run('INSERT INTO audit_head (id, seq, hash) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET seq = excluded.seq, hash = excluded.hash', seq, hash);
+      // The count only ever goes up by one from a head this server could verify; a head it could not is left to be found by `verify`.
+      this.writeHead(seq, hash, head && this.headProblem(head) === null ? (head.count ?? 0) + 1 : null);
     });
     this.live += 1;
     if (this.live > this.liveLimit) this.archive(entry.at);
+  }
+
+  // --- The signed end of the log -------------------------------------------------------------------
+
+  private head(): HeadRow | undefined {
+    return this.db.get<HeadRow>('SELECT seq, hash, count, mac, key_id FROM audit_head WHERE id = 1');
+  }
+  private writeHead(seq: number, hash: string, count: number | null): void {
+    const mac = count === null ? null : headMac(this.keys.current, seq, hash, count);
+    this.db.run(
+      'INSERT INTO audit_head (id, seq, hash, count, mac, key_id) VALUES (1, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET seq = excluded.seq, hash = excluded.hash, count = excluded.count, mac = excluded.mac, key_id = excluded.key_id',
+      seq, hash, count, mac, mac === null ? null : this.keys.current.id,
+    );
+  }
+  /** What is wrong with the record of the end of the log, or null. Only the holder of the key can write one that passes. */
+  private headProblem(head: HeadRow | undefined): string | null {
+    if (!head) return 'The signed record of the end of the log is missing.';
+    if (head.count === null || head.mac === null) return 'The record of the end of the log is not signed.';
+    const key = this.keys.all.find((item) => item.id === head.key_id);
+    if (!key) return `The record of the end of the log was signed with a key this server was not given (key id ${head.key_id}).`;
+    if (!safeEqualHex(headMac(key, head.seq, head.hash, head.count), head.mac)) return 'The record of the end of the log has been altered: its signature does not match.';
+    return null;
+  }
+  /**
+   * Signs the end of the log as it stands. Called ONLY in the transaction
+   * that creates the schema or that upgrades a database from before the end
+   * was signed; never to "repair" a head that fails its check.
+   */
+  sealHead(): void {
+    const last = this.db.get<{ seq: number; hash: string }>('SELECT seq, hash FROM (SELECT seq, hash FROM audit_log UNION ALL SELECT seq, hash FROM audit_archive) ORDER BY seq DESC LIMIT 1');
+    const count = this.db.get<{ n: number }>('SELECT (SELECT COUNT(*) FROM audit_log) + (SELECT COUNT(*) FROM audit_archive) AS n')?.n ?? 0;
+    this.writeHead(last?.seq ?? 0, last?.hash ?? GENESIS, count);
+  }
+
+  /** After a key rotation: the end of the log, if it verifies under an older key, is signed again with the current one. */
+  resignHead(): void {
+    const head = this.head();
+    if (head && this.headProblem(head) === null && head.key_id !== this.keys.current.id) this.writeHead(head.seq, head.hash, head.count);
+  }
+
+  /** A signed statement of where the log ended, to keep OUTSIDE the database (npm run audit:checkpoint). */
+  checkpoint(at: number): AuditCheckpoint {
+    const head = this.head();
+    const problem = this.headProblem(head);
+    if (problem || !head) throw new Error(`No checkpoint was made: ${problem ?? 'the end of the log is missing'} Run audit:verify.`);
+    const body = { seq: head.seq, hash: head.hash, count: head.count as number, at, keyId: this.keys.current.id };
+    return { ...body, mac: checkpointMac(this.keys.current, body) };
   }
 
   /** Moves the older half of the live table to the archive, in one transaction. */
@@ -177,13 +252,20 @@ export class SqlAuditLog implements AuditLog {
     return merged.sort((a, b) => b.entry.at - a.entry.at || b.order - a.order).slice(0, limit).map((item) => item.entry);
   }
 
-  /** Walks the whole chain, archive first, and checks every link and the recorded end. */
-  verify(): AuditVerification {
+  /**
+   * Walks the whole chain, archive first, and checks every link; that the
+   * signed record of the end matches the last entry and the number of
+   * entries; that the append-only triggers are in place and unaltered; and,
+   * given a checkpoint from outside the database, that the log still
+   * contains everything it contained then.
+   */
+  verify(checkpoint?: AuditCheckpoint): AuditVerification {
     const archived = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM audit_archive')?.n ?? 0;
     let previous = GENESIS;
     let expectedSeq: number | null = null;
     let count = 0;
     let last: AuditRow | null = null;
+    let atCheckpoint: { hash: string; count: number } | null = null;
     const fail = (problem: string): AuditVerification => ({ ok: false, entries: count, archived, problem });
     for (const table of ['audit_archive', 'audit_log']) {
       for (const row of this.db.all<AuditRow>(`SELECT * FROM ${table} ORDER BY seq`)) {
@@ -196,11 +278,31 @@ export class SqlAuditLog implements AuditLog {
         expectedSeq = row.seq + 1;
         count += 1;
         last = row;
+        if (checkpoint && row.seq === checkpoint.seq) atCheckpoint = { hash: row.hash, count };
       }
     }
-    const head = this.db.get<{ seq: number; hash: string }>('SELECT seq, hash FROM audit_head WHERE id = 1');
-    if (!head && count > 0) return fail('The record of the end of the log is missing.');
-    if (head && (!last || head.seq !== last.seq || head.hash !== last.hash)) return fail(`The log ends at entry ${last?.seq ?? 'none'}, but entry ${head.seq} was the last one written: the newest entries have been removed.`);
+    // The end of the log. Its record carries a signature only the key holder can make, over the last entry AND the count.
+    const head = this.head();
+    const headProblem = this.headProblem(head);
+    if (headProblem) return fail(`${headProblem} Entries may have been removed from the end of the log.`);
+    const signed = head as HeadRow;
+    if ((last?.seq ?? 0) !== signed.seq || (last?.hash ?? GENESIS) !== signed.hash) return fail(`The log ends at entry ${last?.seq ?? 'none'}, but entry ${signed.seq} was the last one written: the newest entries have been removed.`);
+    if (signed.count !== count) return fail(`The log holds ${count} entries but ${signed.count} were written: entries have been removed.`);
+    // The triggers that refuse UPDATE and DELETE must be there, exactly as this code creates them.
+    for (const [name, expected] of Object.entries(AUDIT_TRIGGERS)) {
+      const found = this.db.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", name)?.sql;
+      if (!found) return fail(`The trigger ${name}, which stops audit entries being changed or removed, is missing from the database.`);
+      if (squash(found) !== squash(expected)) return fail(`The trigger ${name}, which stops audit entries being changed or removed, has been altered.`);
+    }
+    if (checkpoint) {
+      const key = this.keys.all.find((item) => item.id === checkpoint.keyId);
+      if (!key) return fail(`The checkpoint was signed with a key this server was not given (key id ${checkpoint.keyId}).`);
+      const { mac, ...body } = checkpoint;
+      if (typeof mac !== 'string' || !safeEqualHex(checkpointMac(key, body), mac)) return fail('The checkpoint file is not one this server made, or it has been altered.');
+      if (checkpoint.count === 0 ? false : !atCheckpoint || atCheckpoint.hash !== checkpoint.hash || atCheckpoint.count !== checkpoint.count) {
+        return fail(`The log no longer contains what it contained at the checkpoint of ${new Date(checkpoint.at).toISOString()} (entry ${checkpoint.seq}, ${checkpoint.count} entries): it has been cut back or replaced by an older copy.`);
+      }
+    }
     return { ok: true, entries: count, archived, problem: null };
   }
 }

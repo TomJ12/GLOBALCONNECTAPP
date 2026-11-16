@@ -111,7 +111,9 @@ link appears: it is never shown in the ops console and never returned over HTTP.
 **Demo data is kept between runs.** `npm run demo` keeps everything in a SQLite
 database, `.demo-data/globalconnect.sqlite` (git-ignored), and says so when it starts:
 accounts you activate, sessions, lockouts, pending requests and the audit log all
-survive a restart. Wipe it with `npm run demo:reset`. Authenticator keys in it are
+survive a restart. Wipe it with `npm run demo:reset`, which only ever deletes the demo
+database in `.demo-data` (if `DATABASE_PATH` or `DATA_FILE` points anywhere else it
+refuses and deletes nothing). Authenticator keys in it are
 encrypted with a development key that is generated once and kept in a file beside the
 database (`globalconnect.sqlite.dev-key`); that only happens with
 `APP_ENV=development`. The activation codes the server itself printed for the sample
@@ -159,7 +161,9 @@ emailed (in development: printed in the server's terminal).
 - Use only the links printed by the **latest** start, and open them in a normal browser
   tab. The editor's built-in preview shows pages inside a frame, and both the ops
   console and the client app refuse to be framed.
-- After pulling a new version run `npm run demo:reset`, then `npm run demo`. Activation
+- After pulling a new version, `npm run demo` upgrades the demo database it finds (and
+  makes the `.demo-data` folder private to you, which the server now insists on). To
+  start from fresh sample accounts instead run `npm run demo:reset` first; activation
   links from before the reset no longer work.
 - If the activation code field is empty after opening a link, type the code printed
   next to the link (it is also the part of the link after `#code=`).
@@ -205,7 +209,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 140 tests (about three minutes)
+npm test                 # node:test, 167 tests (about three minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -287,7 +291,7 @@ server/
                     operations), seed.ts (sample people, development only),
                     sqlite/ (the only place with SQL: db.ts, migrations.ts, tables.ts,
                     directory.ts, audit.ts, keys.ts)
-    cli/db.ts       audit:verify, db:backup, db:rotate-key
+    cli/db.ts       audit:verify, audit:checkpoint, db:backup, db:rotate-key
     providers/
       adapter.ts          ProviderAdapter (= the app's ProviderClient + capabilities), registry
       currencycloud.ts    provider A: reuses src/api/adapters/currencycloud
@@ -333,7 +337,8 @@ Send payment, approve, reject, cancel and convert all follow the same rules:
    confirm step that states the amount, payee and masked account. Nothing is sent before
    the customer presses the confirm button.
 3. **Idempotency.** Creating a payment and booking a conversion send an idempotency key.
-   The payment key is bound to payee + amount + currency + reference. The conversion key
+   The payment key is bound to payee + amount + currency + reference (what the server
+   does with it is under "Approvals": "The payment key, on the server"). The conversion key
    is bound to the conversion *intent* (currencies, side, amount, type, date), not to the
    quote, so a re-quote of the same conversion reuses it.
    Approve, reject and cancel send **no** key. They are safe to repeat because a payment
@@ -464,13 +469,26 @@ the invitation still being the same one).
   piece of security state that is NOT in the database, so a restart resets them (lockout
   counters, which are in the database, are not reset).
 - **Sessions**: 15 minutes idle, 12 hours absolute, revoked by `POST /v1/auth/logout`.
-  Membership is re-read on every request.
+  Membership is re-read on every request. "Last seen" is written at most once a minute
+  per session (each write is a flushed commit), so a session can end up to a minute
+  *early* after its last request, never late. Reads are limited per session
+  (600 a minute). A person's authenticator key is decrypted only where a code is
+  actually checked, not whenever the person is loaded.
 - **Atomic state changes**: an invitation, a TOTP step, a recovery code, a sign-in
   challenge, a step-up permission and a session are each changed through the store's
   atomic operations (`Table.mutate`, `Table.take`, `Directory.updateUser`), never
   read-then-write. In the SQLite store each is one transaction that takes the write
-  lock before it reads (`BEGIN IMMEDIATE`) or a single `DELETE ... RETURNING`; a test
-  runs them from three processes at once against one file.
+  lock before it reads (`BEGIN IMMEDIATE`) or a single `DELETE ... RETURNING`. A test
+  runs them from three processes at once against one file; that shows the store's
+  transactions hold under real contention (the maintenance commands do open the
+  database beside a running server). It is **not** a claim that several servers can
+  share a database: exactly one server process may, and it takes a lock to make sure
+  (see "Database").
+- **A change and its audit entry are one transaction** wherever both are in the
+  database: a held payment's creation and every decision on it, an approval request's
+  decision and its completion, a company's edit. If the entry cannot be written the
+  change is not made. Where a provider or the mail is involved that cannot be so, and
+  the order is: record the intent, act, record the outcome.
 - **Logging**: method, path and status only. Query strings, bodies and headers are never
   logged. Activation codes travel in the link's fragment, not the path or query. (A
   search typed into the ops console is a query string: it reaches the server but not
@@ -505,45 +523,94 @@ the server.
 
 **The rule.** Each company has `approvalsRequired`: 0, 1 or 2. A new company gets 1, and
 so do the two demo companies. It is changed in the ops console (company page, "Payment
-approvals") as a request that an **ops admin** must approve; the change is audited. A
-change applies to payments created afterwards: **payments already waiting keep the rule
-they were created under**, and the request says so.
+approvals") as a request that an **ops admin** must approve; the change is audited.
+**A stricter rule applies at once**, to payments already waiting as well as to new ones:
+a waiting payment needs the larger of the rule it was created under and the rule in
+force when it is approved. **A looser rule applies only to payments created from then
+on**: lowering the rule (or switching it off) never releases a payment that is waiting.
+The request and its confirmation page say which of the two it is.
 
 **Creating.** A `creator` or `admin` creates a payment with a fresh code, as before.
 With a rule of 0 it goes to the provider at once, exactly as it always did. With 1 or 2
 the server **holds** it as "waiting for approval" and sends nothing to the provider.
 **No money is reserved**: the balance is not touched and is only checked when the
 payment is about to be sent, so a held payment can later fail for lack of funds. The
-payee's bank details are copied into the held payment at that moment.
+payee's details as shown to people are copied into the held payment at that moment,
+together with a **digest** of the payee: a SHA-256 hash of everything the
+provider holds about them, taken over the provider's raw record (every routing code of
+every kind, account number, IBAN, BIC, holder, bank, country, currency, payment types,
+addresses, and any field this code has never heard of), leaving out only the provider's
+own created/updated timestamps. Spacing and empty values are normalised; letter case
+and digits are not.
 
 **Approving.** An `approver` or `admin` approves with a fresh code. **The creator can
 never approve their own payment**, whatever their role. With 2 required, two different
 people must approve, neither of them the creator. Each approval is recorded with who and
-when. On the approval that completes the set the server checks, and only then sends:
+when. **Every** approval, not only the one that turns out to be the last, checks:
 
 - the payment is still waiting and has not expired;
-- the payee still exists at the provider and their bank details are **identical** to the
-  copy taken at creation; if not, the approval is refused and the payment is closed as
-  "payee changed" for good (create it again);
-- the creator and the approver are still enabled members of the company with roles that
-  allow creating and approving;
-- the provider reports enough balance.
+- the payee still exists at the provider and the digest of the provider's record is
+  **the same** as the one taken at creation; if not, the approval is refused and the
+  payment is closed as "payee changed" for good (create it again). This is a comparison
+  of digests of the provider's record, not a judgement about which fields matter: a
+  change the provider makes to a payee for its own reasons (a new status, a field it
+  starts returning) also blocks the payment, on purpose;
+- the creator is still an enabled member of the company with a role that allows
+  creating, and the approver one with a role that allows approving;
+- **every earlier approver** is still enabled, still a member and still allowed to
+  approve. An earlier approval whose giver no longer is, is dropped: it stops counting,
+  the payment needs another approval, and the audit log records which approval was
+  dropped and why (`system.payment.approval_dropped`);
+- the provider reports the balance. Not enough money refuses the approval that would
+  have sent the payment, and only that one.
 
-The payment's state, the creator's and the approver's accounts and roles are read and
-the new state is written **in one database transaction**. The payee and the balance are
-the provider's, so they are checked immediately before that transaction, not inside it.
+The payment, its company, the creator, the approver and every earlier approver are read
+and the new state is written **in one database transaction**, together with the audit
+entries for it. The payee and the balance are the provider's, so they are checked
+immediately before that transaction, by the same request: a payment only ever moves to
+`sending` through a request that itself ran both checks, and the transaction refuses if
+the payee digest or the company's provider account is no longer the one that
+request checked. (Two approvals arriving together therefore each run the checks; the
+window that remains is a change at the provider in the instant between a request's check
+and its commit, which no server-side check can close.)
 
 **Sending exactly once.** In that transaction the payment moves to `sending` and gets an
 idempotency key derived from the held payment's id. The provider is then asked to make
 the payment with that key. If the answer is lost, the server crashes, or the request is
 retried, the payment stays `sending` and is **settled by that key before anything else
 can happen to it**: the server looks the key up at the provider; if the payment is
-there, it is marked sent; if not, the provider is asked again **with the same key**. It
-is never sent under a new key. This runs at start-up (before the server takes
-requests), once a minute, and whenever anyone tries to act on that payment. A plain
-refusal by the provider (not enough money, details not accepted) is final: the payment
-is marked failed and is not retried. This relies on the provider honouring the
-idempotency key; both mocks do, and it has to be confirmed with each real provider.
+there, it is marked sent; if not, the provider is asked again **with the same key**.
+The server never asks under a second key, and it settles against the provider account
+that was recorded on the payment when it moved to `sending`, not whatever the company
+points at later (and a company cannot be re-pointed while one of its payments is
+`sending`). Whether that makes "exactly once" true is **the provider's** doing, not
+the server's: it holds only if the provider honours the idempotency key for as long as
+a send can stay unsettled, and finds a payment by that key. Both mocks do; it has to be
+confirmed with each real provider, and until it is, "sent once" is a claim about the
+mocks. This runs at start-up (before the server takes requests; every unsettled send,
+since no other process can be in the middle of one), once a minute, and whenever anyone
+tries to act on that payment. A plain refusal by the provider (not enough money,
+details not accepted) is final: the payment is marked failed and is not retried.
+
+When the provider's answer comes back, its amount, currency and payee are compared with
+what was approved. A difference does not undo anything (the payment has been made), but
+it is flagged: an audit entry `system.payment.send_mismatch`, and the app shows the
+payment as "Sent, but not as approved: contact support" instead of as an ordinary sent
+payment.
+
+**The payment key, on the server.** The app sends an idempotency key with each new
+payment. On the server it means: *this key, from this person, with this request, is one
+payment*. The server stores a hash of the request (payee, amount, currency, reference,
+reason) and who made it. The same key from the same person with the same request
+returns the original payment and creates nothing. The same key with anything different,
+or from another member of the company, is refused as a validation error that says
+nothing about the payment the key belongs to. The key is looked up both among held
+payments and at the provider, whatever the company's rule is at that moment, so a rule
+changed between two attempts cannot turn one request into two payments (held and then
+sent directly, or the reverse). One limit: for a payment that was never held (rule 0)
+the server keeps no record of its own, so "who made it" is not known; a colleague
+repeating the identical request with the same key is shown that payment (which every
+member can see anyway), and it is not made again.
 
 **Reject, cancel, expire.** An `approver` or `admin` can reject (optionally with a
 reason, through the API; the app does not ask for one). The creator, or a company
@@ -566,7 +633,12 @@ expires, and can cancel; they are not offered Approve. An approver sees who crea
 the payee's bank details masked, and the approvals so far. Payments that were already
 pending at the provider (the seeded sample on provider A) remain in the list and can be
 approved or rejected there as before; the API marks them `external` and the app says
-they are not held by Global Connect.
+they are not held by Global Connect. For those the server applies the same role rule
+(approver or admin, with a fresh code) and records who approved or rejected, marked
+`external` in the audit log. It does **not** apply its own creator-cannot-approve rule,
+approver re-validation, payee digest or expiry to them: it never held them and
+does not know who created them; whatever the provider's own approval rules are is all
+that applies.
 
 **API.** `POST /v1/payments` (held → `status: "awaiting_approval"` and a `held` object),
 `GET /v1/approvals`, `POST /v1/payments/:id/approve|reject|cancel` (each with a
@@ -909,12 +981,39 @@ entry, and database triggers reject every `UPDATE` and `DELETE` on it.
 
 **Tamper-evident.** Each entry stores a keyed hash (HMAC-SHA-256) over the entry before
 it and its own content; the key is derived from `DATA_ENCRYPTION_KEY`, which is not in
-the database. `npm run audit:verify` walks the whole chain, archive included, and exits
-non-zero naming the first entry that was changed, removed or inserted, or saying that
-the newest entries were cut off. Limits, plainly: this detects tampering by someone who
-has the database file but not the key. Someone with the key can rewrite the chain, and
-someone who restores a whole older copy of the file leaves a chain that verifies; only
-shipping entries to separate write-once storage addresses those, and that is not built.
+the database. The **end of the log** (the last entry's number and hash, and how many
+entries were ever written) is kept in one row that is itself signed with a key derived
+from `DATA_ENCRYPTION_KEY`; it is signed when the database is created (or upgraded) and
+re-signed only by a server that found the previous signature valid. `npm run
+audit:verify` (read-only; it changes nothing in the database) checks:
+
+- the whole chain, archive included, naming the first entry that was changed, removed,
+  inserted or reordered;
+- that the log ends where the signed record says, with as many entries as it says. So
+  cutting entries off the end is found **even if the record of the end is edited,
+  copied from the entry that is now last, or deleted**: without the key it cannot be
+  made to match, and a missing or unsigned record is itself a failure;
+- that the triggers which refuse `UPDATE` and `DELETE` exist and are exactly the ones
+  this code creates (dropping them, or putting back ones that refuse nothing, is
+  reported even when no entry was touched).
+
+What the file alone can never show is the **whole database replaced by an older copy of
+itself**: an older copy is a valid log. For that, export a checkpoint and keep it where
+whoever keeps the database cannot change it:
+
+```bash
+npm run audit:checkpoint -- /somewhere/else/audit-2026-11-16.checkpoint   # refuses to overwrite
+npm run audit:verify -- --checkpoint /somewhere/else/audit-2026-11-16.checkpoint
+```
+
+The checkpoint is a small signed file (entry number, hash, count, time; no entry
+content). Verifying with it fails if the log no longer contains what it contained then.
+Limits, plainly: all of this detects tampering by someone who has the database file but
+**not the key**. Someone with the key can rewrite the chain, the record of its end and a
+checkpoint. Everything written after the newest checkpoint you hold can still be rolled
+back unnoticed by restoring an older copy. Taking checkpoints is manual: nothing
+schedules it or ships it off the machine, and a checkpoint left beside the database
+protects nothing. Write-once storage for entries is not built.
 After a key rotation, keep the old key in `DATA_ENCRYPTION_KEY_PREVIOUS` for as long as
 entries written under it must verify.
 
@@ -929,8 +1028,16 @@ limits"). Retention and shipping off the machine are still to do.
 
 - **Email delivery:** there is a `Mailer` interface and no implementation that sends
   mail. The server will not start outside development without one.
-- **The database is one SQLite file on the server's disk** (see "Database"): one server
-  instance, no replication.
+- **The database is one SQLite file on the server's disk** (see "Database"): exactly
+  one server process, no replication.
+- **A request that was approved but interrupted** (a crash, the mail or the provider
+  failing half-way) is neither shown as approved nor silently retried. It is listed on
+  the Approvals page under "Approved, but not finished" and counted in the server's log
+  at start-up; the approver or an ops admin (never the requester) finishes it, which
+  repeats only what is missing (creating a company, a client or a staff member a second
+  time creates nothing; an activation email is sent again with a new link, which cancels
+  the earlier one), or closes it, which undoes nothing and says so. Nothing finishes
+  such a request automatically.
 - **Who can reach `/ops`:** it is on the same port as the client API, open to anyone who
   can reach the server. It needs **IP allow-listing or a VPN, and staff SSO**.
 - **Four-eyes is as described above and no more:** two ops admins acting together can do
@@ -991,7 +1098,14 @@ covers the audit log and everything else), foreign keys on, a 5-second busy time
 **Migrations** are numbered and forward-only (`server/src/store/sqlite/migrations.ts`).
 At start-up each one not yet applied runs in its own transaction and is recorded in
 `schema_version`. A database with a higher version than the code knows is refused: the
-server will not open a file written by a newer version of itself.
+server will not open a file written by a newer version of itself. Migration 4 (this
+version) signs the end of the audit log as it stands and makes two rules the database's
+own: **one provider account, one company** and **one company per name** (compared
+ignoring case, spacing and width) are unique indexes, so two approvals arriving together
+cannot create two companies on one account; the loser is refused with a plain message
+and its request goes back to waiting. A database from the previous version upgrades in
+that one step at the next server start; if it already holds two companies on one
+account or with one name the upgrade stops, says which, and changes nothing.
 
 **Transactions.** Every read-then-write of security state (setting a password on an
 invitation, counting an attempt, burning an authenticator step, using a recovery code,
@@ -1017,7 +1131,32 @@ npm run db:rotate-key        # re-encrypts every stored authenticator key with t
 ```
 
 It can be run while the server is running, but the server only starts using the new key
-when it is restarted with it.
+when it is restarted with it. The rotation is **one transaction**: if any stored secret
+cannot be decrypted it stops, names the table and row, and nothing is changed.
+
+**One server process.** The server keeps some state in its own memory (rate limits, the
+quotes it issued) and assumes nobody else is sending its payments, so it must be the only
+server on its database. It takes an exclusive lock (`<database>.lock`) at start-up and a
+second server on the same file refuses to start. The operating system releases the lock
+if the process dies. The maintenance commands (`audit:verify`, `audit:checkpoint`,
+`db:backup`, `db:rotate-key`) do not take it and can run beside the server.
+
+**File permissions.** The database holds password hashes, encrypted keys and the audit
+log. The server sets its umask to 077 at start-up, creates the database, its `-wal` and
+`-shm` files, the lock, the development key file and its folder for the owner only
+(`600`/`700`), and **refuses to start** (and the commands refuse to run) if the database
+file or its folder can be read or written by group or others, naming the `chmod` that
+puts it right. `npm run demo` tightens its own `.demo-data` folder; the container's
+entry script does the same for the volume. Not checked: the folders above it, ACLs, and
+who else can become the server's user. Not applicable on Windows, where the check is
+skipped.
+
+**A database that has been used in development stays a development database.** The first
+start in `APP_ENV=development` marks the database (it then holds sample accounts and, in
+`dev_seed_codes`, their activation codes in readable form). A strict start **refuses**
+such a database rather than purging it: start a real deployment with a new file. A
+database that has lost the marker saying which encryption key wrote it is refused too,
+whatever key is offered (restore from a backup).
 
 **Backups.** Do not copy the file while the server is running: with write-ahead logging
 a plain copy can be inconsistent. Use
@@ -1027,10 +1166,15 @@ npm run db:backup -- /path/to/backup.sqlite     # refuses to overwrite an existi
 ```
 
 which takes a consistent snapshot with SQLite's `VACUUM INTO` while the server keeps
-running. The backup holds everything the database does; the encryption key is not in
-it and must be kept separately (and must be kept: without it the authenticator keys in
-the backup cannot be read and the audit chain cannot be verified). Scheduling, off-site
-copies and restore drills are not built.
+running. The command opens the database read-only, and the backup file is created for
+the owner only (`600`) before anything is written to it; the folder you put it in is
+yours to protect. A database left by an older version is not upgraded by a command:
+start the server once first. The backup holds everything the database does; the
+encryption key is not in it and must be kept separately (and must be kept: without it
+the authenticator keys in the backup cannot be read and the audit chain cannot be
+verified). A backup is also exactly what "an older copy of the database" means for the
+audit log: take an `audit:checkpoint` when you take one. Scheduling, off-site copies
+and restore drills are not built.
 
 **Moving to PostgreSQL later.** All SQL is in `server/src/store/sqlite/`; services see
 only the interfaces in `server/src/store/types.ts` (`Directory`, `OpsDirectory`,
@@ -1041,9 +1185,10 @@ locking strategy, `VACUUM INTO` for backup); `migrations.ts` (`STRICT` tables,
 `tables.ts` (small tables stored as one JSON document per key, with `json_extract` in
 lookups). In PostgreSQL the transactions would become `SELECT ... FOR UPDATE` or
 conditional `UPDATE`s, the documents `jsonb`, and the interfaces (already
-`Promise`-returning) would not change. SQLite also means **one server instance**: the
-in-memory rate limits and the issued-quote map (`http/app.ts`, capped at 20,000 quotes)
-would have to move to shared storage first.
+`Promise`-returning) would not change. More than one server process would need more
+than a different database: the in-memory rate limits and the issued-quote map
+(`http/app.ts`, capped at 20,000 quotes) would have to move to shared storage, and the
+start-up settling of unfinished sends assumes there is no other server.
 
 ## How closely the mocks follow the real APIs
 

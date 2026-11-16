@@ -66,6 +66,13 @@ export interface ProviderClient {
    */
   approvePayment(paymentId: string): Promise<ApprovalResult>;
   rejectPayment(paymentId: string): Promise<void>;
+  /**
+   * The text to digest for "has this payee's destination changed?": the
+   * provider's whole raw record of the payee, normalised (see digest.ts).
+   * Null when the payee no longer exists. Only backends that talk to a
+   * provider directly have this.
+   */
+  beneficiaryDigestSource?(beneficiaryId: string): Promise<string | null>;
   /** Withdraw a payment that is still waiting for approval. Only a backend that holds payments itself has this. */
   cancelPayment?(paymentId: string): Promise<void>;
 }

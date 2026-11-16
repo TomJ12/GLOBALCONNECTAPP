@@ -301,6 +301,30 @@ To check the audit log has not been altered:
 fly ssh console -C "gc audit-verify"
 ```
 
+That finds entries changed, removed or cut off the end. The one thing it cannot find by
+itself is the whole database having been swapped for an older copy of itself. If that
+matters to you, take a **checkpoint** when you take a backup (a small signed note of
+where the log ended; it contains no audit entries), download it and keep it with the
+backup, off the server:
+
+```bash
+fly ssh console -C "gc audit-checkpoint /data/audit-2026-11-13.checkpoint"
+fly ssh sftp get /data/audit-2026-11-13.checkpoint ./audit-2026-11-13.checkpoint
+fly ssh console -C "rm /data/audit-2026-11-13.checkpoint"
+```
+
+To check against it later, put it back on the server first (`fly ssh sftp shell`, then
+`put audit-2026-11-13.checkpoint /data/audit-2026-11-13.checkpoint`), and run
+`fly ssh console -C "gc audit-verify --checkpoint /data/audit-2026-11-13.checkpoint"`.
+
+**File permissions and the one-server rule.** The server refuses to start if the
+database, or the `/data` folder, could be read by another user of the machine, and if
+another server process is already using the database. You should not meet either on
+Fly: the container's start script makes `/data` and the files in it private to the
+server's user on every start, and a volume is attached to one machine only. If the log
+ever says "can be read or changed by other users" or "Another Global Connect server
+process is already running", do not work around it; the message says what to do.
+
 **Fly's own snapshots.** Separately, Fly takes a snapshot of the whole volume every
 day and keeps five days of them (`snapshot_retention` in `fly.toml`). They are a
 second safety net, not a replacement for the download above: they live in the same

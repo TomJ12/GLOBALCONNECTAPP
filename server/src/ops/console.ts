@@ -42,7 +42,7 @@ import { ApiError } from '../errors';
 import { activationMessage, maskEmail, type Mailer } from '../mailer';
 import type { ProviderRegistry } from '../providers/adapter';
 import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate';
-import { approvalsRequiredOf, type ApprovalRecord, type ApprovalsRequired, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
+import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type ApprovalsRequired, type AuditInput, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { h, Html, layout, qrSvg, when } from './html';
 
@@ -251,6 +251,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         /** Null when the action needs no second person (or four-eyes is off in development). */
         approver: OpsUserRecord | null;
         source: string;
+        /** The approval request being carried out, if there is one. What an action creates is named after it, so carrying the same request out again creates nothing twice. */
+        requestId?: string;
       }
       interface Applied {
         target: AuditParty | null;
@@ -292,6 +294,10 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         config.fourEyes && (typeof def.fourEyes === 'function' ? def.fourEyes(params) : def.fourEyes === true);
       const needsAdminApproval = (def: ActionDef, params: Record<string, string>): boolean =>
         typeof def.adminApproval === 'function' ? def.adminApproval(params) : def.adminApproval === true;
+      const conflictError = (error: StoreConflict): OpsError =>
+        error.what === 'company_name'
+          ? new OpsError('Another company already has that name. Company names must be different.', 409, 'name_taken')
+          : new OpsError('Another company is already mapped to that provider account. Two companies can never share one.', 409, 'mapping_taken');
       const flagOf = (flag: ActionDef['danger'], params: Record<string, string>): boolean => (typeof flag === 'function' ? flag(params) : flag === true);
       const person = (user: OpsUserRecord) => ({ id: user.id, email: user.email });
       const append = (actor: AuditParty, action: string, outcome: 'success' | 'failure', target: AuditParty | null, source: string, detail: Record<string, string>) =>
@@ -415,6 +421,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           } catch (error) {
             // Not a failure: the action has not been attempted yet. Nothing was changed and nothing is logged.
             if (error instanceof ConfirmNeeded) return send(reply, error.notice ? 409 : 200, confirmationPage(ctx, options.name, path, form, error.confirmation, error.notice));
+            // The database's own refusal of a second company with the same name or provider account.
+            if (error instanceof StoreConflict) error = conflictError(error);
             await append(opsParty(ctx.user), `ops.${options.name}`, 'failure', target, request.ip, { reason: error instanceof OpsError ? error.reason : reasonOf(error) });
             return problem(reply, ctx, error);
           }
@@ -714,13 +722,48 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         if (!request) throw new OpsError('No such request.', 404, 'not_found');
         return request;
       };
-      /** Moves a pending request to its final state. Atomic: of two decisions arriving together, one wins. */
-      const decide = async (request: ApprovalRecord, status: 'approved' | 'rejected' | 'cancelled', by: OpsUserRecord): Promise<void> => {
+      /**
+       * Moves a pending request on: to rejected or cancelled (final), or to `applying` (approved, about to be carried
+       * out). Atomic: of two decisions arriving together, one wins. `audit` is written in the same transaction.
+       */
+      const decide = async (request: ApprovalRecord, status: 'applying' | 'rejected' | 'cancelled', by: OpsUserRecord, audit?: (stored: ApprovalRecord) => AuditInput | AuditInput[] | null): Promise<void> => {
         const decidedAt = now();
-        const changed = await stores.ops.approvals.mutate(request.id, (current) =>
-          current && current.status === 'pending' && current.expiresAt > decidedAt ? { ...current, status, decidedBy: person(by), decidedAt } : undefined,
+        const changed = await stores.ops.approvals.mutate(
+          request.id,
+          (current) => (current && current.status === 'pending' && current.expiresAt > decidedAt ? { ...current, status, decidedBy: person(by), decidedAt } : undefined),
+          (stored) => (stored && audit && stored.status === status && stored.decidedAt === decidedAt && stored.decidedBy?.id === by.id ? audit(stored) : null),
         );
         if (!changed || changed.status !== status || changed.decidedBy?.id !== by.id || changed.decidedAt !== decidedAt) throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
+      };
+      const entryOf = (actor: AuditParty, action: string, target: AuditParty | null, source: string, detail: Record<string, string>): AuditInput => ({ at: now(), actor, target, action, outcome: 'success', source, detail });
+      /**
+       * Carries out a request that is in `applying`, then marks it approved together with both audit entries, in one
+       * transaction. A REFUSAL (the checks no longer pass: things changed since it was asked for) puts it back to
+       * waiting, nothing having been done. Any other failure (the provider, the mail, a crash) leaves it `applying`:
+       * it may be half done, and it has to be finished or closed from the Approvals page, never guessed at.
+       */
+      const carryOut = async (item: ApprovalRecord, def: ActionDef, requester: OpsUserRecord, approver: OpsUserRecord, source: string, extra: Record<string, string>, resuming: boolean): Promise<void> => {
+        let applied: Applied;
+        try {
+          applied = await def.apply(item.params, { requester, approver, source, requestId: item.id });
+        } catch (caught) {
+          const error = caught instanceof StoreConflict ? conflictError(caught) : caught;
+          if (error instanceof OpsError && !resuming) {
+            await stores.ops.approvals.mutate(item.id, (current) => (current && current.status === 'applying' ? { ...current, status: 'pending', decidedBy: null, decidedAt: null } : undefined));
+          }
+          throw error;
+        }
+        const both = { request: item.id, requestedBy: requester.email, approvedBy: approver.email, confirmed: 'yes', ...extra };
+        const target = applied.target ?? item.target;
+        const done = await stores.ops.approvals.mutate(
+          item.id,
+          (current) => (current && current.status === 'applying' ? { ...current, status: 'approved' } : undefined),
+          (stored) =>
+            stored?.status === 'approved'
+              ? [entryOf(opsParty(requester), `ops.${def.name}`, target, source, { ...applied.detail, ...both }), entryOf(opsParty(approver), 'ops.approval.approve', target, source, { ...both, action: def.name, ...(resuming ? { resumed: 'yes' } : {}) })]
+              : null,
+        );
+        if (done?.status !== 'approved') throw new OpsError('This request is no longer being carried out.', 409, 'not_pending');
       };
       /** How often this approver has been the one to approve this requester lately. Shown to the approver, and kept with the approval. */
       const pairHistory = async (requesterId: string, approverId: string): Promise<{ byRequester: number; byPair: number; flag: boolean }> => {
@@ -737,13 +780,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const row = (item: ApprovalRecord) =>
           h`<tr><td><a href="/ops/approvals/${item.id}">${item.summary}</a></td><td>${item.requestedBy.email}</td><td>${when(item.requestedAt)}</td><td>${statusTag(item)}</td><td>${item.status === 'pending' ? `expires ${when(item.expiresAt)}` : item.decidedBy ? `${item.decidedBy.email}, ${when(item.decidedAt)}` : when(item.decidedAt)}</td></tr>`;
         const pending = all.filter((item) => item.status === 'pending');
+        const interrupted = all.filter((item) => item.status === 'applying');
         return send(
           reply,
           200,
           layout(
             chromeOf(ctx, 'Approvals', flashOf(request)),
-            h`<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
-<div class="card"><h2>Decided (latest 50)</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th>Decided</th></tr>${all.filter((item) => item.status !== 'pending').slice(0, 50).map(row)}</table></div>`,
+            h`${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
+<div class="card"><h2>Decided (latest 50)</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th>Decided</th></tr>${all.filter((item) => item.status !== 'pending' && item.status !== 'applying').slice(0, 50).map(row)}</table></div>`,
           ),
         );
       });
@@ -766,7 +810,11 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               item.status === 'approved' && def?.mails && item.target && h`<p class="flash">An activation email was sent to ${maskEmail(item.target.label)}. The link is not shown to staff.</p>`
             }</div>
 <div>${
-              item.status !== 'pending'
+              item.status === 'applying'
+                ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">This was approved by ${item.decidedBy?.email ?? 'someone'} and then interrupted while being carried out. It may be partly done.</p>${
+                    mine ? h`<p class="muted">It is your own request: a different staff member must finish or close it.</p>` : h`${form(ctx, `${base}/resume`, h``, 'Finish carrying it out')}${form(ctx, `${base}/abandon`, h``, 'Close without finishing', { danger: true })}`
+                  }</div>`
+                : item.status !== 'pending'
                 ? h`<div class="card"><p class="muted">This request is ${item.status}.</p></div>`
                 : mine
                   ? h`<div class="card"><h2>Your request</h2><p class="muted">You cannot approve your own request. A different staff member must do it.</p>${form(ctx, `${base}/cancel`, h``, 'Cancel request')}</div>`
@@ -806,37 +854,71 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           danger: flagOf(def.danger, item.params),
           password,
         });
-        await decide(item, 'approved', ctx.user);
-        let applied: Applied;
-        try {
-          applied = await def.apply(item.params, { requester, approver: ctx.user, source });
-        } catch (error) {
-          // It could not be carried out (things changed since it was asked for): it goes back to waiting.
-          await stores.ops.approvals.mutate(item.id, (current) => (current && current.status === 'approved' ? { ...current, status: 'pending', decidedBy: null, decidedAt: null } : undefined));
-          throw error;
-        }
-        const both = { request: item.id, requestedBy: requester.email, approvedBy: ctx.user.email, pairApprovals30d: String(history.byPair + 1), confirmed: 'yes', ...(password ? { passwordChecked: 'yes' } : {}) };
-        await append(opsParty(requester), `ops.${def.name}`, 'success', applied.target ?? item.target, source, { ...applied.detail, ...both });
-        await append(opsParty(ctx.user), 'ops.approval.approve', 'success', applied.target ?? item.target, source, { ...both, action: def.name });
+        // The decision is on record from the moment it is made, whatever becomes of carrying it out.
+        await decide(item, 'applying', ctx.user, () => entryOf(opsParty(ctx.user), 'ops.approval.begin', item.target, source, { request: item.id, action: item.action, requestedBy: requester.email, approvedBy: ctx.user.email, confirmed: 'yes', ...(password ? { passwordChecked: 'yes' } : {}) }));
+        await carryOut(item, def, requester, ctx.user, source, { pairApprovals30d: String(history.byPair + 1), ...(password ? { passwordChecked: 'yes' } : {}) }, false);
         return { redirect: `/ops/approvals/${item.id}?done=approved`, audited: true };
       });
-      post('/approvals/:id/reject', { name: 'approval.reject' }, async ({ ctx, params, aim, confirm }) => {
+      // A request that was approved but not (or not completely) carried out: finish it, or close it.
+      post('/approvals/:id/resume', { name: 'approval.resume' }, async ({ ctx, params, source, aim, confirm }) => {
+        const item = await approvalOf(params.id);
+        if (item.target) aim(item.target);
+        const def = actions.get(item.action);
+        if (!def || item.status !== 'applying' || !item.decidedBy) throw new OpsError('This request is not waiting to be finished.', 409, 'not_pending');
+        // Whoever approved it, or an ops admin: never the person who asked.
+        if (item.requestedBy.id === ctx.user.id) throw new OpsError('You cannot carry out your own request. A different staff member must do it.', 403, 'own_request');
+        if (item.decidedBy.id !== ctx.user.id && ctx.user.role !== 'ops_admin') throw new OpsError('Only the staff member who approved this request, or an ops admin, can finish it.', 403, 'forbidden');
+        if (needsAdminApproval(def, item.params) && ctx.user.role !== 'ops_admin') throw new OpsError('Only an ops admin can approve this kind of request.', 403, 'admin_approval');
+        const requester = await stores.ops.users.get(item.requestedBy.id);
+        if (!requester || !isActiveStaff(requester)) throw new OpsError('The staff member who made this request can no longer make it. Close it instead.', 409, 'requester_inactive');
+        const password = flagOf(def.password, item.params);
+        await confirm({
+          title: `Finish carrying out: ${item.summary}`,
+          notes: [...item.warnings, `Approved by ${item.decidedBy.email} on ${when(item.decidedAt)}, but it was interrupted before it was recorded as done. It may be partly done. Carrying it out again repeats only what is missing.`],
+          effect: 'This carries the change out now.',
+          danger: flagOf(def.danger, item.params),
+          password,
+        });
+        await carryOut(item, def, requester, ctx.user, source, password ? { passwordChecked: 'yes' } : {}, true);
+        return { redirect: `/ops/approvals/${item.id}?done=approved`, audited: true };
+      });
+      post('/approvals/:id/abandon', { name: 'approval.abandon' }, async ({ ctx, params, source, aim, confirm }) => {
+        const item = await approvalOf(params.id);
+        if (item.target) aim(item.target);
+        if (item.status !== 'applying') throw new OpsError('This request is not waiting to be finished.', 409, 'not_pending');
+        if (item.decidedBy?.id !== ctx.user.id && ctx.user.role !== 'ops_admin') throw new OpsError('Only the staff member who approved this request, or an ops admin, can close it.', 403, 'forbidden');
+        await confirm({
+          title: `Close without finishing: ${item.summary}`,
+          notes: ['It was approved and may have been PARTLY carried out before it was interrupted. Closing it does not undo anything: check the person or company it is about, and make a new request for whatever is still missing.'],
+          effect: 'The request is closed. Nothing more is done.',
+          danger: true,
+        });
+        const detail = { request: item.id, action: item.action, requestedBy: item.requestedBy.email, approvedBy: item.decidedBy?.email ?? '', closedBy: ctx.user.email, confirmed: 'yes', note: 'closed while being carried out; it may be partly done' };
+        const closed = await stores.ops.approvals.mutate(
+          item.id,
+          (current) => (current && current.status === 'applying' ? { ...current, status: 'rejected' } : undefined),
+          (stored) => (stored?.status === 'rejected' ? entryOf(opsParty(ctx.user), 'ops.approval.abandon', item.target, source, detail) : null),
+        );
+        if (closed?.status !== 'rejected') throw new OpsError('This request is not waiting to be finished.', 409, 'not_pending');
+        return { redirect: `/ops/approvals/${item.id}?done=rejected`, audited: true };
+      });
+      post('/approvals/:id/reject', { name: 'approval.reject' }, async ({ ctx, params, source, aim, confirm }) => {
         const item = await approvalOf(params.id);
         if (item.target) aim(item.target);
         if (item.requestedBy.id === ctx.user.id) throw new OpsError('To withdraw your own request, cancel it.', 403, 'own_request');
         if (item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
         await confirm({ title: `Reject the request: ${item.summary}`, notes: [`Requested by ${item.requestedBy.email} on ${when(item.requestedAt)}.`], effect: 'The request is closed and nothing is changed. It cannot be approved afterwards.' });
-        await decide(item, 'rejected', ctx.user);
-        return { detail: { request: item.id, action: item.action, requestedBy: item.requestedBy.email, rejectedBy: ctx.user.email }, redirect: `/ops/approvals/${item.id}?done=rejected` };
+        await decide(item, 'rejected', ctx.user, () => entryOf(opsParty(ctx.user), 'ops.approval.reject', item.target, source, { request: item.id, action: item.action, requestedBy: item.requestedBy.email, rejectedBy: ctx.user.email, confirmed: 'yes' }));
+        return { redirect: `/ops/approvals/${item.id}?done=rejected`, audited: true };
       });
-      post('/approvals/:id/cancel', { name: 'approval.cancel' }, async ({ ctx, params, aim, confirm }) => {
+      post('/approvals/:id/cancel', { name: 'approval.cancel' }, async ({ ctx, params, source, aim, confirm }) => {
         const item = await approvalOf(params.id);
         if (item.target) aim(item.target);
         if (item.requestedBy.id !== ctx.user.id) throw new OpsError('Only the staff member who made a request can cancel it. You can reject it.', 403, 'not_requester');
         if (item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
         await confirm({ title: `Cancel your request: ${item.summary}`, effect: 'The request is withdrawn and nothing is changed.' });
-        await decide(item, 'cancelled', ctx.user);
-        return { detail: { request: item.id, action: item.action, requestedBy: item.requestedBy.email }, redirect: `/ops/approvals/${item.id}?done=cancelled` };
+        await decide(item, 'cancelled', ctx.user, () => entryOf(opsParty(ctx.user), 'ops.approval.cancel', item.target, source, { request: item.id, action: item.action, requestedBy: item.requestedBy.email, confirmed: 'yes' }));
+        return { redirect: `/ops/approvals/${item.id}?done=cancelled`, audited: true };
       });
 
       // --- Companies ---------------------------------------------------------------
@@ -878,6 +960,16 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           throw new OpsError('The provider could not be asked whether that account exists. Nothing was changed; try again.', 502, 'provider_unavailable');
         }
         if (!exists) throw new OpsError('The provider does not know that account id (with that contact id). Check it and try again.', 400, 'mapping_unknown');
+      };
+      /**
+       * A company cannot be re-pointed while one of its payments has been handed to the provider and the answer is
+       * not yet known: that payment is settled on the account it was sent to. Returns how many payments are waiting
+       * for approval (a number only: ops never sees a payment).
+       */
+      const assertNothingBeingSent = async (companyId: string): Promise<number> => {
+        const sending = (await stores.payments.list({ companyId, status: 'sending' })).length;
+        if (sending > 0) throw new OpsError(`${sending} ${sending === 1 ? 'payment of this company is' : 'payments of this company are'} being sent to the provider and the outcome is not known yet. The company cannot be re-pointed until that is settled (the server retries every minute). Try again shortly.`, 409, 'payments_sending');
+        return (await stores.payments.list({ companyId, status: 'awaiting_approval' })).length;
       };
       const membersOf = async (companyId: string): Promise<UserRecord[]> => {
         const ids = (await stores.directory.listMemberships()).filter((item) => item.companyId === companyId).map((item) => item.userId);
@@ -937,11 +1029,15 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           await assertMappingAllowed(mapping, null);
           return { params: { name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId }, summary: `Create company “${mapping.name}” on ${PROVIDERS[mapping.providerKey].label}, account ${mapping.providerAccountId}`, warnings: ['Everyone later attached to this company will see and move the money in that provider account. It starts with one approval required for payments.'] };
         },
-        async apply(params) {
+        async apply(params, { requestId }) {
           const mapping = mappingOf(params);
+          // Named after the request that creates it: carrying the same request out twice makes one company.
+          const company: CompanyRecord = { id: requestId ? `co_${sha256(`company:${requestId}`).slice(0, 12)}` : `co_${randomToken().slice(0, 12)}`, ...mapping, deactivatedAt: null };
+          const existing = await stores.directory.getCompany(company.id);
+          if (existing) return { target: companyParty(existing), detail: { provider: PROVIDERS[existing.providerKey].slug, providerAccountId: existing.providerAccountId }, redirect: `/ops/companies/${existing.id}?done=created` };
           await assertNameFree(mapping.name, null);
           await assertMappingAllowed(mapping, null);
-          const company: CompanyRecord = { id: `co_${randomToken().slice(0, 12)}`, ...mapping, deactivatedAt: null };
+          // The database refuses a second company with this name or this provider account, even if two requests are approved at the same moment.
           await stores.directory.saveCompany(company);
           return { target: companyParty(company), detail: { provider: PROVIDERS[company.providerKey].slug, providerAccountId: company.providerAccountId }, redirect: `/ops/companies/${company.id}?done=created` };
         },
@@ -962,7 +1058,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
 <div class="card"><h2>Payment approvals</h2><p>Now: <strong>${required} required</strong>. ${APPROVAL_LABELS[required] ?? ''}.</p>${gap ? h`<p class="warn">${gap}</p>` : ''}${form(
               ctx,
               `/ops/companies/${company.id}/approvals`,
-              h`<label>Approvals required before a payment is sent <select name="approvalsRequired">${[0, 1, 2].map((value) => h`<option value="${String(value)}"${value === required ? h` selected` : ''}>${String(value)}: ${APPROVAL_LABELS[value] ?? ''}</option>`)}</select></label><p class="muted">The creator of a payment can never approve it. A change applies to payments created afterwards; payments already waiting for approval keep the rule they were created under.${config.fourEyes ? ' Needs approval by an ops admin.' : ''}</p>`,
+              h`<label>Approvals required before a payment is sent <select name="approvalsRequired">${[0, 1, 2].map((value) => h`<option value="${String(value)}"${value === required ? h` selected` : ''}>${String(value)}: ${APPROVAL_LABELS[value] ?? ''}</option>`)}</select></label><p class="muted">The creator of a payment can never approve it. A stricter rule applies at once, to payments already waiting as well; a looser one applies only to payments created afterwards.${config.fourEyes ? ' Needs approval by an ops admin.' : ''}</p>`,
               'Change payment approvals',
               { request: true },
             )}</div>
@@ -994,8 +1090,10 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           if (changed) {
             if (actor.role !== 'ops_admin') throw new OpsError('Only an ops admin can change a company’s provider, account id or contact id.', 403, 'forbidden');
             await assertMappingAllowed(mapping, company.id);
+            const waiting = await assertNothingBeingSent(company.id);
             const members = await membersOf(company.id);
             warnings.push(`This re-points the company at a different provider account. ${members.length} ${members.length === 1 ? 'person is' : 'people are'} attached to it; ALL of their sessions will be ended when this is carried out.`);
+            if (waiting > 0) warnings.push(`${waiting} ${waiting === 1 ? 'payment of this company is' : 'payments of this company are'} waiting for approval. After the re-point ${waiting === 1 ? 'it' : 'they'} can no longer be approved (${waiting === 1 ? 'its payee belongs' : 'their payees belong'} to the old account) and will have to be created again.`);
           }
           return {
             params: { id: company.id, name: mapping.name, provider: PROVIDERS[mapping.providerKey].slug, providerAccountId: mapping.providerAccountId, providerContactId: mapping.providerContactId, mapping: changed ? 'changed' : 'same' },
@@ -1006,24 +1104,37 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         async apply(params, { requester, source }) {
           const company = await companyOf(params.id);
           const mapping = mappingOf(params);
-          const changed = !sameMapping(company, mapping);
-          const detail: Record<string, string> = { provider: PROVIDERS[mapping.providerKey].slug, mapping: changed ? 'changed' : 'same' };
-          if (changed) {
-            // What was approved is what is done: a "same mapping" request can never change the mapping.
-            if (params.mapping !== 'changed' || requester.role !== 'ops_admin') throw new OpsError('The company’s mapping changed since this was requested. Make the request again.', 409, 'stale');
-            await assertMappingAllowed(mapping, company.id);
+          // What was approved is what is done: a "same mapping" request can never change the mapping.
+          const repoint = params.mapping === 'changed';
+          if (!repoint && !sameMapping(company, mapping)) throw new OpsError('The company’s mapping changed since this was requested. Make the request again.', 409, 'stale');
+          const detail: Record<string, string> = { provider: PROVIDERS[mapping.providerKey].slug, mapping: repoint ? 'changed' : 'same' };
+          if (repoint) {
+            if (requester.role !== 'ops_admin') throw new OpsError('The company’s mapping changed since this was requested. Make the request again.', 409, 'stale');
+            // Every check that can refuse comes first, and the provider is asked BEFORE anything is changed.
+            if (!sameMapping(company, mapping)) await assertMappingAllowed(mapping, company.id);
+            await assertNothingBeingSent(company.id);
           }
-          const renamed = mapping.name !== company.name;
-          if (renamed) await assertNameFree(mapping.name, company.id);
-          await stores.directory.saveCompany({ ...company, ...mapping, ...(renamed ? { previousName: company.name, renamedAt: now() } : {}) });
-          if (renamed) detail.previousName = company.name;
-          if (changed) {
-            registry.invalidate(company.id);
+          if (nameKey(mapping.name) !== nameKey(company.name)) await assertNameFree(mapping.name, company.id);
+          if (repoint) {
+            // Sessions end BEFORE the mapping moves, and ending them again is harmless: if this is interrupted and
+            // carried out a second time, nobody is left signed in to the old account's data.
             let sessions = 0;
             for (const member of await membersOf(company.id)) sessions += await revokeClientSessions(requester, member, source, 'company provider mapping changed');
             detail.providerAccountId = mapping.providerAccountId;
             detail.sessionsEnded = String(sessions);
           }
+          // ONE transaction on the row as it is NOW (the provider was asked a moment ago and time has passed): only the
+          // name and the mapping are written, so a deactivation or a change of approval rule made meanwhile stays.
+          let previousName: string | null = null;
+          const saved = await stores.directory.updateCompany(company.id, (current) => {
+            if (!repoint && !sameMapping(current, mapping)) throw new OpsError('The company’s mapping changed since this was requested. Make the request again.', 409, 'stale');
+            const renamed = mapping.name !== current.name;
+            previousName = renamed ? current.name : null;
+            return { ...current, ...mapping, ...(renamed ? { previousName: current.name, renamedAt: now() } : {}) };
+          });
+          if (!saved) throw new OpsError('No such company.', 404, 'not_found');
+          if (previousName) detail.previousName = previousName;
+          if (repoint) registry.invalidate(company.id);
           return { target: companyParty({ id: company.id, name: mapping.name }), detail, redirect: `/ops/companies/${company.id}?done=saved` };
         },
       });
@@ -1053,18 +1164,23 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           if (gap) warnings.push(gap);
           return {
             params: { id: company.id, approvalsRequired: String(wanted), from: String(current) },
-            summary: `Change payment approvals for company ${describe(company)} from ${current} to ${wanted} required. This applies to payments created from now on: payments already waiting for approval are NOT affected and keep the rule they were created under.`,
+            summary: `Change payment approvals for company ${describe(company)} from ${current} to ${wanted} required. ${wanted > current ? 'A stricter rule applies at once, to payments already waiting for approval as well as to new ones.' : 'A looser rule applies to payments created from now on: payments already waiting for approval are NOT affected and keep the rule they were created under.'}`,
             warnings,
           };
         },
         async apply(params) {
           const company = await companyOf(params.id);
           const wanted = Number(oneOf(params.approvalsRequired ?? '', ['0', '1', '2'], 'number of approvals')) as ApprovalsRequired;
-          const from = approvalsRequiredOf(company);
-          // What was approved was a change FROM a particular rule. If the rule has moved since, it is asked for again.
-          if (String(from) !== params.from) throw new OpsError('The company’s approval rule changed since this was requested. Make the request again.', 409, 'stale');
-          await stores.directory.saveCompany({ ...company, approvalsRequired: wanted });
-          return { target: companyParty(company), detail: { from: String(from), to: String(wanted) }, redirect: `/ops/companies/${company.id}?done=saved` };
+          // Read and written in one transaction, and only this column: what was approved was a change FROM a particular
+          // rule. If the rule has moved since, it is asked for again. (Already at the wanted rule: this request was
+          // carried out before and interrupted; there is nothing left to do.)
+          const saved = await stores.directory.updateCompany(company.id, (current) => {
+            const from = approvalsRequiredOf(current);
+            if (from !== wanted && String(from) !== params.from) throw new OpsError('The company’s approval rule changed since this was requested. Make the request again.', 409, 'stale');
+            return { ...current, approvalsRequired: wanted };
+          });
+          if (!saved) throw new OpsError('No such company.', 404, 'not_found');
+          return { target: companyParty(company), detail: { from: params.from ?? '', to: String(wanted) }, redirect: `/ops/companies/${company.id}?done=saved` };
         },
       });
       for (const [verb, deactivate] of [['deactivate', true], ['reactivate', false]] as const) {
@@ -1086,7 +1202,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           },
           async apply(params) {
             const company = await companyOf(params.id);
-            await stores.directory.saveCompany({ ...company, deactivatedAt: deactivate ? now() : null });
+            // Only this column, on the row as it is now.
+            await stores.directory.updateCompany(company.id, (current) => ({ ...current, deactivatedAt: deactivate ? (current.deactivatedAt ?? now()) : null }));
             return { target: companyParty(company), redirect: `/ops/companies/${company.id}?done=saved` };
           },
         });
@@ -1161,9 +1278,19 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           warnings.push(`No email is sent yet. The account cannot be used until an activation link is emailed to ${maskEmail(email)} from the person’s page (a separate request).`);
           return { params, summary: `Create client user ${name} <${email}> in ${[...memberships.values()].map(({ company, role }) => `${describe(company)} as ${role}`).join(', ')}`, warnings };
         },
-        async apply(params) {
+        async apply(params, { requestId }) {
+          // Named after the request that creates it: carrying the same request out twice makes one person.
+          const id = requestId ? `usr_${sha256(`client:${requestId}`).slice(0, 12)}` : `usr_${randomToken().slice(0, 12)}`;
+          const made = await stores.directory.getUser(id);
+          if (made) {
+            for (const index of [1, 2, 3]) {
+              const companyId = text(params, `company${index}`);
+              if (companyId) await stores.directory.setMembership({ userId: id, companyId, role: oneOf(text(params, `role${index}`), CLIENT_ROLES, 'role') });
+            }
+            return { target: clientParty(made), detail: { companies: 'already created by this request' }, redirect: `/ops/users/${id}?done=created` };
+          }
           const { name, email, memberships } = await newClientOf(params);
-          const user: UserRecord = { id: `usr_${randomToken().slice(0, 12)}`, email, name, passwordHash: null, totpSecret: null, lastTotpStep: 0, recoveryCodeHashes: [], activatedAt: null, disabledAt: null, lastSignInAt: null };
+          const user: UserRecord = { id, email, name, passwordHash: null, totpSecret: null, lastTotpStep: 0, recoveryCodeHashes: [], activatedAt: null, disabledAt: null, lastSignInAt: null };
           await stores.directory.saveUser(user);
           for (const [companyId, { role }] of memberships) await stores.directory.setMembership({ userId: user.id, companyId, role });
           return { target: clientParty(user), detail: { companies: [...memberships].map(([companyId, { role }]) => `${companyId}:${role}`).join(' ') }, redirect: `/ops/users/${user.id}?done=created` };
@@ -1397,7 +1524,10 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
           aim({ type: 'ops', id: null, label: email });
           return { params: { name, email, role }, summary: `Invite ${name} <${email}> as staff with the role ${role}`, warnings: ['This creates a new member of staff, who will be able to act on client accounts. Approve only if you know this person and this address.', `An activation email will be sent to ${maskEmail(email)}.`] };
         },
-        async apply(params, { requester, approver, source }) {
+        async apply(params, { requester, approver, source, requestId }) {
+          // Carried out before and interrupted after the account was made: the account is this request's, the email is sent again.
+          const begun = requestId ? await stores.ops.users.findByEmail(needEmail(params)) : null;
+          if (begun && begun.activatedAt === null && !begun.disabledAt && begun.name === params.name && begun.role === params.role) return { target: opsParty(begun), detail: { role: begun.role, ...(await mailStaffLink(begun)) }, redirect: `/ops/staff/${begun.id}?done=mailed` };
           const { name, email, role } = await newStaffOf(params);
           const user = await opsAuth.createUser(email, name, role);
           // On its own line in the audit log, where it is looked for: somebody new can now act as staff.
