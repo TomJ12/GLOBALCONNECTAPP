@@ -444,7 +444,7 @@ function asSchema4(target: string): void {
   const db = new Db(target);
   const head = db.get<{ seq: number; hash: string; count: number }>('SELECT seq, hash, count FROM audit_head') as { seq: number; hash: string; count: number };
   db.exec(`DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version = 5;
-    DELETE FROM meta WHERE key = 'state'; INSERT INTO meta (key, value) VALUES ('used_in_development', '1');`);
+    DELETE FROM meta WHERE key = 'state'; INSERT OR REPLACE INTO meta (key, value) VALUES ('used_in_development', '1');`);
   db.run('UPDATE audit_head SET mac = ?, key_id = ?', legacyHeadMac(keys.current, head.seq, head.hash, head.count), keys.current.id);
   db.close();
 }
@@ -495,6 +495,10 @@ test('upgrade: a schema-4 database keeps the end of its log exactly as that vers
   const plain = new Db(file);
   plain.run("DELETE FROM meta WHERE key = 'used_in_development'");
   plain.close();
+  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /has been used in development mode/);
+  // Brought up to date by something that is not the development server (a command): it is a development database all the same.
+  asSchema4(file);
+  createSqliteStores({ path: file, keys }).close();
   assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /has been used in development mode/);
   // Nor is a database from before schema 5 ever taken on outside development, marker or no marker: nothing but
   // development could run then.
@@ -923,6 +927,9 @@ test('N9: key rotation and re-sealing need the database to themselves; a server 
   rotating.rotateKeys();
   rotating.close();
   await assert.rejects(async () => running.stores.audit.append(system('event.2')), /audit log cannot be written to[^]*signed with a key this server was not given/);
+  // (Everything keyed followed the rotation: the new key alone opens the database, the old one alone no longer does.)
+  createSqliteStores({ path: file, keys: dataKeys(OTHER_KEY) }).close();
+  assert.throws(() => createSqliteStores({ path: file, keys }), /not the key this database was written with/);
   running.stores.close();
   // Restarted with the new key (the documented order), everything is as it was left: the log verifies and goes on.
   const restarted = createRuntime({ ...config, dataEncryptionKey: OTHER_KEY, previousDataEncryptionKeys: [TEST_DATA_KEY] });

@@ -171,6 +171,9 @@ test('N11: wrong passwords from many sources slow EVERY guess, one at a time, wi
     },
   });
   const source = (n: number) => ({ 'x-forwarded-for': `203.0.${Math.floor(n / 250)}.${(n % 250) + 1}` });
+  // People getting the password RIGHT, however many, slow nobody.
+  for (let n = 0; n < GATE_GLOBAL_FAILURES + 5; n += 1) assert.equal((await submit(DEMO_PASSWORD, { headers: source(4000 + n) })).statusCode, 303);
+  assert.deepEqual(waits, []);
   // Under the ceiling: every source has its own allowance and nothing waits.
   for (let n = 0; n < GATE_GLOBAL_FAILURES; n += 1) assert.equal((await submit(`wrong ${n}`, { headers: source(n) })).statusCode, 401);
   assert.deepEqual(waits, []);
