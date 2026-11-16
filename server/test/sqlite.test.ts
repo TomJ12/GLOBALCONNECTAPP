@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -15,8 +15,8 @@ import { createRuntime, keysFor } from '../src/startup';
 import { seedDirectory } from '../src/store/seed';
 import { createSqliteStores } from '../src/store/sqlite';
 import { legacyHeadMac, type AuditCheckpoint } from '../src/store/sqlite/audit';
-import { Db, lockForServer } from '../src/store/sqlite/db';
-import { dataKeys, newDataKey } from '../src/store/sqlite/keys';
+import { Db, LOCK_WATCH_MS, lockForServer } from '../src/store/sqlite/db';
+import { dataKeys, newDataKey, open, seal } from '../src/store/sqlite/keys';
 import { AUDIT_TRIGGERS, MIGRATIONS } from '../src/store/sqlite/migrations';
 import { AMIRA, BEN, DANA, harness, PASSWORD, TEST_DATA_KEY, type Harness } from './helpers';
 
@@ -794,4 +794,258 @@ test('L6: "last seen" is written at most once a minute per session, and reads ar
   assert.equal((await h.call('GET', '/v1/balances', { token: other })).status, 200);
   h.clock.advance(61_000);
   assert.equal((await h.call('GET', '/v1/balances', { token })).status, 200);
+});
+
+// --- Audit of 2ac6785 ---------------------------------------------------------------------------------
+
+test('N7: anything added to the database that could hide or drop audit entries is found by verify and at start-up, and an entry the database did not really store refuses the action', async () => {
+  await withHistory();
+  const additions: [string, string, RegExp][] = [
+    ['a trigger that silently drops chosen entries', "CREATE TRIGGER quiet BEFORE INSERT ON audit_log WHEN NEW.action LIKE 'event.%' BEGIN SELECT RAISE(IGNORE); END", /contains a trigger quiet that this server did not create/],
+    ['a trigger that keeps the end of the log from moving', 'CREATE TRIGGER still BEFORE UPDATE ON audit_head BEGIN SELECT RAISE(IGNORE); END', /trigger still/],
+    ['a trigger on another table altogether', 'CREATE TRIGGER elsewhere AFTER INSERT ON users BEGIN DELETE FROM sessions; END', /trigger elsewhere/],
+    ['a trigger on the markers', 'CREATE TRIGGER marks BEFORE UPDATE ON meta BEGIN SELECT RAISE(IGNORE); END', /trigger marks/],
+    ['a view', 'CREATE VIEW recent AS SELECT * FROM audit_log', /view recent/],
+    ['a view with a trigger that swallows writes', 'CREATE VIEW audit_sink AS SELECT * FROM audit_log; CREATE TRIGGER sink INSTEAD OF INSERT ON audit_sink BEGIN SELECT 1; END', /trigger sink|view audit_sink/],
+    ['an index on the log', 'CREATE UNIQUE INDEX one_action ON audit_log (action)', /index one_action/],
+    ['a column added to the log', "ALTER TABLE audit_log ADD COLUMN hidden TEXT GENERATED ALWAYS AS ('x') VIRTUAL", /table audit_log, which is part of how the audit log is protected, has been altered/],
+    ['a trigger replaced by one of the same name on another table', 'DROP TRIGGER audit_archive_no_delete; CREATE TRIGGER audit_archive_no_delete BEFORE DELETE ON sessions BEGIN SELECT 1; END', /trigger audit_archive_no_delete, which is part of how the audit log is protected, has been altered/],
+  ];
+  const pristine = path.join(folder, 'pristine.sqlite');
+  const first = new Db(file);
+  first.backupTo(pristine);
+  first.close();
+  for (const [what, sql, problem] of additions) {
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${file}${suffix}`, { force: true });
+    const copy = new Db(pristine);
+    copy.backupTo(file);
+    copy.close();
+    // A server is running on the database when the change is made...
+    const running = createSqliteStores({ path: file, keys });
+    const before = running.verifyAudit().entries;
+    const other = new Db(file);
+    other.exec(sql);
+    other.close();
+    // ...and the check that the audit command runs finds it, with or without any entry having been touched.
+    assert.match(running.verifyAudit().problem ?? '', problem, what);
+    running.close();
+    assert.throws(() => createSqliteStores({ path: file, keys }), problem, `${what}: refused at start-up`);
+    const cli = spawnSync(tsx, ['src/cli/db.ts', 'audit-verify'], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY }, encoding: 'utf8' });
+    assert.equal(cli.status, 1, what);
+    assert.match(cli.stderr, problem, what);
+    void before;
+  }
+
+  // The two that make the server lose entries without an error from the database: the write itself notices, and
+  // refuses whatever was being recorded, in the same transaction.
+  for (const sql of [additions[0]?.[1] as string, additions[1]?.[1] as string]) {
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${file}${suffix}`, { force: true });
+    const copy = new Db(pristine);
+    copy.backupTo(file);
+    copy.close();
+    const running = createSqliteStores({ path: file, keys });
+    const state = () => JSON.stringify([running.db.all('SELECT seq, hash FROM audit_log ORDER BY seq'), running.db.all('SELECT * FROM audit_head'), running.db.get("SELECT approvals_required FROM companies WHERE id = 'co_northfield'")]);
+    const before = state();
+    const other = new Db(file);
+    other.exec(sql);
+    other.close();
+    await assert.rejects(async () => running.audit.append(system('event.lost', 99)), /audit log cannot be written to, so the action was refused and nothing was recorded[^]*did not store/);
+    // A change that carries its audit entry is not made either.
+    await assert.rejects(async () => running.directory.updateCompany('co_northfield', (current) => ({ ...current, approvalsRequired: 2 }), () => system('event.rule', 99)), /audit log cannot be written to/);
+    assert.equal(state(), before);
+    running.close();
+  }
+});
+
+test('N6: entries moved to the archive by anyone but the server are found, the console reads both tables as one log, and says how many are archived', async () => {
+  const { entries } = await withHistory();
+  // Allowed by the triggers (a copy exists, so the delete passes), and it used to hide the entries from the console.
+  const mover = new Db(file);
+  const FIELDS = 'seq, id, at, actor_type, actor_id, actor_label, target_type, target_id, target_label, action, outcome, source, detail, prev_hash, hash, key_id';
+  mover.exec(`INSERT INTO audit_archive (${FIELDS}, archived_at) SELECT ${FIELDS}, 1 FROM audit_log WHERE seq < ${entries}; DELETE FROM audit_log WHERE seq < ${entries};`);
+  mover.close();
+  const moved = /Entries have been moved between the live log and the archive by something other than this server \(the archive reaches entry \d+; the server archived up to entry 0\)/;
+  assert.throws(() => createSqliteStores({ path: file, keys }), moved);
+  const readOnly = createSqliteStores({ path: file, keys, readOnly: true });
+  assert.match(readOnly.verifyAudit().problem ?? '', moved);
+  // Even so, nothing has left the view: whoever reads the log reads all of it.
+  assert.equal((await readOnly.audit.query({ limit: 10_000 })).length, entries);
+  assert.deepEqual(readOnly.audit.counts(), { live: 1, archived: entries - 1 });
+  readOnly.close();
+  // The same the other way round: an archived entry put back in the live table.
+  const stores = createSqliteStores({ path: path.join(folder, 'b.sqlite'), keys, audit: { liveLimit: 4, notice: () => {} } });
+  for (let n = 1; n <= 9; n += 1) await stores.audit.append(system(`event.${n}`, n));
+  assert.equal(stores.verifyAudit().ok, true);
+  const { archived } = stores.audit.counts();
+  assert.ok(archived > 0);
+  // Searching finds archived entries like any other.
+  assert.deepEqual((await stores.audit.query({ action: 'event.1' })).map((entry) => entry.action), ['event.1']);
+  stores.db.exec(`INSERT INTO audit_log (${FIELDS}) SELECT ${FIELDS} FROM audit_archive WHERE seq = ${archived}`);
+  assert.match(stores.verifyAudit().problem ?? '', /Entry \d+ is missing|moved between the live log and the archive|does not follow/);
+  stores.close();
+
+  // The console says how many entries there are and how many of them are archived.
+  h = await harness({}, undefined, { audit: { liveLimit: 4 } });
+  for (let n = 1; n <= 9; n += 1) await h.stores.audit.append(system(`event.${n}`, n));
+  const total = h.stores.audit.counts();
+  assert.match(readFileSync(path.join(serverDir, 'src', 'ops', 'console.ts'), 'utf8'), /The log holds \$\{String\(held\.live \+ held\.archived\)\}[^`]*of the oldest are in the archive, and are searched and shown here like the rest/);
+  assert.ok(total.archived > 0 && total.live + total.archived === 9);
+});
+
+test('N9: key rotation and re-sealing need the database to themselves; a server that cannot vouch for the end of its log writes nothing; the key holder can recover, on record', async () => {
+  const config = { ...loadConfig({ APP_ENV: 'development' }), databasePath: file, dataEncryptionKey: TEST_DATA_KEY };
+  const running = createRuntime(config);
+  await running.stores.audit.append(system('event.1'));
+  const env = { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: OTHER_KEY, DATA_ENCRYPTION_KEY_PREVIOUS: TEST_DATA_KEY };
+  const cli = (command: string, with_: Record<string, string> = env) => spawnSync(tsx, ['src/cli/db.ts', command], { cwd: serverDir, env: with_, encoding: 'utf8' });
+  // Beside a running server both are refused, and nothing is changed.
+  const before = running.stores.db.get<{ mac: string }>('SELECT mac FROM audit_head')?.mac;
+  for (const command of ['rotate-key', 'audit-reseal']) {
+    const refused = cli(command);
+    assert.equal(refused.status, 2, command);
+    assert.match(refused.stderr, /The server is running on .*data\.sqlite\. Stop it first/, command);
+  }
+  assert.equal(running.stores.db.get<{ mac: string }>('SELECT mac FROM audit_head')?.mac, before);
+  // The read-only commands still run beside it.
+  assert.equal(cli('audit-verify').status, 0);
+
+  // What a rotation beside a running server used to do, forced here through the store: the end of the log is now
+  // signed with a key the running server does not have. It must not write an unsigned end over it: it writes nothing.
+  const rotating = createSqliteStores({ path: file, keys: dataKeys(OTHER_KEY, [TEST_DATA_KEY]) });
+  rotating.rotateKeys();
+  rotating.close();
+  await assert.rejects(async () => running.stores.audit.append(system('event.2')), /audit log cannot be written to[^]*signed with a key this server was not given/);
+  running.stores.close();
+  // Restarted with the new key (the documented order), everything is as it was left: the log verifies and goes on.
+  const restarted = createRuntime({ ...config, dataEncryptionKey: OTHER_KEY, previousDataEncryptionKeys: [TEST_DATA_KEY] });
+  await restarted.stores.audit.append(system('event.3'));
+  assert.deepEqual([restarted.stores.verifyAudit().ok, restarted.stores.verifyAudit().entries], [true, 2]);
+  restarted.stores.close();
+  // With the server stopped the command works, and the state record follows the key.
+  assert.equal(cli('rotate-key', { ...env, DATA_ENCRYPTION_KEY: TEST_DATA_KEY, DATA_ENCRYPTION_KEY_PREVIOUS: OTHER_KEY }).status, 0);
+  createSqliteStores({ path: file, keys, mode: 'development' }).close();
+
+  // An end that was left unsigned (by the version before this one, in exactly that situation): the server refuses
+  // to start, the key holder accepts the log as it stands, and the log says so.
+  const raw = new Db(file);
+  raw.exec('UPDATE audit_head SET mac = NULL, count = NULL, key_id = NULL');
+  raw.close();
+  assert.throws(() => createRuntime({ ...config, previousDataEncryptionKeys: [OTHER_KEY] }), /end of the log is not signed[^]*npm run audit:reseal/);
+  const plain = { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY, DATA_ENCRYPTION_KEY_PREVIOUS: OTHER_KEY };
+  const both = { ...config, previousDataEncryptionKeys: [OTHER_KEY] };
+  assert.equal(cli('audit-verify', plain).status, 1);
+  // Without the key nobody can do it.
+  assert.notEqual(cli('audit-reseal', { PATH: plain.PATH, DATABASE_PATH: file, DATA_ENCRYPTION_KEY: OTHER_KEY }).status, 0);
+  const resealed = cli('audit-reseal', plain);
+  assert.equal(resealed.status, 0, resealed.stderr);
+  const after = createRuntime(both);
+  const record = (await after.stores.audit.query({ limit: 1 }))[0];
+  assert.deepEqual([record?.action, record?.detail.entries, record?.detail.recordedEnd], ['system.audit.resealed', '2', 'entry 2 (unsigned)']);
+  assert.equal(after.stores.verifyAudit().ok, true);
+  after.stores.close();
+});
+
+test('N8: a stored secret whose authentication tag was shortened is refused', async () => {
+  const sealed = seal(keys, 'JBSWY3DPEHPK3PXP', 'users:usr_x:totp').text;
+  assert.equal(open(keys, sealed, 'users:usr_x:totp'), 'JBSWY3DPEHPK3PXP');
+  const parts = sealed.split(':');
+  const tag = Buffer.from(parts[4] as string, 'base64');
+  assert.equal(tag.length, 16);
+  for (const length of [4, 8, 12, 13, 15]) {
+    const cut = [...parts.slice(0, 4), tag.subarray(0, length).toString('base64')].join(':');
+    assert.throws(() => open(keys, cut, 'users:usr_x:totp'), /not in the expected encrypted form/, `${length} bytes`);
+  }
+  assert.throws(() => open(keys, [...parts.slice(0, 4), Buffer.concat([tag, Buffer.alloc(1)]).toString('base64')].join(':'), 'users:usr_x:totp'));
+  // In the database: a row edited that way does not give up its key.
+  const { secret } = await withHistory();
+  const stores = createSqliteStores({ path: file, keys });
+  const stored = stores.db.get<{ totp_secret: string }>("SELECT totp_secret FROM users WHERE id = 'usr_amira'")?.totp_secret as string;
+  const pieces = stored.split(':');
+  stores.db.run("UPDATE users SET totp_secret = ? WHERE id = 'usr_amira'", [...pieces.slice(0, 4), Buffer.from(pieces[4] as string, 'base64').subarray(0, 13).toString('base64')].join(':'));
+  await assert.rejects(async () => (await stores.directory.getUser('usr_amira'))?.totpSecret, /not in the expected encrypted form/);
+  stores.db.run("UPDATE users SET totp_secret = ? WHERE id = 'usr_amira'", stored);
+  assert.equal((await stores.directory.getUser('usr_amira'))?.totpSecret, secret);
+  stores.close();
+});
+
+test('N4: the one-server lock belongs to the database file, not to the path it was reached by, and a server whose lock file disappears stops', async () => {
+  const config = { ...loadConfig({ APP_ENV: 'development' }), databasePath: file };
+  const first = createRuntime(config);
+  // The same file through a symlink to it, through a symlinked folder, and through a path with dots in it.
+  const link = path.join(folder, 'link.sqlite');
+  symlinkSync(file, link);
+  writeFileSync(`${link}.dev-key`, readFileSync(`${file}.dev-key`), { mode: 0o600 });
+  const side = mkdtempSync(path.join(tmpdir(), 'gc-side-'));
+  try {
+    symlinkSync(folder, path.join(side, 'data'));
+    for (const other of [link, path.join(side, 'data', 'data.sqlite'), path.join(folder, '.', 'nested', '..', 'data.sqlite')]) {
+      assert.throws(() => createRuntime({ ...config, databasePath: other }), /Another Global Connect server process is already running/, other);
+    }
+    assert.deepEqual(readdirSync(folder).filter((name) => name.endsWith('.lock')), ['data.sqlite.lock'], 'one lock file, beside the real database');
+  } finally {
+    rmSync(side, { recursive: true, force: true });
+  }
+  first.stores.close();
+
+  // The lock file removed, or replaced by another, while a server holds it: that server is told within seconds
+  // (and, running for real, exits), so a second one that took the new file is not left sharing the database.
+  for (const replace of [false, true]) {
+    let message = '';
+    const unlock = lockForServer(file, (text) => (message = text));
+    rmSync(`${file}.lock`);
+    if (replace) writeFileSync(`${file}.lock`, '', { mode: 0o600 });
+    for (let waited = 0; !message && waited < 2 * LOCK_WATCH_MS; waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.match(message, /lock file .*data\.sqlite\.lock was removed or replaced while the server was running\. The server is stopping/, String(replace));
+    unlock();
+    rmSync(`${file}.lock`, { force: true });
+  }
+  // Left alone, it says nothing.
+  let spoke = false;
+  const unlock = lockForServer(file, () => (spoke = true));
+  await new Promise((resolve) => setTimeout(resolve, LOCK_WATCH_MS + 300));
+  assert.equal(spoke, false);
+  unlock();
+  // By default a lost lock ends the process.
+  assert.match(readFileSync(path.join(serverDir, 'src', 'store', 'sqlite', 'db.ts'), 'utf8'), /console\.error\(message\);\s+process\.exit\(1\);/);
+});
+
+test('M5: any permission at all for group or others is refused, on the write-ahead files, the key file and the lock as well, and in the real folder of a symlinked path', async () => {
+  const config = { ...loadConfig({ APP_ENV: 'development' }), databasePath: file };
+  const running = createRuntime(config);
+  await running.stores.audit.append(system('event.1'));
+  // While it runs the write-ahead files exist.
+  const refusal = (target: string, mode: number) => new RegExp(`${target.replace(/[.]/g, '\\.')} can be read or changed by other users of this machine \\(its permissions are ${mode.toString(8)}`);
+  for (const suffix of ['-wal', '-shm']) {
+    assert.ok(existsSync(`${file}${suffix}`), suffix);
+    chmodSync(`${file}${suffix}`, 0o666);
+    assert.throws(() => createSqliteStores({ path: file, keys: keysFor(config), readOnly: true }), refusal(`${file}${suffix}`, 0o666));
+    chmodSync(`${file}${suffix}`, 0o600);
+  }
+  running.stores.close();
+  // Others only, group only, read only, write only, execute only: each is refused, on every file that matters.
+  for (const suffix of ['', '.dev-key', '.lock']) {
+    for (const mode of [0o604, 0o640, 0o602, 0o620, 0o601, 0o610, 0o644, 0o666]) {
+      chmodSync(`${file}${suffix}`, mode);
+      assert.throws(() => createRuntime(config), refusal(`${file}${suffix}`, mode), `${suffix} ${mode.toString(8)}`);
+      chmodSync(`${file}${suffix}`, 0o600);
+    }
+  }
+  for (const mode of [0o701, 0o710, 0o705, 0o750]) {
+    chmodSync(folder, mode);
+    assert.throws(() => createRuntime(config), refusal(folder, mode), mode.toString(8));
+    chmodSync(folder, 0o700);
+  }
+  // A private folder holding only a symlink to a database that sits in a folder others can read.
+  const shared = path.join(folder, 'shared');
+  mkdirSync(shared, { mode: 0o700 });
+  const real = path.join(shared, 'real.sqlite');
+  createSqliteStores({ path: real, keys }).close();
+  const linked = path.join(folder, 'linked.sqlite');
+  symlinkSync(real, linked);
+  createSqliteStores({ path: linked, keys }).close();
+  chmodSync(shared, 0o755);
+  assert.throws(() => createSqliteStores({ path: linked, keys }), refusal(shared, 0o755));
+  chmodSync(shared, 0o700);
+  chmodSync(real, 0o640);
+  assert.throws(() => createSqliteStores({ path: linked, keys }), /can be read or changed by other users of this machine \(its permissions are 640/);
 });
