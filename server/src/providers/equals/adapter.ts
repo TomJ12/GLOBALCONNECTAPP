@@ -148,7 +148,11 @@ export function wireAmount(amount: string): number {
   return value;
 }
 
+/** Fields of a recipient that are NOT part of its digest (see the same list in the other adapter). More can be named in `ignorePayeeFields`. */
+export const PAYEE_DIGEST_IGNORED: readonly string[] = ['createdAt', 'updatedAt'];
+
 export class EqualsAdapter implements ProviderAdapter {
+  private readonly ignorePayeeFields: string[];
   readonly capabilities = { forwardContracts: false, paymentApprovals: false };
   private readonly now: () => number;
   /**
@@ -163,9 +167,10 @@ export class EqualsAdapter implements ProviderAdapter {
     private readonly transport: EqualsTransport,
     private readonly company: CompanyRecord,
     private readonly apiKey: string,
-    options: { now?: () => number; keys: Table<ProviderKeyRecord> },
+    options: { now?: () => number; keys: Table<ProviderKeyRecord>; ignorePayeeFields?: string[] },
   ) {
     this.now = options.now ?? Date.now;
+    this.ignorePayeeFields = options.ignorePayeeFields ?? [];
     this.keys = options.keys;
     // Fail closed: without the account scope no call may be made.
     if (!company.providerAccountId) throw new Error('This company has no provider account scope; refusing to call the provider without one');
@@ -380,7 +385,7 @@ export class EqualsAdapter implements ProviderAdapter {
       if (rows.truncated) throw new ProviderError('server', { detail: 'recipient list too long to verify a payee' });
       return null;
     }
-    return row.status === 'AUTHORISED' ? payeeDigestSource(row, ['createdAt', 'updatedAt']) : null;
+    return row.status === 'AUTHORISED' ? payeeDigestSource(row, [...PAYEE_DIGEST_IGNORED, ...this.ignorePayeeFields]) : null;
   }
 
   /** Two calls, as documented: validate the details, then confirm the recipient so it can be paid. */
@@ -450,6 +455,8 @@ export interface EqualsFactoryOptions {
   /** Where idempotency-key -> order mappings are kept (outside any adapter instance). */
   keys: Table<ProviderKeyRecord>;
   now?: () => number;
+  /** Recipient fields left out of the payee digest, beyond PAYEE_DIGEST_IGNORED. */
+  ignorePayeeFields?: string[];
 }
 
 export function equalsFactory(options: EqualsFactoryOptions): ProviderFactory {
@@ -458,7 +465,7 @@ export function equalsFactory(options: EqualsFactoryOptions): ProviderFactory {
     mock: options.transport === undefined || options.transport instanceof MockEqualsServer,
     async forCompany(company) {
       if (!options.credentials) throw new Error('Provider credentials are not configured');
-      return new EqualsAdapter(transport, company, options.credentials.apiKey, { now: options.now, keys: options.keys });
+      return new EqualsAdapter(transport, company, options.credentials.apiKey, { now: options.now, keys: options.keys, ignorePayeeFields: options.ignorePayeeFields });
     },
     async accountExists(mapping) {
       if (!options.credentials || !mapping.providerAccountId) return false;

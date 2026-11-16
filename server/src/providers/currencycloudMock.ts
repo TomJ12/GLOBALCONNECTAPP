@@ -65,12 +65,15 @@ export class MockCurrencycloudPlatform implements Transport {
 
   /** TESTS ONLY: what happens to the NEXT request that creates a payment. `lost_response`: made, but the answer never arrives. `applied_late`: no answer, and the request only reaches the provider when `releaseLate` is called. `no_answer`: never made. */
   paymentFault: 'lost_response' | 'applied_late' | 'no_answer' | null = null;
+  /** TESTS ONLY: how many requests to create a payment have been made (whatever came of them). */
+  paymentRequests = 0;
   private readonly late: (() => Promise<unknown>)[] = [];
   async releaseLate(): Promise<void> {
     for (const run of this.late.splice(0)) await run();
   }
 
   async request(request: TransportRequest): Promise<TransportResponse> {
+    if (request.method === 'POST' && request.path === '/v2/payments/create') this.paymentRequests += 1;
     if (this.paymentFault && request.method === 'POST' && request.path === '/v2/payments/create') {
       const fault = this.paymentFault;
       this.paymentFault = null;

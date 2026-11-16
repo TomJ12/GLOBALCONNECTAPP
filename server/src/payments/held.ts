@@ -23,13 +23,14 @@ import Big from 'big.js';
 
 import { canonicalJson } from '@/api/canonical';
 import { isProviderError } from '@/api/errors';
+import { payeeDigestFields } from '@/api/payeeDigest';
 import type { ApprovalResult, ApprovalStep, Beneficiary, Payment, PaymentHoldState, PaymentStatus, PendingApproval, UserRole } from '@/api/types';
 
 import type { Config } from '../config';
 import { randomToken, sha256 } from '../crypto';
 import { ApiError } from '../errors';
 import type { ProviderAdapter } from '../providers/adapter';
-import { approvalsRequiredOf, type AuditInput, type AuditParty, type CompanyMember, type CompanyRecord, type HeldPaymentPeople, type HeldPaymentRecord, type Stores, type UserRecord } from '../store/types';
+import { approvalsRequiredOf, type AuditInput, type AuditParty, type CompanyMember, type CompanyRecord, type DirectPaymentRecord, type HeldPaymentPeople, type HeldPaymentRecord, type Stores, type UserRecord } from '../store/types';
 
 export interface Actor {
   user: UserRecord;
@@ -39,7 +40,7 @@ export interface Actor {
 
 export interface HeldPaymentsDeps {
   stores: Stores;
-  config: Pick<Config, 'paymentApprovalMs'>;
+  config: Pick<Config, 'paymentApprovalMs' | 'paymentReconcileMs'>;
   now: () => number;
   /** Runs a call against the company's provider. The only way this file reaches one. */
   withProvider: <T>(company: CompanyRecord, run: (provider: ProviderAdapter) => Promise<T>) => Promise<T>;
@@ -52,6 +53,21 @@ const CAN_APPROVE: UserRole[] = ['approver', 'admin'];
 const SYSTEM: AuditParty = { type: 'system', id: null, label: 'payment approvals' };
 /** A payment that only just went to `sending` is being sent by the request that put it there; the sweep leaves it alone this long. */
 const SEND_GRACE_MS = 30_000;
+/** What a provider says when it plainly will not make a payment. Anything else is "we do not know". */
+const REFUSALS = ['validation', 'insufficient_funds', 'forbidden', 'not_found'];
+const ATTEMPTS_KEPT = 20;
+type Attempt = NonNullable<HeldPaymentRecord['attempts']>[number];
+/** When the provider was last asked to make it (or, never asked yet, when it was approved). */
+const lastAttemptAt = (record: HeldPaymentRecord): number => record.attempts?.at(-1)?.at ?? record.statusAt;
+/** The attempt history with its latest attempt given its outcome. */
+const closeAttempt = (attempts: Attempt[] | undefined, outcome: Attempt['outcome'], reason: string | null): Attempt[] => {
+  const list = [...(attempts ?? [])];
+  const last = list.at(-1);
+  if (last && last.outcome === 'started') list[list.length - 1] = { ...last, outcome, ...(reason ? { reason } : {}) };
+  return list;
+};
+/** True when some attempt to send it went unanswered: its outcome is being checked. */
+const outcomeUnknown = (record: HeldPaymentRecord): boolean => record.status === 'sending' && (Boolean(record.unconfirmedSince) || (record.attempts ?? []).some((item) => item.outcome === 'unknown' || item.outcome === 'refused'));
 /** Closed held payments stay in the payments list this long. */
 const SHOWN_MS = 30 * 24 * 60 * 60_000;
 
@@ -113,13 +129,14 @@ export class HeldPayments {
       beneficiaryName: record.payee.name,
       reference: record.reference,
       // Sent, but not as it was approved: nobody should take that for a normal payment.
-      status: record.mismatch ? 'unknown' : STATUS[record.status],
+      // ...and one whose sending went unanswered is neither sent nor failed: nobody should create it again.
+      status: record.mismatch || outcomeUnknown(record) ? 'unknown' : STATUS[record.status],
       route: null,
       fee: null,
       estimatedArrival: null,
       createdAt: new Date(record.createdAt).toISOString(),
       held: {
-        state: (record.mismatch ? 'mismatch' : record.status === 'sent' ? 'sending' : record.status) as PaymentHoldState,
+        state: (record.mismatch ? 'mismatch' : outcomeUnknown(record) ? 'checking' : record.status === 'sent' ? 'sending' : record.status) as PaymentHoldState,
         createdBy: names.get(record.createdBy) ?? 'Someone no longer on this account',
         createdByYou: record.createdBy === viewer.user.id,
         approvalsRequired: requiredNow(record, viewer.company),
@@ -201,9 +218,19 @@ export class HeldPayments {
   // --- Creating --------------------------------------------------------------------------------
 
   /** The provider's digest of where a payee's money goes (see @/api/digest), or null when the payee is gone. */
-  private async digest(company: CompanyRecord, payeeId: string): Promise<string | null> {
+  private async digest(company: CompanyRecord, payeeId: string): Promise<{ digest: string; fields: Record<string, string> } | null> {
     const source = await this.deps.withProvider(company, (provider) => provider.beneficiaryDigestSource(payeeId));
-    return source === null ? null : sha256(source);
+    if (source === null) return null;
+    // Field by field as well, as short hashes, so that a later difference can be NAMED (the name only, never a value).
+    const fields = Object.fromEntries(Object.entries(payeeDigestFields(source)).map(([name, value]) => [name, sha256(`${name}\n${value}`).slice(0, 16)]));
+    return { digest: sha256(source), fields };
+  }
+  /** The names of the fields that differ between the payee as it was when the payment was created and as it is now. */
+  private changedFields(record: HeldPaymentRecord, now: Record<string, string>): string {
+    const before = record.payeeFields;
+    if (!before) return 'not recorded for this payment';
+    const names = [...new Set([...Object.keys(before), ...Object.keys(now)])].filter((name) => before[name] !== now[name]).sort();
+    return names.length > 12 ? `${names.slice(0, 12).join(', ')} and ${names.length - 12} more` : names.join(', ');
   }
 
   /**
@@ -214,9 +241,14 @@ export class HeldPayments {
    * Whatever the company's rule is now: a key that was held is never sent again.
    */
   async replay(actor: Actor, input: Parameters<typeof requestHashOf>[0], idempotencyKey: string, source: string): Promise<Payment | null> {
-    const record = await this.deps.stores.payments.findByKey(actor.company.id, idempotencyKey);
+    let record = await this.deps.stores.payments.findByKey(actor.company.id, idempotencyKey);
     if (!record) return null;
     if (record.createdBy !== actor.user.id || record.requestHash !== requestHashOf(input)) throw new ApiError('validation', { fields: ['idempotencyKey'] });
+    // A payment that has waited too long is expired, whoever happens to look at it and however: asking again does not keep it alive.
+    if (record.status === 'awaiting_approval' && record.expiresAt <= this.deps.now()) {
+      await this.expireDue(actor.company.id);
+      record = (await this.deps.stores.payments.get(record.id)) ?? record;
+    }
     // Recorded with what the payment IS, not with what was sent this time (they are the same, by the check above).
     await this.deps.stores.audit.append(this.entry('client.payment.create', 'success', partyOf(actor.user), source, record, actor.company, { held: 'yes', replay: 'yes', status: record.status }));
     return (await this.viewer(actor)).one(record);
@@ -227,23 +259,22 @@ export class HeldPayments {
     const { stores, now } = this.deps;
     const policy = approvalsRequiredOf(actor.company);
     if (policy === 0) throw new Error('This company does not hold payments for approval.');
-    // The key may have been used BEFORE the company had a rule, and gone straight to the provider then. That payment is the answer.
-    const direct = await this.deps.withProvider(actor.company, (provider) => provider.findPaymentByIdempotencyKey(idempotencyKey));
-    if (direct) {
-      // Returned only for the same request. (Who made it was not recorded here: it was never held. Every member of
-      // the company can see that payment in any case.)
-      const same = new Big(direct.amount).eq(input.amount) && direct.currency === input.currency && direct.beneficiaryId === input.beneficiaryId && direct.reference === input.reference;
+    // A payment sent straight to the provider by a version of this server that kept no record of such sends
+    // (`submit` has already looked for the record this version keeps). That payment is the answer, for the same request.
+    const legacy = await this.deps.withProvider(actor.company, (provider) => provider.findPaymentByIdempotencyKey(idempotencyKey));
+    if (legacy) {
+      const same = new Big(legacy.amount).eq(input.amount) && legacy.currency === input.currency && legacy.beneficiaryId === input.beneficiaryId && legacy.reference === input.reference;
       if (!same) throw new ApiError('validation', { fields: ['idempotencyKey'] });
-      return direct;
+      return legacy;
     }
     const payees = await this.deps.withProvider(actor.company, (provider) => provider.listBeneficiaries());
     const payee = payees.items.find((item) => item.id === input.beneficiaryId);
     if (!payee) throw new ApiError('validation', { fields: ['beneficiaryId'] });
     if (payee.currency !== input.currency) throw new ApiError('validation', { fields: ['currency'] });
-    const payeeDigest = await this.digest(actor.company, payee.id);
-    if (payeeDigest === null) throw new ApiError('validation', { fields: ['beneficiaryId'] });
+    const digest = await this.digest(actor.company, payee.id);
+    if (digest === null) throw new ApiError('validation', { fields: ['beneficiaryId'] });
     const at = now();
-    const { record, created } = await stores.payments.create(
+    const result = await stores.payments.create(
       {
         id: `hp_${randomToken().slice(0, 20)}`,
         companyId: actor.company.id,
@@ -256,7 +287,8 @@ export class HeldPayments {
         reference: input.reference,
         reason: input.reason,
         payee,
-        payeeDigest,
+        payeeDigest: digest.digest,
+        payeeFields: digest.fields,
         requestHash: requestHashOf(input),
         approvalsRequired: policy,
         approvals: [],
@@ -267,15 +299,89 @@ export class HeldPayments {
         sendKey: null,
         sendMapping: null,
         providerPaymentId: null,
+        attempts: [],
       },
       (stored) => this.entry('client.payment.create', 'success', partyOf(actor.user), source, stored, actor.company, { key: sha256(idempotencyKey).slice(0, 16), held: 'yes', approvalsRequired: String(policy), status: 'awaiting_approval' }),
     );
+    // The key went straight to the provider a moment ago (the rule has only just been switched on): that send is the answer.
+    if ('direct' in result) return this.direct(actor, input, result.direct, false);
     // Two of the same request at the same moment: the second finds the first's payment, and is held to the same rule as any replay.
-    if (!created) {
+    if (!result.created) {
       const again = await this.replay(actor, input, idempotencyKey, source);
       if (again) return again;
     }
-    return (await this.viewer(actor)).one(record);
+    return (await this.viewer(actor)).one(result.record);
+  }
+
+  /**
+   * A new payment, whatever the company's rule: held for approval, or sent
+   * straight to the provider. `replay` has already found that this key holds
+   * no held payment.
+   *
+   * A payment that goes straight to the provider is RECORDED HERE FIRST, by
+   * its key, with who made it and a hash of the request. So the key is known
+   * to this server from before the provider is asked: while that send is
+   * unanswered, or lands late, the same request arriving again (even after an
+   * approval rule has been switched on) finds the record and can never become
+   * a second, held, payment.
+   */
+  async submit(actor: Actor, input: Parameters<typeof requestHashOf>[0], idempotencyKey: string, source: string): Promise<Payment> {
+    const { stores, now } = this.deps;
+    const existing = await stores.payments.getDirect(actor.company.id, idempotencyKey);
+    if (existing) return this.direct(actor, input, existing, false);
+    if (this.holds(actor.company)) return this.create(actor, input, idempotencyKey, source);
+    const claim = await stores.payments.claimDirect({
+      companyId: actor.company.id,
+      idempotencyKey,
+      createdBy: actor.user.id,
+      requestHash: requestHashOf(input),
+      createdAt: now(),
+      mapping: mappingOf(actor.company),
+      state: 'started',
+      unknown: false,
+      providerPaymentId: null,
+    });
+    if ('held' in claim) {
+      // Held a moment ago by the same request arriving twice: answered from that payment, by the rules of any replay.
+      const again = await this.replay(actor, input, idempotencyKey, source);
+      if (again) return again;
+      throw new ApiError('validation', { fields: ['idempotencyKey'] });
+    }
+    return this.direct(actor, input, claim.direct, claim.created);
+  }
+
+  /** Sends, or answers for, a payment that goes straight to the provider under the creator's own key. */
+  private async direct(actor: Actor, input: Parameters<typeof requestHashOf>[0], record: DirectPaymentRecord, fresh: boolean): Promise<Payment> {
+    // The same key from anyone else, or with anything different in the request, is refused without a word about the payment it belongs to.
+    if (record.createdBy !== actor.user.id || record.requestHash !== requestHashOf(input)) throw new ApiError('validation', { fields: ['idempotencyKey'] });
+    const { stores } = this.deps;
+    const target: CompanyRecord = { ...actor.company, ...record.mapping };
+    const mark = (change: (current: DirectPaymentRecord) => Partial<DirectPaymentRecord>) => stores.payments.updateDirect(record.companyId, record.idempotencyKey, (current) => ({ ...current, ...change(current) }));
+    if (!fresh) {
+      const found = await this.deps.withProvider(target, (provider) => provider.findPaymentByIdempotencyKey(record.idempotencyKey));
+      if (found) {
+        await mark(() => ({ state: 'made', providerPaymentId: found.id }));
+        return found;
+      }
+      if (this.holds(actor.company)) {
+        // The provider does not have it (yet), and the company now has an approval rule. The earlier send may still
+        // land, so this request is NOT held as a second payment; and nothing is sent past the rule. A send the
+        // provider plainly refused, with no unanswered attempt before it, made nothing: that key is spent.
+        if (record.state === 'refused' && !record.unknown) throw new ApiError('validation', { fields: ['idempotencyKey'] });
+        throw new ApiError('timeout');
+      }
+      // Asked again under the same key: an attempt that never reported back is one whose outcome is not known.
+      await mark((current) => ({ state: 'started', unknown: current.unknown || current.state === 'started' }));
+    }
+    try {
+      const payment = await this.deps.withProvider(target, (provider) => provider.createPayment({ beneficiaryId: input.beneficiaryId, amount: input.amount, currency: input.currency as Payment['currency'], reference: input.reference, reason: input.reason, idempotencyKey: record.idempotencyKey }));
+      await mark(() => ({ state: 'made', providerPaymentId: payment.id }));
+      return payment;
+    } catch (error) {
+      const refused = isProviderError(error) && REFUSALS.includes(error.kind);
+      await mark(() => (refused ? { state: 'refused' } : { unknown: true }));
+      throw error;
+    }
   }
 
   // --- Deciding --------------------------------------------------------------------------------
@@ -311,8 +417,9 @@ export class HeldPayments {
   private async forDecision(actor: Actor, id: string): Promise<HeldPaymentRecord> {
     let record = await this.find(actor.company.id, id);
     if (!record) throw new ApiError('not_found');
-    // An unfinished send is settled before anything else is considered.
-    if (record.status === 'sending') record = await this.settle(record, '');
+    // An unfinished send is settled before anything else is considered. By looking it up under its key: the
+    // provider is only ASKED AGAIN when the last attempt is old enough to have been given up, and none is under way.
+    if (record.status === 'sending') record = await this.settle(record, '', { lookupOnly: this.inFlight.has(record.id) || this.deps.now() - lastAttemptAt(record) < SEND_GRACE_MS });
     if (record.status === 'awaiting_approval' && record.expiresAt <= this.deps.now()) {
       await this.expireDue(actor.company.id);
       throw new ApiError('validation', { reason: 'payment_expired' });
@@ -335,10 +442,14 @@ export class HeldPayments {
     // only known inside the transaction below (another approval may land at the same moment), and a payment must
     // never be sent on the strength of a check that nobody ran.
     const checkedAgainst = mappingOf(actor.company);
-    const digest = await this.digest(actor.company, record.payee.id);
+    const payee = await this.digest(actor.company, record.payee.id);
+    const digest = payee?.digest ?? null;
     if (digest !== record.payeeDigest) {
-      const reason = digest === null ? 'payee_removed' : 'payee_changed';
-      await this.close(record.id, 'payee_changed', null, digest === null ? 'payee removed' : 'payee details changed', (stored, company) => this.entry('system.payment.blocked', 'success', SYSTEM, source, stored, company, { reason }));
+      const reason = payee === null ? 'payee_removed' : 'payee_changed';
+      // WHICH fields of the provider's record differ is recorded for staff (names only, never a value), so that a
+      // payment blocked by a field the provider moves on its own can be told from a changed destination.
+      const fields: Record<string, string> = payee === null ? {} : { fields: this.changedFields(record, payee.fields) };
+      await this.close(record.id, 'payee_changed', null, payee === null ? 'payee removed' : 'payee details changed', (stored, company) => this.entry('system.payment.blocked', 'success', SYSTEM, source, stored, company, { reason, ...fields }));
       throw new ApiError('validation', { reason: 'payee_changed' });
     }
     const balances = await this.deps.withProvider(actor.company, (provider) => provider.listBalances());
@@ -447,10 +558,10 @@ export class HeldPayments {
       [],
       (current, context) => {
         company = context.company;
-        return current.status === 'sending' ? { ...current, status, statusAt: at, providerPaymentId: made?.id ?? null, note, mismatch } : null;
+        return current.status === 'sending' ? { ...current, status, statusAt: at, providerPaymentId: made?.id ?? null, note, mismatch, attempts: closeAttempt(current.attempts, status === 'sent' ? 'sent' : 'refused', note), unconfirmedSince: null } : null;
       },
       (stored) => [
-        this.entry('system.payment.send_outcome', status === 'sent' ? 'success' : 'failure', SYSTEM, source, stored, company, { outcome: status, ...(note ? { reason: note } : {}) }),
+        this.entry('system.payment.send_outcome', status === 'sent' ? 'success' : 'failure', SYSTEM, source, stored, company, { outcome: status, attempts: String(stored.attempts?.length ?? 0), ...(note ? { reason: note } : {}) }),
         // The provider made something other than what was approved. Nothing can undo that from here; it must be seen.
         ...(mismatch ? [this.entry('system.payment.send_mismatch', 'failure', SYSTEM, source, stored, company, { mismatch, providerPayment: made?.id ?? '' })] : []),
       ],
@@ -458,28 +569,78 @@ export class HeldPayments {
     return saved ?? (await this.deps.stores.payments.get(record.id)) ?? record;
   }
 
-  /** Asks the provider to make a payment that is in `sending`, under its one key, on the account fixed at approval. */
+  /**
+   * Asks the provider to make a payment that is in `sending`, under its one
+   * key, on the account fixed at approval.
+   *
+   * EVERY ATTEMPT IS WRITTEN DOWN BEFORE IT IS MADE, and its outcome after.
+   * A refusal is final ONLY when it answers the first and only attempt. Once
+   * any attempt has gone unanswered (lost, timed out, or cut off by a crash),
+   * that attempt may still reach the provider: a later refusal says nothing
+   * about it, so the payment is not called failed. It stays `sending`, is
+   * shown as "outcome being checked", and from then on is only LOOKED UP by
+   * its key (`settle`), never asked for again.
+   */
   private async send(record: HeldPaymentRecord, source: string): Promise<HeldPaymentRecord> {
     const target = await this.sendTarget(record);
     const sendKey = record.sendKey;
-    if (!target || !sendKey || record.status !== 'sending') return record;
+    if (!target || !sendKey || record.status !== 'sending' || record.unconfirmedSince || this.inFlight.has(record.id)) return record;
     await this.deps.beforeSend?.(record);
+    const at = this.deps.now();
+    const started = await this.deps.stores.payments.update(record.id, [], (current) => (current.status === 'sending' && !current.unconfirmedSince ? { ...current, attempts: [...(current.attempts ?? []).slice(-(ATTEMPTS_KEPT - 1)), { at, outcome: 'started' }] } : null));
+    if (!started) return (await this.deps.stores.payments.get(record.id)) ?? record;
+    this.inFlight.add(record.id);
     try {
       const payment = await this.deps.withProvider(target, (provider) =>
         provider.createPayment({ beneficiaryId: record.payee.id, amount: record.amount, currency: record.currency as Payment['currency'], reference: record.reference, reason: record.reason, idempotencyKey: sendKey }),
       );
-      return await this.finish(record, 'sent', source, payment, null);
+      return await this.finish(started, 'sent', source, payment, null);
     } catch (error) {
-      // A plain refusal (not enough money, details not accepted) is final: the provider did not make the payment.
-      if (isProviderError(error) && ['validation', 'insufficient_funds', 'forbidden', 'not_found'].includes(error.kind)) return this.finish(record, 'failed', source, null, error.kind);
+      const kind = isProviderError(error) ? error.kind : 'error';
+      const earlier = (started.attempts ?? []).slice(0, -1);
+      if (isProviderError(error) && REFUSALS.includes(error.kind)) {
+        // A plain refusal (not enough money, details not accepted) of the first and only attempt: the provider did not make the payment.
+        if (earlier.length === 0) return await this.finish(started, 'failed', source, null, kind);
+        // Refused NOW, but an earlier attempt was never answered. Not failed: outcome being checked.
+        let company: CompanyRecord | null = null;
+        const held = await this.deps.stores.payments.update(
+          record.id,
+          [],
+          (current, context) => {
+            company = context.company;
+            return current.status === 'sending' ? { ...current, attempts: closeAttempt(current.attempts, 'refused', kind), unconfirmedSince: current.unconfirmedSince ?? at, refusal: kind } : null;
+          },
+          (stored) => this.entry('system.payment.send_outcome', 'failure', SYSTEM, source, stored, company, { outcome: 'unconfirmed', reason: kind, attempts: String(stored.attempts?.length ?? 0), note: 'refused, but an earlier attempt was never answered and may still be made: being checked by key' }),
+        );
+        return held ?? started;
+      }
       // Anything else (no answer, an unreadable one, a busy or signed-out provider): we do not know. It stays `sending`.
-      await this.deps.stores.audit.append(this.entry('system.payment.send_outcome', 'failure', SYSTEM, source, record, target, { outcome: 'unknown', reason: isProviderError(error) ? error.kind : 'error' }));
-      return record;
+      let company: CompanyRecord | null = null;
+      const unknown = await this.deps.stores.payments.update(
+        record.id,
+        [],
+        (current, context) => {
+          company = context.company;
+          return current.status === 'sending' ? { ...current, attempts: closeAttempt(current.attempts, 'unknown', kind) } : null;
+        },
+        (stored) => this.entry('system.payment.send_outcome', 'failure', SYSTEM, source, stored, company, { outcome: 'unknown', reason: kind, attempts: String(stored.attempts?.length ?? 0) }),
+      );
+      return unknown ?? started;
+    } finally {
+      this.inFlight.delete(record.id);
     }
   }
+  /** Payments this process is asking the provider to make at this moment. */
+  private readonly inFlight = new Set<string>();
 
-  /** Settles a payment in `sending`: if the provider has it under its key, it was sent; if not, it is asked again with the SAME key, on the SAME account. */
-  async settle(record: HeldPaymentRecord, source: string): Promise<HeldPaymentRecord> {
+  /**
+   * Settles a payment in `sending`. If the provider has it under its key, it
+   * was sent. If not: a payment whose refusal is unconfirmed is only looked
+   * for again, until the reconciliation window has passed without it, and is
+   * only then called failed; any other is asked for again with the SAME key,
+   * on the SAME account, unless the caller may only look (`lookupOnly`).
+   */
+  async settle(record: HeldPaymentRecord, source: string, options: { lookupOnly?: boolean } = {}): Promise<HeldPaymentRecord> {
     const target = await this.sendTarget(record);
     const sendKey = record.sendKey;
     if (!target || !sendKey || record.status !== 'sending') return record;
@@ -489,7 +650,14 @@ export class HeldPayments {
     } catch {
       return record; // Could not ask. It stays as it is and will be looked at again.
     }
-    return found ? this.finish(record, 'sent', source, found, null) : this.send(record, source);
+    if (found) return this.finish(record, 'sent', source, found, null);
+    if (record.unconfirmedSince) {
+      const waited = this.deps.now() - record.unconfirmedSince;
+      if (waited < this.deps.config.paymentReconcileMs) return record;
+      return this.finish(record, 'failed', source, null, `${record.refusal ?? 'refused'}; not found at the provider under its key in ${Math.round(waited / 3_600_000)} hours of checking`);
+    }
+    if (options.lookupOnly || this.inFlight.has(record.id)) return record;
+    return this.send(record, source);
   }
 
   /**
@@ -502,7 +670,8 @@ export class HeldPayments {
     const expired = await this.expireDue();
     let settled = 0;
     for (const record of await this.deps.stores.payments.list({ status: 'sending' })) {
-      if (!options.all && this.deps.now() - record.statusAt < SEND_GRACE_MS) continue;
+      if (this.inFlight.has(record.id)) continue;
+      if (!options.all && this.deps.now() - lastAttemptAt(record) < SEND_GRACE_MS) continue;
       if ((await this.settle(record, '')).status !== 'sending') settled += 1;
     }
     return { expired, settled };

@@ -23,6 +23,8 @@ export interface CurrencycloudFactoryOptions {
   /** The wire to the provider. Defaults to the in-memory mock platform. */
   transport?: Transport;
   now?: () => number;
+  /** Payee fields left out of the payee digest, beyond the adapter's own list. */
+  ignorePayeeFields?: string[];
 }
 
 export function currencycloudFactory(options: CurrencycloudFactoryOptions): ProviderFactory {
@@ -32,7 +34,7 @@ export function currencycloudFactory(options: CurrencycloudFactoryOptions): Prov
   const clientFor = async (mapping: ProviderMapping): Promise<CurrencycloudClient> => {
     if (!options.credentials) throw new Error('Provider credentials are not configured');
     if (!mapping.providerContactId || !mapping.providerAccountId) throw new Error('This company has no provider account scope; refusing to call the provider without one');
-    const client = new CurrencycloudClient(transport, { planName: null, now: options.now, onBehalfOf: mapping.providerContactId });
+    const client = new CurrencycloudClient(transport, { planName: null, now: options.now, onBehalfOf: mapping.providerContactId, ignorePayeeFields: options.ignorePayeeFields });
     await client.authenticate(options.credentials.loginId, options.credentials.apiKey);
     return client;
   };

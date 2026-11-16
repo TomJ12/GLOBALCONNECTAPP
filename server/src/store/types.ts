@@ -388,6 +388,40 @@ export interface HeldPaymentRecord {
   providerPaymentId: string | null;
   /** Set when what the provider says it made differs from this record (amount, currency or payee). */
   mismatch?: string | null;
+  /** The payee's digest field by field (name -> short hash), so that a refusal can say WHICH field changed. Names only are ever reported. */
+  payeeFields?: Record<string, string>;
+  /**
+   * Every time the provider was asked to make this payment, newest last (the last 20). `started` is written BEFORE
+   * the provider is asked: an attempt still `started` after a crash is one whose outcome is not known.
+   */
+  attempts?: { at: number; outcome: 'started' | 'sent' | 'refused' | 'unknown'; reason?: string }[];
+  /**
+   * Set when the provider REFUSED an attempt after an earlier attempt's outcome was not known. The refusal proves
+   * nothing about the earlier attempt, which may still land: the payment stays `sending`, is only looked up by its
+   * key (never asked for again), and becomes `failed` only once the reconciliation window has passed without it.
+   */
+  unconfirmedSince?: number | null;
+  refusal?: string | null;
+}
+
+/**
+ * A payment sent straight to the provider because the company had no approval rule. Recorded by key BEFORE the
+ * provider is asked, so the key is known to this server whatever the provider says, or does not say, afterwards.
+ */
+export interface DirectPaymentRecord {
+  companyId: string;
+  idempotencyKey: string;
+  createdBy: string;
+  /** SHA-256 of the request as it was first made (payee, amount, currency, reference, reason). */
+  requestHash: string;
+  createdAt: number;
+  /** The provider account it was sent to. It is looked for there, wherever the company points later. */
+  mapping: { providerKey: ProviderKey; providerAccountId: string; providerContactId: string };
+  /** `started`: asked, outcome not (yet) known. `made`: the provider has it. `refused`: the provider plainly refused the latest attempt. */
+  state: 'started' | 'made' | 'refused';
+  /** True once any attempt ended without an answer: a later refusal then proves nothing about that attempt. */
+  unknown: boolean;
+  providerPaymentId: string | null;
 }
 
 /** The people and the company a decision depends on, read in the same transaction as the payment. */
@@ -399,8 +433,16 @@ export interface HeldPaymentPeople {
 }
 
 export interface HeldPaymentStore {
-  /** Stores the payment unless one with this company and idempotency key exists; returns whichever is stored. */
-  create(record: HeldPaymentRecord, audit?: AuditWith<HeldPaymentRecord>): Promise<{ record: HeldPaymentRecord; created: boolean }>;
+  /**
+   * Stores the payment unless this company and idempotency key already have one, held OR sent directly: returns
+   * whichever is stored. ONE transaction, so the same key can never become both.
+   */
+  create(record: HeldPaymentRecord, audit?: AuditWith<HeldPaymentRecord>): Promise<{ record: HeldPaymentRecord; created: boolean } | { direct: DirectPaymentRecord }>;
+  /** The same for a payment about to be sent directly: recorded unless the key already has a held payment or a direct record. */
+  claimDirect(record: DirectPaymentRecord): Promise<{ held: HeldPaymentRecord } | { direct: DirectPaymentRecord; created: boolean }>;
+  getDirect(companyId: string, idempotencyKey: string): Promise<DirectPaymentRecord | null>;
+  /** ATOMIC. Null leaves it as it is. */
+  updateDirect(companyId: string, idempotencyKey: string, change: (current: DirectPaymentRecord) => DirectPaymentRecord | null): Promise<DirectPaymentRecord | null>;
   get(id: string): Promise<HeldPaymentRecord | null>;
   findByKey(companyId: string, idempotencyKey: string): Promise<HeldPaymentRecord | null>;
   list(where: { companyId?: string; status?: HeldPaymentStatus }): Promise<HeldPaymentRecord[]>;

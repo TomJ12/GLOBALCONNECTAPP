@@ -35,8 +35,37 @@ function normalise(value: unknown): unknown {
   return value;
 }
 
-/** The canonical text that is hashed. Exposed so that the two ends (app adapter, server) hash the same thing. */
+/** Removes the ignored fields. A name without a dot is a top-level field; "a.b" is field b inside a (inside each item, if a is a list). */
+function without(value: unknown, ignore: readonly string[], prefix: string): unknown {
+  if (Array.isArray(value)) return value.map((item) => without(item, ignore, prefix));
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !ignore.includes(`${prefix}${key}`))
+      .map(([key, item]) => [key, without(item, ignore, `${prefix}${key}.`)]),
+  );
+}
+
+/**
+ * The canonical text that is hashed. Exposed so that the two ends (app adapter, server) hash the same thing.
+ * `ignore` is the adapter's explicit list of fields that move without the destination changing; nothing else is left out.
+ */
 export function payeeDigestSource(raw: Record<string, unknown>, ignore: readonly string[]): string {
-  const kept = Object.fromEntries(Object.entries(raw).filter(([key]) => !ignore.includes(key)));
-  return canonicalJson(normalise(kept) ?? {});
+  return canonicalJson(normalise(without(raw, ignore, '')) ?? {});
+}
+
+/**
+ * The same record field by field: the dotted name of every value in it, with
+ * that value's canonical text. For saying WHICH field differs between two
+ * digests (names only are ever reported; values are compared, not shown).
+ */
+export function payeeDigestFields(source: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const walk = (value: unknown, name: string): void => {
+    if (Array.isArray(value)) value.forEach((item, index) => walk(item, `${name}[${index}]`));
+    else if (value !== null && typeof value === 'object') for (const [key, item] of Object.entries(value as Record<string, unknown>)) walk(item, name ? `${name}.${key}` : key);
+    else fields[name] = JSON.stringify(value);
+  };
+  walk(JSON.parse(source) as unknown, '');
+  return fields;
 }

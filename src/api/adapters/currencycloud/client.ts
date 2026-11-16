@@ -83,6 +83,8 @@ export interface CurrencycloudClientOptions {
   /** Most pages a "read everything" loop will fetch (100 rows each). */
   maxPages?: number;
   now?: () => number;
+  /** Payee fields left out of the payee digest, beyond PAYEE_DIGEST_IGNORED. */
+  ignorePayeeFields?: readonly string[];
   /**
    * The contact id of the client this instance acts for. When set (always, on
    * the server, where one set of API credentials serves many clients) it is
@@ -98,6 +100,14 @@ const DEFAULT_MAX_PAGES = 50;
 /** How long a payee looked up for a list row is reused. Approvals always look payees up fresh. */
 const PAYEE_CACHE_MS = 5 * 60 * 1000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * Fields of a payee that are NOT part of its digest: they move without the destination of a payment changing.
+ * Everything else is, including fields this code has never heard of. More can be named by whoever builds the
+ * client (`ignorePayeeFields`; "a.b" for a field inside another), for a field the provider turns out to update
+ * on its own. Leaving a field out is a decision about where money may go: keep the list short and explicit.
+ */
+export const PAYEE_DIGEST_IGNORED: readonly string[] = ['created_at', 'updated_at'];
 
 export class CurrencycloudClient implements ProviderClient {
   private token: string | null = null;
@@ -335,7 +345,7 @@ export class CurrencycloudClient implements ProviderClient {
   async beneficiaryDigestSource(beneficiaryId: string): Promise<string | null> {
     try {
       const raw = await this.call(z.record(z.string(), z.unknown()), 'GET', `/v2/beneficiaries/${encodeURIComponent(beneficiaryId)}`);
-      return payeeDigestSource(raw, ['created_at', 'updated_at']);
+      return payeeDigestSource(raw, [...PAYEE_DIGEST_IGNORED, ...(this.options.ignorePayeeFields ?? [])]);
     } catch (error) {
       if (error instanceof ProviderError && error.kind === 'not_found') return null;
       throw error;

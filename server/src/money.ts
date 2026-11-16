@@ -9,7 +9,8 @@ import { ApiError } from './errors';
  * what the customer typed.
  */
 export function assertAmount(amount: unknown, currency: string, field = 'amount'): string {
-  if (typeof amount !== 'string' || !/^\d{1,15}(\.\d+)?$/.test(amount)) throw new ApiError('validation', { fields: [field] });
+  // No leading zeros ("01.50"): an amount has one spelling, and it is stored and shown exactly as it was approved.
+  if (typeof amount !== 'string' || !/^(0|[1-9]\d{0,14})(\.\d+)?$/.test(amount)) throw new ApiError('validation', { fields: [field] });
   const decimals = amount.includes('.') ? amount.length - amount.indexOf('.') - 1 : 0;
   if (decimals > currencyDecimals(currency) || !/[1-9]/.test(amount)) throw new ApiError('validation', { fields: [field] });
   return amount;

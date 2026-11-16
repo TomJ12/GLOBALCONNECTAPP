@@ -25,6 +25,13 @@ export interface Config {
   openOnNetwork: boolean;
   /** The key holder's one-off acceptance of an audit log whose end is not signed (AUDIT_ACCEPT_LOG_END): the label of that exact log end. */
   auditAcceptLogEnd: string | null;
+  /**
+   * How long a payment whose sending had an unknown outcome and was then refused is still looked for at the
+   * provider (by its key) before it is called failed (PAYMENT_RECONCILE_HOURS, default 72).
+   */
+  paymentReconcileMs: number;
+  /** Payee fields left out of the payee digest for each provider, beyond the adapter's own short list (PAYEE_DIGEST_IGNORE_CURRENCYCLOUD / _EQUALS). */
+  payeeDigestIgnore: { currencycloud: string[]; equals: string[] };
   /** Only with APP_ENV=development. */
   development: boolean;
   /** Everything else. */
@@ -265,7 +272,17 @@ export function loadConfig(env: Env = process.env): Config {
   const approvalHours = Number(env.PAYMENT_APPROVAL_HOURS ?? 48);
   if (!(approvalHours > 0 && approvalHours <= 24 * 30)) throw new Error('PAYMENT_APPROVAL_HOURS must be a number of hours between 0 and 720 (default 48).');
 
+  const reconcileHours = Number(env.PAYMENT_RECONCILE_HOURS ?? 72);
+  if (!(reconcileHours > 0 && reconcileHours <= 24 * 30)) throw new Error('PAYMENT_RECONCILE_HOURS must be a number of hours between 0 and 720 (default 72).');
+  const fieldList = (value: string | undefined): string[] => {
+    const names = (value ?? '').split(',').map((item) => item.trim()).filter(Boolean);
+    if (names.some((name) => !/^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$/.test(name))) throw new Error('PAYEE_DIGEST_IGNORE_* must be a comma-separated list of field names (a.b for a field inside another).');
+    return names;
+  };
+
   return {
+    paymentReconcileMs: Math.round(reconcileHours * 60 * 60_000),
+    payeeDigestIgnore: { currencycloud: fieldList(env.PAYEE_DIGEST_IGNORE_CURRENCYCLOUD), equals: fieldList(env.PAYEE_DIGEST_IGNORE_EQUALS) },
     paymentApprovalMs: Math.round(approvalHours * 60 * 60_000),
     demoAccessPassword,
     publicDemo,

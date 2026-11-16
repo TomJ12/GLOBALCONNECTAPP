@@ -128,8 +128,8 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
   const providerA = options.providers?.a ?? new MockCurrencycloudPlatform({ now, enforceOwnership: options.enforceOwnership });
   const providerB = options.providers?.b ?? new MockEqualsServer({ now, enforceOwnership: options.enforceOwnership });
   const registry = new ProviderRegistry({
-    currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: providerA, now }),
-    equals: equalsFactory({ credentials: config.providers.equals, transport: providerB, keys: stores.providerKeys, now }),
+    currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: providerA, now, ignorePayeeFields: config.payeeDigestIgnore.currencycloud }),
+    equals: equalsFactory({ credentials: config.providers.equals, transport: providerB, keys: stores.providerKeys, now, ignorePayeeFields: config.payeeDigestIgnore.equals }),
   });
   const outbox = new ConsoleOutbox(() => {});
   const logs: string[] = [];

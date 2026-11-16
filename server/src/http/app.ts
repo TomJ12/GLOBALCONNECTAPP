@@ -652,9 +652,8 @@ export async function buildApp(deps: AppDeps) {
             if (again) return again;
             await assertOwnPayee(context, input.beneficiaryId);
             // With an approval policy the payment is HELD here: nothing is sent to the provider until it is approved.
-            // (If this key went straight to the provider before the company had a rule, that payment is returned.)
-            if (held.holds(context.company)) return held.create(context, input, idempotencyKey, request.ip);
-            return withProvider(context, (provider) => provider.createPayment({ ...input, idempotencyKey }));
+            // Without one it goes straight to the provider, and is recorded here by its key BEFORE the provider is asked.
+            return held.submit(context, input, idempotencyKey, request.ip);
           },
           // A held payment's creation is recorded with the payment itself; here, what the provider made is recorded as it is.
           (payment) => (payment.held ? null : { payment: payment.id, status: payment.status, amount: payment.amount, currency: payment.currency, payee: payment.beneficiaryId }),

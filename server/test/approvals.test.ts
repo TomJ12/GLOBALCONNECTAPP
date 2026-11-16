@@ -9,6 +9,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 
+import Big from 'big.js';
+
+import { ProviderError } from '../../src/api/errors';
 import * as schemas from '../../src/api/schemas';
 import { loadConfig } from '../src/config';
 import type { UserRole } from '../../src/api/types';
@@ -102,6 +105,10 @@ function providerPayments(company: Company): any[] {
 function allProviderPayments(company: Company): number {
   if (company.id === 'co_northfield') return [...(h.providerA as any).accounts.values()].flatMap((account: any) => account.mock.state.payments).filter((row: any) => String(row.unique_request_id ?? '').startsWith('gc-')).length;
   return [...(h.providerB as any).states.values()].flatMap((state: any) => state.paymentOrders).filter((row: any) => String(row.clientReference ?? '').startsWith('gc-')).length;
+}
+/** How many times the provider has been ASKED to make a payment (whatever came of it). */
+function createCalls(company: Company): number {
+  return mockOf(company).paymentRequests;
 }
 function providerPayee(company: Company, id: string): any {
   if (company.id === 'co_northfield') return (h.providerA as any).accounts.get('sample-contact-0001').mock.state.beneficiaries.find((row: any) => row.id === id);
@@ -494,7 +501,10 @@ for (const company of COMPANIES) {
     const unknown = await act(approver, lost.id, 'approve');
     assert.deepEqual([unknown.status, unknown.json], [200, { status: 'unknown', approvalsRemaining: 0 }]);
     assert.equal((await record(lost.id)).status, 'sending');
-    assert.equal((await heldOf(creator, lost.id)).held.state, 'sending');
+    // Neither sent nor failed as far as anyone can tell: the people looking at it are told not to create it again.
+    const shown = await heldOf(creator, lost.id);
+    assert.deepEqual([shown.status, shown.held.state], ['unknown', 'checking']);
+    assert.equal(schemas.payment.safeParse(shown).success, true);
     assert.equal((await audit('system.payment.send_outcome')).find((entry) => entry.detail.payment === lost.id)?.detail.outcome, 'unknown');
     // Whatever anyone tries next, the unfinished send is settled first: found under its key, so it is "sent" and nothing is re-sent.
     for (const [who, action] of [[admin, 'reject'], [creator, 'cancel'], [admin, 'approve']] as const) assert.equal(reasonOf(await act(who, lost.id, action)), 'not_awaiting_approval');
@@ -518,11 +528,27 @@ for (const company of COMPANIES) {
 
     // 3. The request never arrives at all, and the approver simply asks again.
     const never = await create(company, creator, payee);
+    // (Every permission is obtained first: in these tests getting a code moves the clock on.)
+    const permits: [Person, string, string][] = [];
+    for (const [who, action] of [[approver, 'approve'], [approver, 'approve'], [admin, 'reject']] as const) permits.push([who, action, await stepUp(who, `payment.${action}`, { paymentId: never.id })]);
+    const decide = ([who, action, token]: [Person, string, string]) => h.call('POST', `/v1/payments/${never.id}/${action}`, { token: who.token, headers: { 'x-step-up-token': token } });
     mock.paymentFault = 'no_answer';
-    assert.equal((await act(approver, never.id, 'approve')).json.status, 'unknown');
+    assert.equal((await decide(permits[0] as [Person, string, string])).json.status, 'unknown');
     assert.equal(providerPayments(company).length, 2);
+    // N2: asking again straight away only LOOKS for it under its key; the provider is not asked a second time while
+    // the first request may still be on its way.
+    const calls = createCalls(company);
+    assert.deepEqual((await decide(permits[1] as [Person, string, string])).json, { status: 'unknown', approvalsRemaining: 0 });
+    for (const permit of permits.slice(2)) assert.equal(reasonOf(await decide(permit)), 'not_awaiting_approval');
+    assert.deepEqual(await h.held.sweep(), { expired: 0, settled: 0 });
+    assert.equal(createCalls(company), calls, 'no second create call within the grace period');
+    assert.equal(providerPayments(company).length, 2);
+    // Once the first attempt is old enough to have been given up, asking again does ask the provider, with the same key.
+    h.clock.advance(31_000);
     assert.deepEqual((await act(approver, never.id, 'approve')).json, { status: 'processing', approvalsRemaining: 0 });
+    assert.equal(createCalls(company), calls + 1);
     assert.equal(providerPayments(company).length, 3);
+    assert.deepEqual((await record(never.id)).attempts?.map((item) => item.outcome), ['unknown', 'sent']);
 
     // Three payments, three keys, each the one derived from its held payment.
     assert.deepEqual([...keysSeen()].sort(), (await Promise.all([lost, late, never].map(async (item) => (await record(item.id)).sendKey))).sort());
@@ -720,9 +746,15 @@ for (const company of COMPANIES) {
     assert.equal((await h.stores.payments.list({ companyId: company.id })).length, 1, 'no held copy of a payment that was already sent');
     // That key with a different request, or from someone else, makes nothing either.
     for (const change of [{ amount: '2.00' }, { reference: 'INV-2' }]) assert.deepEqual((await createWith(company, creator, payee, { key: direct.key, ...change })).reply.json, refusal);
-    // (Who created a payment that was never held is not recorded here, so a colleague repeating the very same request
-    // is shown that payment, which they can see anyway. It is not made again and nothing is held.)
-    assert.equal((await createWith(company, admin, payee, { key: direct.key })).id, direct.id);
+    assert.deepEqual((await createWith(company, creator, payee, { key: direct.key, reason: 'Other' })).reply.json, refusal);
+    // A payment that was never held is recorded by its key too, with who made it: a colleague repeating the very
+    // same request under that key is refused in the same words, under either rule.
+    assert.deepEqual((await createWith(company, admin, payee, { key: direct.key })).reply.json, refusal);
+    await h.policy(company.id, 0);
+    assert.deepEqual((await createWith(company, admin, payee, { key: direct.key })).reply.json, refusal);
+    assert.deepEqual((await createWith(company, creator, payee, { key: direct.key, amount: '2.00' })).reply.json, refusal);
+    assert.equal((await createWith(company, creator, payee, { key: direct.key })).id, direct.id);
+    await h.policy(company.id, 1);
     assert.equal(providerPayments(company).length, 1);
     assert.equal((await h.stores.payments.list({ companyId: company.id })).length, 1);
     // And the held one is still approvable, once.
@@ -797,6 +829,242 @@ for (const company of COMPANIES) {
     assert.equal(providerPayments(company).length, 0);
     refuse = null;
     assert.equal((await act(approver, waiting.id, 'approve')).status, 200);
+  });
+
+  // --- Audit of 2ac6785 ---------------------------------------------------------------------------------
+
+  test(on('N1: a send that went unanswered and is then refused is NOT failed: it is checked by key, found when it lands, and only called failed after the window'), async () => {
+    const { admin, creator, approver, payee } = await team(company);
+    const mock = mockOf(company);
+    const balance = (amount: string | null, saved?: unknown) => {
+      if (company.id === 'co_northfield') {
+        const row = (h.providerA as any).accounts.get('sample-contact-0001').mock.balanceRow(company.currency);
+        const before = row.amount;
+        row.amount = amount === null ? saved : new Big(amount);
+        return before;
+      }
+      const balances = (h.providerB as any).states.get('S00001').balances as Map<string, Big>;
+      const before = balances.get(company.currency);
+      balances.set(company.currency, amount === null ? (saved as Big) : new Big(amount));
+      return before;
+    };
+
+    // The final approval's request to the provider gets no answer, and has not arrived there yet.
+    const { id, key } = await create(company, creator, payee);
+    mock.paymentFault = 'applied_late';
+    assert.deepEqual((await act(approver, id, 'approve')).json, { status: 'unknown', approvalsRemaining: 0 });
+    assert.equal(providerPayments(company).length, 0);
+    // The sweep finds nothing under the key and asks again; at that moment the provider refuses (no money).
+    const funds = balance('0.00');
+    h.clock.advance(31_000);
+    assert.deepEqual(await h.held.sweep(), { expired: 0, settled: 0 });
+    balance(null, funds);
+    // It used to be "failed" here, for good. It is not: the first request may still be made.
+    let stored = await record(id);
+    assert.deepEqual([stored.status, stored.refusal, stored.attempts?.map((item) => [item.outcome, item.reason ?? ''])], ['sending', 'insufficient_funds', [['unknown', 'network'], ['refused', 'insufficient_funds']]]);
+    assert.equal(stored.unconfirmedSince, h.clock.now);
+    for (const who of [creator, approver]) {
+      const shown = await heldOf(who, id);
+      assert.deepEqual([shown.status, shown.held.state], ['unknown', 'checking']);
+    }
+    assert.deepEqual((await audit('system.payment.send_outcome')).filter((entry) => entry.detail.payment === id).map((entry) => [entry.detail.outcome, entry.detail.reason]).reverse(), [['unknown', 'network'], ['unconfirmed', 'insufficient_funds']]);
+    // While it is being checked: looked up only, never asked for again, and nobody can close or re-decide it.
+    const calls = createCalls(company);
+    for (let n = 0; n < 3; n += 1) {
+      h.clock.advance(61_000);
+      assert.deepEqual(await h.held.sweep(), { expired: 0, settled: 0 });
+    }
+    for (const [who, action] of [[admin, 'reject'], [creator, 'cancel'], [admin, 'approve']] as const) assert.equal(reasonOf(await act(who, id, action)), 'not_awaiting_approval');
+    assert.deepEqual((await act(approver, id, 'approve')).json, { status: 'unknown', approvalsRemaining: 0 });
+    assert.equal(createCalls(company), calls);
+    // The creator's app, asking by its key, is not told "failed" either.
+    assert.equal((await h.call('GET', `/v1/payments/by-key/${key}`, { token: creator.token })).json.status, 'unknown');
+    // Now the first request lands, and the provider makes the payment. The next look finds it: sent, once.
+    await mock.releaseLate();
+    assert.equal(providerPayments(company).length, 1);
+    h.clock.advance(61_000);
+    assert.deepEqual(await h.held.sweep(), { expired: 0, settled: 1 });
+    stored = await record(id);
+    assert.deepEqual([stored.status, stored.unconfirmedSince ?? null, stored.providerPaymentId !== null], ['sent', null, true]);
+    assert.equal(providerPayments(company).length, 1);
+
+    // One that never lands: still being checked just before the window ends, failed (and said why) once it has.
+    const never = await create(company, creator, payee);
+    mock.paymentFault = 'no_answer';
+    assert.equal((await act(approver, never.id, 'approve')).json.status, 'unknown');
+    const again = balance('0.00');
+    h.clock.advance(31_000);
+    await h.held.sweep();
+    balance(null, again);
+    assert.equal((await record(never.id)).status, 'sending');
+    h.clock.advance(h.config.paymentReconcileMs - 60_000);
+    await h.held.sweep();
+    assert.equal((await record(never.id)).status, 'sending');
+    h.clock.advance(61_000);
+    assert.deepEqual(await h.held.sweep(), { expired: 0, settled: 1 });
+    stored = await record(never.id);
+    assert.equal(stored.status, 'failed');
+    assert.match(stored.note ?? '', /^insufficient_funds; not found at the provider under its key in 72 hours of checking$/);
+    assert.equal(providerPayments(company).length, 1);
+
+    // A refusal of the first and ONLY attempt is still final at once: nothing else is in flight.
+    // (The approval's own balance check is satisfied; the provider then refuses.)
+    const creatorAgain = await signIn(creator.email, company.id, { secret: creator.secret });
+    const approverAgain = await signIn(approver.email, company.id, { secret: approver.secret });
+    const plain = await create(company, creatorAgain, payee);
+    const real = h.held['deps'].withProvider;
+    let drained: unknown = null;
+    h.held['deps'].withProvider = (async (target: any, run: any) =>
+      real(target, async (provider: any) => {
+        const original = provider.listBalances;
+        provider.listBalances = async (...args: unknown[]) => {
+          const balances = await original.apply(provider, args);
+          drained = balance('0.00');
+          return balances;
+        };
+        try {
+          return await run(provider);
+        } finally {
+          provider.listBalances = original;
+        }
+      })) as typeof real;
+    assert.deepEqual((await act(approverAgain, plain.id, 'approve')).json, { status: 'failed', approvalsRemaining: 0 });
+    h.held['deps'].withProvider = real;
+    assert.ok(drained !== null);
+    balance(null, drained);
+    assert.deepEqual([(await record(plain.id)).status, (await record(plain.id)).attempts?.map((item) => item.outcome)], ['failed', ['refused']]);
+  });
+
+  test(on('N1: an attempt cut off by a crash counts as unanswered: after the restart a refusal is not final'), async () => {
+    const folder = mkdtempSync(path.join(tmpdir(), 'gc-n1-'));
+    folders.push(folder);
+    const databasePath = path.join(folder, 'data.sqlite');
+    const { creator, approver, payee } = await team(company, { databasePath });
+    const { id } = await create(company, creator, payee);
+    // The process dies after writing down that it is asking, and before any answer.
+    const stored = { ...(await record(id)) };
+    await h.stores.payments.update(id, [], (current) => ({ ...current, status: 'sending', statusAt: h.clock.now, sendKey: `gc-crash-${current.id}`, sendMapping: null, approvals: [{ userId: approver.id, at: h.clock.now }], attempts: [{ at: h.clock.now, outcome: 'started' }] }));
+    void stored;
+    // After the restart nothing is found under the key, it is asked again, and the provider refuses.
+    const real = h.held['deps'].withProvider;
+    h.held['deps'].withProvider = (async (target: any, run: any) => real(target, async (provider: any) => run(new Proxy(provider, { get: (object, name) => (name === 'createPayment' ? async () => { throw new ProviderError('insufficient_funds'); } : Reflect.get(object, name).bind?.(object) ?? Reflect.get(object, name)) })))) as typeof real;
+    assert.deepEqual(await h.held.sweep({ all: true }), { expired: 0, settled: 0 });
+    h.held['deps'].withProvider = real;
+    const after = await record(id);
+    assert.deepEqual([after.status, after.attempts?.map((item) => item.outcome), Boolean(after.unconfirmedSince)], ['sending', ['started', 'refused'], true]);
+    assert.equal((await heldOf(creator, id)).held.state, 'checking');
+  });
+
+  test(on('N3: a payment past its expiry is expired when its key is replayed, not handed back as still waiting'), async () => {
+    const { creator, approver, payee } = await team(company);
+    const { id, key } = await create(company, creator, payee);
+    h.clock.advance(49 * HOUR);
+    const later = await signIn(creator.email, company.id, { secret: creator.secret });
+    const replayed = await createWith(company, later, payee, { key });
+    assert.deepEqual([replayed.reply.status, replayed.id, replayed.reply.json.status, replayed.reply.json.held.state, replayed.reply.json.held.canCancel], [200, id, 'cancelled', 'expired', false]);
+    assert.equal((await record(id)).status, 'expired');
+    assert.equal(reasonOf(await act(await signIn(approver.email, company.id, { secret: approver.secret }), id, 'approve')), 'payment_expired');
+    assert.equal((await audit('system.payment.expire')).filter((entry) => entry.detail.payment === id).length, 1);
+  });
+
+  test(on('N13: a payment sent directly is recorded by its key BEFORE the provider is asked: the same request after a rule change never becomes a second, held, payment'), async () => {
+    const { admin, creator, approver, payee } = await team(company);
+    const mock = mockOf(company);
+    await h.policy(company.id, 0);
+    const refusal = { error: { kind: 'validation', fields: ['idempotencyKey'] } };
+    // Sent directly; the request has not reached the provider and there is no answer.
+    mock.paymentFault = 'applied_late';
+    const first = await create(company, creator, payee);
+    assert.notEqual(first.reply.status, 200);
+    assert.equal(providerPayments(company).length, 0);
+    const direct = await h.stores.payments.getDirect(company.id, first.key);
+    assert.deepEqual([direct?.createdBy, direct?.state, direct?.unknown, direct?.providerPaymentId], [creator.id, 'started', true, null]);
+    // The company's rule is switched on, and the app retries the same request with the same key.
+    await h.policy(company.id, 1);
+    const retried = await createWith(company, creator, payee, { key: first.key });
+    assert.deepEqual([retried.reply.status, retried.reply.json], [504, { error: { kind: 'timeout' } }], 'outcome not known: neither held nor sent');
+    assert.equal((await h.stores.payments.list({ companyId: company.id })).length, 0, 'no held twin');
+    assert.equal(providerPayments(company).length, 0);
+    // Anything else with that key, or anyone else, is refused as for any key that is taken.
+    assert.deepEqual((await createWith(company, creator, payee, { key: first.key, amount: '1.00' })).reply.json, refusal);
+    assert.deepEqual((await createWith(company, creator, payee, { key: first.key, reason: 'Other' })).reply.json, refusal);
+    assert.deepEqual((await createWith(company, admin, payee, { key: first.key })).reply.json, refusal);
+    // The first request lands. The retry now gets that payment: one payment for one request.
+    await mock.releaseLate();
+    assert.equal(providerPayments(company).length, 1);
+    const found = await createWith(company, creator, payee, { key: first.key });
+    assert.equal(found.reply.status, 200);
+    assert.equal(found.reply.json.held, undefined);
+    assert.equal((await h.stores.payments.getDirect(company.id, first.key))?.providerPaymentId, found.id);
+    assert.equal((await h.stores.payments.list({ companyId: company.id })).length, 0);
+    assert.equal(providerPayments(company).length, 1);
+    void approver;
+
+    // With no rule, a retry of an unanswered direct send asks the provider again under the SAME key, as before.
+    await h.policy(company.id, 0);
+    mock.paymentFault = 'lost_response';
+    const lost = await create(company, creator, payee);
+    assert.notEqual(lost.reply.status, 200);
+    assert.equal(providerPayments(company).length, 2);
+    const again = await createWith(company, creator, payee, { key: lost.key });
+    assert.equal(again.reply.status, 200);
+    assert.equal(providerPayments(company).length, 2);
+    // A direct send the provider plainly refused made nothing; under a rule that key is spent, not quietly held.
+    const real = h.held['deps'].withProvider;
+    h.held['deps'].withProvider = (async (target: any, run: any) => real(target, async (provider: any) => run(new Proxy(provider, { get: (object, name) => (name === 'createPayment' ? async () => { throw new ProviderError('insufficient_funds'); } : Reflect.get(object, name).bind?.(object) ?? Reflect.get(object, name)) })))) as typeof real;
+    const refused = await create(company, creator, payee);
+    h.held['deps'].withProvider = real;
+    assert.equal(refused.reply.json.error.kind, 'insufficient_funds');
+    assert.deepEqual([(await h.stores.payments.getDirect(company.id, refused.key))?.state, (await h.stores.payments.getDirect(company.id, refused.key))?.unknown], ['refused', false]);
+    await h.policy(company.id, 1);
+    assert.deepEqual((await createWith(company, creator, payee, { key: refused.key })).reply.json, refusal);
+    assert.equal((await h.stores.payments.list({ companyId: company.id })).length, 0);
+    // The store itself: one key cannot be both, whichever arrives first.
+    const key = 'key-both-000001';
+    const base = { companyId: company.id, idempotencyKey: key, createdBy: creator.id, requestHash: 'x', createdAt: 1, mapping: { providerKey: 'equals' as const, providerAccountId: 'a', providerContactId: '' }, state: 'started' as const, unknown: false, providerPaymentId: null };
+    assert.equal(((await h.stores.payments.claimDirect(base)) as { created: boolean }).created, true);
+    assert.equal(((await h.stores.payments.claimDirect(base)) as { created: boolean }).created, false);
+    const template = await create(company, creator, payee);
+    const heldTwin = await h.stores.payments.create({ ...(await record(template.id)), id: 'hp_twin', idempotencyKey: key });
+    assert.ok('direct' in heldTwin);
+    assert.ok('held' in (await h.stores.payments.claimDirect({ ...base, idempotencyKey: template.key })));
+  });
+
+  test(on('an amount has one spelling: leading zeros are refused, so what is stored and approved is what was typed'), async () => {
+    const { creator, payee } = await team(company);
+    for (const amount of ['01.50', '00.50', '0125.00', '00']) {
+      const reply = (await createWith(company, creator, payee, { amount })).reply;
+      assert.deepEqual([reply.status, reply.json.error?.fields], [400, ['amount']], amount);
+    }
+    assert.equal((await createWith(company, creator, payee, { amount: '0.50' })).reply.status, 200);
+    assert.equal((await h.stores.payments.list({ companyId: company.id })).length, 1);
+  });
+
+  test(on('payee digest: a refusal names the fields that changed (never their values), and a field the provider moves on its own can be left out by name'), async () => {
+    const ignored = company.id === 'co_northfield' ? { PAYEE_DIGEST_IGNORE_CURRENCYCLOUD: 'payments_count,bank.last_checked_at' } : { PAYEE_DIGEST_IGNORE_EQUALS: 'paymentsCount,bank.lastCheckedAt' };
+    const names = company.id === 'co_northfield' ? ['payments_count', 'last_checked_at', 'bank_name', 'routing_code_value_1'] : ['paymentsCount', 'lastCheckedAt', 'bankName', 'bankIdentifier'];
+    const [counter, stamp, bank, routing] = names as [string, string, string, string];
+    const config = loadConfig({ APP_ENV: 'development', ...ignored });
+    const { creator, approver, payee } = await team(company, {}, { payeeDigestIgnore: config.payeeDigestIgnore });
+    const row = providerPayee(company, payee);
+    Object.assign(row, { [counter]: 0, bank: { [stamp]: '2026-01-01', branch: 'A' } });
+    const fine = await create(company, creator, payee);
+    const blocked = await create(company, creator, payee);
+    // The provider counts a payment and stamps a check: both are on the adapter's ignore list, by name. Nothing is blocked.
+    Object.assign(row, { [counter]: 7, bank: { [stamp]: '2031-01-01', branch: 'A' } });
+    assert.deepEqual((await act(approver, fine.id, 'approve')).json, { status: 'processing', approvalsRemaining: 0 });
+    // A field NOT on the list, nested or not, still blocks, and the audit entry says which, by name only.
+    const secretValue = 'ZZ-ATTACKER-9999';
+    Object.assign(row, { [bank]: secretValue, [routing]: '999999', bank: { [stamp]: '2031-01-01', branch: 'B' } });
+    assert.equal(reasonOf(await act(approver, blocked.id, 'approve')), 'payee_changed');
+    const entry = (await audit('system.payment.blocked')).find((item) => item.detail.payment === blocked.id);
+    assert.equal(entry?.detail.fields, [bank, 'bank.branch', routing].sort().join(', '));
+    assert.ok(!JSON.stringify(entry).includes(secretValue) && !JSON.stringify(entry).includes('999999'));
+    // What the client app is told is unchanged: no field names, no provider's vocabulary.
+    assert.doesNotMatch(h.bodies.join('\n'), new RegExp(`${routing}|${counter}`));
+    // The lists are explicit and short, and a malformed one is refused at start-up.
+    assert.deepEqual(loadConfig({ APP_ENV: 'development' }).payeeDigestIgnore, { currencycloud: [], equals: [] });
+    assert.throws(() => loadConfig({ APP_ENV: 'development', PAYEE_DIGEST_IGNORE_EQUALS: 'a b; DROP' }), /PAYEE_DIGEST_IGNORE_\* must be a comma-separated list of field names/);
   });
 }
 

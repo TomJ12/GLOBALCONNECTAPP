@@ -301,7 +301,8 @@ export interface Payment {
 }
 
 /** `mismatch`: it was sent, but the provider's record of it differs from what was approved (amount, currency or payee). */
-export type PaymentHoldState = 'awaiting_approval' | 'sending' | 'rejected' | 'cancelled' | 'expired' | 'payee_changed' | 'failed' | 'mismatch';
+/** `checking`: approved and handed to the provider, but an attempt to send it went unanswered: it may or may not have been made, and must not be created again. */
+export type PaymentHoldState = 'awaiting_approval' | 'sending' | 'rejected' | 'cancelled' | 'expired' | 'payee_changed' | 'failed' | 'mismatch' | 'checking';
 
 export interface PaymentHold {
   state: PaymentHoldState;
