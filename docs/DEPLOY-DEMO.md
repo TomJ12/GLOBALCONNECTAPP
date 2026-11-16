@@ -301,8 +301,10 @@ To check the audit log has not been altered:
 fly ssh console -C "gc audit-verify"
 ```
 
-That finds entries changed, removed or cut off the end. The one thing it cannot find by
-itself is the whole database having been swapped for an older copy of itself. If that
+That finds entries changed, removed, cut off the end or hidden in the archive, and
+anything added to the database that could hide or drop entries. The server runs most of
+the same check at every start and will not start if it fails. The one thing neither can
+find by itself is the whole database having been swapped for an older copy of itself. If that
 matters to you, take a **checkpoint** when you take a backup (a small signed note of
 where the log ended; it contains no audit entries), download it and keep it with the
 backup, off the server:
@@ -316,6 +318,31 @@ fly ssh console -C "rm /data/audit-2026-11-13.checkpoint"
 To check against it later, put it back on the server first (`fly ssh sftp shell`, then
 `put audit-2026-11-13.checkpoint /data/audit-2026-11-13.checkpoint`), and run
 `fly ssh console -C "gc audit-verify --checkpoint /data/audit-2026-11-13.checkpoint"`.
+
+**If the server will not start after an update, saying the end of the audit log is not
+signed.** That is expected exactly once if your demo was first deployed with the very
+first version of this guide (its database did not sign the end of the log). The server
+will not sign a log it did not write the end of. The message in `fly logs` shows how
+many entries the log holds and a short label for its end, like
+`AUDIT_ACCEPT_LOG_END=3fa9c2d1e0b7a6f4`. If the number of entries looks right to you,
+accept the log as it stands, once:
+
+```bash
+fly secrets set AUDIT_ACCEPT_LOG_END=3fa9c2d1e0b7a6f4     # the label from YOUR log; the server restarts and starts
+fly secrets unset AUDIT_ACCEPT_LOG_END                    # straight afterwards; it restarts again
+```
+
+Do the second line straight away: the server refuses to start a second time while the
+setting is still there. The acceptance is written into the audit log itself
+(`system.audit.resealed`, highlighted on the Audit page). If you see this message at any
+other time, do **not** accept it: it means entries may have been removed. Take a backup
+and get help. (If you do not care about what is in the demo, the other way out is to
+start again with an empty volume.)
+
+**Changing the encryption key** (`DATA_ENCRYPTION_KEY`) cannot be done on a running
+demo: the command needs the server stopped, which on Fly means no console to run it
+from. For a demo, do not rotate it; if the key has leaked, start again with a new
+volume and new secrets (step 5).
 
 **File permissions and the one-server rule.** The server refuses to start if the
 database, or the `/data` folder, could be read by another user of the machine, and if
@@ -444,9 +471,15 @@ downloaded.
 - **The demo gate.** With `DEMO_ACCESS_PASSWORD` set, everything except `/healthz`
   (which answers `{"ok":true}` and nothing else, for Fly's health check) requires the
   gate first: a signed, HttpOnly, Secure cookie, valid 12 hours, five password
-  attempts a minute per visitor. It is a door in front of the demo, not a replacement
-  for anything: clients still sign in with password and authenticator code, staff
-  likewise.
+  attempts a minute per visitor. On top of that there is a ceiling for everyone
+  together: after 20 wrong passwords in ten minutes, from anywhere, every attempt
+  (right or wrong) waits a few seconds, one at a time, and the wait grows (to 16
+  seconds at most) while wrong guesses keep coming. Nobody is locked out: the right
+  password still works, a little later; if many attempts are already waiting you are
+  asked to try again in a few seconds. It ends by itself ten minutes after the wrong
+  guesses stop. It is a door in front of the demo, not a replacement for anything:
+  clients still sign in with password and authenticator code, staff likewise. It still
+  rests on the password being long and not guessable.
 - **The server refuses to start** in demo (development) mode on Fly, or on any address
   that is not your own machine or a Codespace, unless the demo password,
   `SERVER_SECRET`, `ADMIN_TOKEN`, `DATA_ENCRYPTION_KEY` and a database path are all

@@ -125,6 +125,15 @@ run `npm run demo:reset` (the old file is not converted). Without `DATABASE_PATH
 example `npm run server`) the database is in memory: a restart forgets everything and
 prints new codes.
 
+**Who can reach it.** In development the server shows sample accounts and prints their
+activation codes, so it listens **on this machine only** (`127.0.0.1`) unless told
+otherwise. That is also what a GitHub Codespace needs: its port forwarding connects
+from inside the codespace. A development server on any other address (`HOST=0.0.0.0`,
+for a phone on your network or a container) must be behind the demo gate
+(`DEMO_ACCESS_PASSWORD`), which is how the Docker image and Fly run it; or you must say
+so in so many words with `DEV_OPEN_ON_NETWORK=1`, and the server then prints a warning
+at every start. Outside development the address is the operator's choice, as before.
+
 **Node.js 22.13 or newer is required** (`node --version`). `npm run demo` and the server
 check and say so plainly. The repository has a `.devcontainer` that asks GitHub
 Codespaces for a Node 22 image; a codespace created before it was added needs
@@ -209,7 +218,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 167 tests (about three minutes)
+npm test                 # node:test, 192 tests (about four minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -291,7 +300,7 @@ server/
                     operations), seed.ts (sample people, development only),
                     sqlite/ (the only place with SQL: db.ts, migrations.ts, tables.ts,
                     directory.ts, audit.ts, keys.ts)
-    cli/db.ts       audit:verify, audit:checkpoint, db:backup, db:rotate-key
+    cli/db.ts       audit:verify, audit:checkpoint, audit:reseal, db:backup, db:rotate-key
     providers/
       adapter.ts          ProviderAdapter (= the app's ProviderClient + capabilities), registry
       currencycloud.ts    provider A: reuses src/api/adapters/currencycloud
@@ -553,8 +562,17 @@ when. **Every** approval, not only the one that turns out to be the last, checks
   **the same** as the one taken at creation; if not, the approval is refused and the
   payment is closed as "payee changed" for good (create it again). This is a comparison
   of digests of the provider's record, not a judgement about which fields matter: a
-  change the provider makes to a payee for its own reasons (a new status, a field it
-  starts returning) also blocks the payment, on purpose;
+  change the provider makes to a payee for its own reasons (a new status, a counter, a
+  nested timestamp it starts returning) also blocks the payment, on purpose. Two things
+  keep that manageable. The audit entry for the refusal (`system.payment.blocked`)
+  **names the fields that differ** (names only, never values; staff see it in the
+  console, the client app does not), so a false refusal can be told from a changed
+  destination. And the fields left out of the digest are an **explicit list per
+  provider adapter** (`PAYEE_DIGEST_IGNORED` in each adapter: only the created/updated
+  timestamps), which an operator can extend by name with
+  `PAYEE_DIGEST_IGNORE_CURRENCYCLOUD` / `PAYEE_DIGEST_IGNORE_EQUALS` (comma-separated;
+  `a.b` for a field inside another). Leaving a field out is a decision about where
+  money may go: nothing is ignored by default beyond those timestamps;
 - the creator is still an enabled member of the company with a role that allows
   creating, and the approver one with a role that allows approving;
 - **every earlier approver** is still enabled, still a member and still allowed to
@@ -588,9 +606,25 @@ the server's: it holds only if the provider honours the idempotency key for as l
 a send can stay unsettled, and finds a payment by that key. Both mocks do; it has to be
 confirmed with each real provider, and until it is, "sent once" is a claim about the
 mocks. This runs at start-up (before the server takes requests; every unsettled send,
-since no other process can be in the middle of one), once a minute, and whenever anyone
-tries to act on that payment. A plain refusal by the provider (not enough money,
-details not accepted) is final: the payment is marked failed and is not retried.
+since no other process can be in the middle of one) and once a minute. When someone
+tries to act on a payment that is `sending`, the server only **looks it up** under its
+key; it asks the provider again only when the last attempt is more than 30 seconds old
+and none is under way in this process, so a decision never fires a second request
+beside the first.
+
+**Every attempt is written down before it is made**, with its outcome afterwards
+(`attempts` on the payment; the last 20). A plain refusal by the provider (not enough
+money, details not accepted) is **final only when it answers the first and only
+attempt**: then the payment is failed and not retried. Once any attempt has gone
+unanswered (lost, timed out, or cut off by a crash), that attempt may still reach the
+provider, so a later refusal proves nothing and the payment is **not** called failed.
+It stays `sending`, the creator and the approvers see "Outcome being checked: do not
+create it again", and from then on the server only looks it up by key, never asks
+again. If the provider turns out to have it, it is marked sent. Only after
+`PAYMENT_RECONCILE_HOURS` (default 72) of looking without finding it is it marked
+failed, with a note saying so. While it is being checked the company cannot be
+re-pointed. Limits: a request that reaches the provider later than the window would
+still be missed, and a provider that cannot find a payment by key defeats all of it.
 
 When the provider's answer comes back, its amount, currency and payee are compared with
 what was approved. A difference does not undo anything (the payment has been made), but
@@ -604,13 +638,20 @@ payment*. The server stores a hash of the request (payee, amount, currency, refe
 reason) and who made it. The same key from the same person with the same request
 returns the original payment and creates nothing. The same key with anything different,
 or from another member of the company, is refused as a validation error that says
-nothing about the payment the key belongs to. The key is looked up both among held
-payments and at the provider, whatever the company's rule is at that moment, so a rule
-changed between two attempts cannot turn one request into two payments (held and then
-sent directly, or the reverse). One limit: for a payment that was never held (rule 0)
-the server keeps no record of its own, so "who made it" is not known; a colleague
-repeating the identical request with the same key is shown that payment (which every
-member can see anyway), and it is not made again.
+nothing about the payment the key belongs to. That holds for held payments and for
+payments sent straight to the provider alike: a direct send is **recorded on the server
+by its key, creator and request hash before the provider is asked**, and one key can
+never be both a direct send and a held payment (one database transaction decides). So
+a rule changed between two attempts cannot turn one request into two payments, even
+while the first attempt is still unanswered: if a direct send's outcome is not known
+and the company now has a rule, the retry is answered "outcome not known yet" (a
+timeout, which the app reconciles by key) until the provider shows the payment; it is
+neither held as a second payment nor sent past the rule. A direct send the provider
+plainly refused, with nothing unanswered before it, made nothing, and under a rule its
+key is spent. Limits: payments sent directly by an earlier version of this server left
+no such record; for those the provider is still asked by key and the request compared
+with what it returns (amount, currency, payee, reference), and who made them is not
+known. Amounts have one spelling: a leading zero ("01.50") is refused.
 
 **Reject, cancel, expire.** An `approver` or `admin` can reject (optionally with a
 reason, through the API; the app does not ask for one). The creator, or a company
@@ -981,48 +1022,102 @@ entry, and database triggers reject every `UPDATE` and `DELETE` on it.
 
 **Tamper-evident.** Each entry stores a keyed hash (HMAC-SHA-256) over the entry before
 it and its own content; the key is derived from `DATA_ENCRYPTION_KEY`, which is not in
-the database. The **end of the log** (the last entry's number and hash, and how many
-entries were ever written) is kept in one row that is itself signed with a key derived
-from `DATA_ENCRYPTION_KEY`; it is signed when the database is created (or upgraded) and
-re-signed only by a server that found the previous signature valid. `npm run
-audit:verify` (read-only; it changes nothing in the database) checks:
+the database. Entries are numbered from 1 without a gap. The **end of the log** (the
+last entry's number and hash, how many entries there are, and how far the archive
+reaches) is kept in one row that is itself signed with a key derived from
+`DATA_ENCRYPTION_KEY`.
 
-- the whole chain, archive included, naming the first entry that was changed, removed,
-  inserted or reordered;
-- that the log ends where the signed record says, with as many entries as it says. So
-  cutting entries off the end is found **even if the record of the end is edited,
-  copied from the entry that is now last, or deleted**: without the key it cannot be
-  made to match, and a missing or unsigned record is itself a failure;
-- that the triggers which refuse `UPDATE` and `DELETE` exist and are exactly the ones
-  this code creates (dropping them, or putting back ones that refuse nothing, is
-  reported even when no entry was touched).
+**Who may sign the end of the log.** Only three things ever do: the creation of a new,
+empty database; a server adding an entry to a log whose end it has just verified; and
+the key holder, explicitly (below). In particular the server **never signs an existing
+log because the database "needs upgrading"**: the version table is an ordinary table
+that anyone with the file can edit. What the database is (its schema version, and
+whether it was ever used in development) is kept in a second signed record, required
+on every database that is not brand new, and it must agree with the version table. So
+deleting rows, columns, markers or version numbers to make a cut log look like an old
+database waiting to be upgraded gets a refusal, not a signature.
 
-What the file alone can never show is the **whole database replaced by an older copy of
-itself**: an older copy is a valid log. For that, export a checkpoint and keep it where
-whoever keeps the database cannot change it:
+`npm run audit:verify` (read-only; it changes nothing in the database) checks:
+
+- the whole chain, live and archived as one log, naming the first entry that was
+  changed, removed, inserted or reordered;
+- that the log ends where the signed record says. Cutting entries off the end is found
+  even if the record of the end is edited, copied from the entry that is now last, left
+  unsigned or deleted;
+- that entries are where the server put them: an entry moved into (or out of) the
+  archive by anyone else no longer matches the signed archive boundary;
+- that **nothing has been added to the database** that could hide or drop entries: the
+  audit tables, the marker tables and their indexes must be exactly as this code
+  creates them, and the database must contain the four append-only triggers and no
+  other trigger and no view at all, wherever attached.
+
+The server runs the cheap part of this (everything but the walk along the chain) at
+every start and refuses to start if it fails. And every entry is written fail-closed:
+the server first verifies the signed end, then checks that the database really stored
+exactly one new entry, next in sequence, and moved the end by one; if any of that is
+not so, the entry is not written, the transaction is rolled back, and **the action that
+was to be recorded is refused** (a trigger that makes an insert quietly do nothing is
+caught this way even between two runs of `audit:verify`).
+
+**What this does and does not detect, precisely.** Someone who can write the database
+file but does **not** have the key cannot, without it being found at the next start or
+the next `audit:verify`: change, insert, reorder or remove an entry; cut entries off the
+end; hide entries in the archive; add a trigger, view or index that suppresses entries;
+or get the server to sign a shortened log. They **can** still do two things that the
+database alone cannot show:
+
+- **replace the whole database with an older copy of itself** (or delete it, so that a
+  new empty one is created). An older copy is a valid log. Only a **checkpoint kept
+  somewhere else** catches this:
+
+  ```bash
+  npm run audit:checkpoint -- /somewhere/else/audit-2026-11-16.checkpoint   # refuses to overwrite
+  npm run audit:verify -- --checkpoint /somewhere/else/audit-2026-11-16.checkpoint
+  ```
+
+  The checkpoint is a small signed file (entry number, hash, count, time; no entry
+  content). Verifying with it fails if the log no longer contains what it contained
+  then. Everything written after the newest checkpoint you hold can still be rolled
+  back unnoticed. Taking checkpoints is manual: nothing schedules it or ships it off the
+  machine, and a checkpoint left beside the database protects nothing;
+- **stop the server recording at all** (by breaking the database so that it refuses to
+  start, or to write). That is loud, not silent.
+
+Someone who **has the key** can rewrite the chain, the record of its end, the state
+record and a checkpoint. Write-once storage for entries is not built.
+
+**When the end of the log is not signed.** A database written by the first version of
+this server (schema 3) has a log whose end was never signed, and a key rotation done
+beside a running server with the previous version could leave the end unsigned. The
+server refuses to start on such a log, says how many entries it holds and what its end
+is, and will not sign it. The **key holder** can accept the log as it stands, once:
 
 ```bash
-npm run audit:checkpoint -- /somewhere/else/audit-2026-11-16.checkpoint   # refuses to overwrite
-npm run audit:verify -- --checkpoint /somewhere/else/audit-2026-11-16.checkpoint
+npm run audit:reseal        # server stopped; needs DATA_ENCRYPTION_KEY
 ```
 
-The checkpoint is a small signed file (entry number, hash, count, time; no entry
-content). Verifying with it fails if the log no longer contains what it contained then.
-Limits, plainly: all of this detects tampering by someone who has the database file but
-**not the key**. Someone with the key can rewrite the chain, the record of its end and a
-checkpoint. Everything written after the newest checkpoint you hold can still be rolled
-back unnoticed by restoring an older copy. Taking checkpoints is manual: nothing
-schedules it or ships it off the machine, and a checkpoint left beside the database
-protects nothing. Write-once storage for entries is not built.
+It checks every entry that is there (altered entries are never accepted, only an
+unsigned end), signs the end, and writes an entry `system.audit.resealed` saying how
+many entries were accepted, which the console highlights. Where no command can be run
+(a container that will not start), set `AUDIT_ACCEPT_LOG_END` to the end label from the
+refusal message for **one** start: it matches only that exact log, and the server will
+not start a second time while it is still set. Be clear about what acceptance means: if
+entries had been cut off the end before you accepted it, they are gone and the log now
+verifies; compare with your latest checkpoint or backup first if you have one. A
+database from the previous version of this server (schema 4), whose end was signed,
+needs none of this: its signed end is carried over as it is. A local demo can simply be
+reset (`npm run demo:reset`).
+
 After a key rotation, keep the old key in `DATA_ENCRYPTION_KEY_PREVIOUS` for as long as
 entries written under it must verify.
 
 **When the log grows.** Nothing is dropped. When the live table passes 100,000 entries
 the older half is **moved**, in one transaction, to an archive table
 (`audit_archive`) in the same database, and a line on the server's error output says so.
-The ops console shows the live table; the archive is read with SQL and is covered by
-`audit:verify`. One signed-in client can write at most 60 entries a minute (see "Rate
-limits"). Retention and shipping off the machine are still to do.
+The two tables are one log: the ops console searches and shows both, and says how many
+entries there are and how many of them are archived. One signed-in client can write at
+most 60 entries a minute (see "Rate limits"). Retention and shipping off the machine are
+still to do.
 
 ### Still not production-ready (ops console)
 
@@ -1036,8 +1131,12 @@ limits"). Retention and shipping off the machine are still to do.
   at start-up; the approver or an ops admin (never the requester) finishes it, which
   repeats only what is missing (creating a company, a client or a staff member a second
   time creates nothing; an activation email is sent again with a new link, which cancels
-  the earlier one), or closes it, which undoes nothing and says so. Nothing finishes
-  such a request automatically.
+  the earlier one), or closes it, which undoes nothing and says so. Finishing and
+  closing take exactly the checks of approving (not the requester, not the person the
+  request is about, an ops admin where approval needs one, and the requester must still
+  be allowed to make the request). A request whose approval is still running is not
+  "interrupted" and cannot be run or closed beside it. One left unfinished for more than
+  24 hours can only be closed. Nothing finishes such a request automatically.
 - **Who can reach `/ops`:** it is on the same port as the client API, open to anyone who
   can reach the server. It needs **IP allow-listing or a VPN, and staff SSO**.
 - **Four-eyes is as described above and no more:** two ops admins acting together can do
@@ -1098,14 +1197,21 @@ covers the audit log and everything else), foreign keys on, a 5-second busy time
 **Migrations** are numbered and forward-only (`server/src/store/sqlite/migrations.ts`).
 At start-up each one not yet applied runs in its own transaction and is recorded in
 `schema_version`. A database with a higher version than the code knows is refused: the
-server will not open a file written by a newer version of itself. Migration 4 (this
-version) signs the end of the audit log as it stands and makes two rules the database's
-own: **one provider account, one company** and **one company per name** (compared
-ignoring case, spacing and width) are unique indexes, so two approvals arriving together
-cannot create two companies on one account; the loser is refused with a plain message
-and its request goes back to waiting. A database from the previous version upgrades in
-that one step at the next server start; if it already holds two companies on one
-account or with one name the upgrade stops, says which, and changes nothing.
+server will not open a file written by a newer version of itself. Before any migration
+runs on a database that already exists, its key marker and signed state record are
+checked (see "Audit log": nothing is upgraded on the word of the version table alone).
+Migration 4 makes two rules the database's own: **one provider account, one company**
+and **one company per name** (compared ignoring case, spacing and width) are unique
+indexes, so two approvals arriving together cannot create two companies on one account;
+the loser is refused with a plain message and its request goes back to waiting. If a
+database from before that already holds two companies on one account, or with one name,
+the upgrade stops before changing anything and **names the companies**. Migration 5
+(this version) adds the signed state record, signs the archive boundary together with
+the end of the audit log, and adds the table in which payments sent straight to the
+provider are recorded by key. **Upgrading:** a database from the previous version
+(schema 4) upgrades by itself at the next server start. One from the first version
+(schema 3) does too if its audit log is empty; if it has entries, the server refuses
+and says what to do (`npm run audit:reseal`, or for a demo `npm run demo:reset`).
 
 **Transactions.** Every read-then-write of security state (setting a password on an
 invitation, counting an attempt, burning an authenticator step, using a recovery code,
@@ -1121,42 +1227,63 @@ activation codes are stored only as hashes, as before. Everything else (names, e
 the audit log) is not encrypted: the file needs disk encryption and access control like
 any database. The wrong key is refused at start-up, before anything is changed.
 
-**Rotating the key.**
+**Rotating the key.** The server must be **stopped**. This is the only safe order, and
+the command refuses to run while a server holds the database:
 
 ```bash
-# 1. In server/.env: the NEW key in DATA_ENCRYPTION_KEY, the old one in DATA_ENCRYPTION_KEY_PREVIOUS
-npm run db:rotate-key        # re-encrypts every stored authenticator key with the new key
-# 2. Restart the server. Keep the old key in DATA_ENCRYPTION_KEY_PREVIOUS while audit
-#    entries written under it must still pass audit:verify.
+# 1. Stop the server.
+# 2. In server/.env: the NEW key in DATA_ENCRYPTION_KEY, the old one in DATA_ENCRYPTION_KEY_PREVIOUS
+npm run db:rotate-key        # re-encrypts every stored authenticator key, and re-signs the key marker,
+                             # the state record and the end of the audit log, with the new key
+# 3. Start the server (with the new key, and the old one still in DATA_ENCRYPTION_KEY_PREVIOUS
+#    for as long as audit entries written under it must pass audit:verify).
 ```
 
-It can be run while the server is running, but the server only starts using the new key
-when it is restarted with it. The rotation is **one transaction**: if any stored secret
-cannot be decrypted it stops, names the table and row, and nothing is changed.
+Why not beside a running server: it would leave that server holding only the old key
+while its authenticator keys and the signature on the end of its audit log had moved to
+the new one. (If that ever happens the running server now fails closed: it cannot verify
+the end of the log, so it writes no entry and refuses whatever was to be recorded, until
+it is restarted with the new key. It no longer overwrites the end with an unsigned one.)
+The rotation is **one transaction**: if any stored secret cannot be decrypted it stops,
+names the table and row, and nothing is changed.
 
 **One server process.** The server keeps some state in its own memory (rate limits, the
-quotes it issued) and assumes nobody else is sending its payments, so it must be the only
-server on its database. It takes an exclusive lock (`<database>.lock`) at start-up and a
-second server on the same file refuses to start. The operating system releases the lock
-if the process dies. The maintenance commands (`audit:verify`, `audit:checkpoint`,
-`db:backup`, `db:rotate-key`) do not take it and can run beside the server.
+quotes it issued, which payments it is sending) and assumes nobody else is sending its
+payments, so it must be the only server on its database. At start-up it takes an
+exclusive operating-system lock on `<database>.lock`, beside the database file **as
+resolved** (a symlink to the database, or a path through a symlinked folder, leads to
+the same lock), and a second server refuses to start. The lock is released if the
+process dies. The two commands that write (`db:rotate-key`, `audit:reseal`) take the
+same lock, so they refuse to run beside a server; the read-only ones (`audit:verify`,
+`audit:checkpoint`, `db:backup`) do not, and can. **Limits of this lock:** it is a lock
+on a file beside the database, not on the database itself (Node offers no file lock
+without native code, and locking the database itself would shut out the read-only
+commands). So the running server also checks every 2 seconds that its lock file is
+still the one on disk, and **stops** if it has been deleted or replaced; for up to those
+2 seconds a second server could have started. It does not protect against the same
+database reached through a hard link or a second mount in another folder, nor against
+someone who deliberately defeats it; it is there to stop an accident.
 
 **File permissions.** The database holds password hashes, encrypted keys and the audit
 log. The server sets its umask to 077 at start-up, creates the database, its `-wal` and
 `-shm` files, the lock, the development key file and its folder for the owner only
-(`600`/`700`), and **refuses to start** (and the commands refuse to run) if the database
-file or its folder can be read or written by group or others, naming the `chmod` that
-puts it right. `npm run demo` tightens its own `.demo-data` folder; the container's
-entry script does the same for the volume. Not checked: the folders above it, ACLs, and
-who else can become the server's user. Not applicable on Windows, where the check is
-skipped.
+(`600`/`700`), and **refuses to start** (and the commands refuse to run) if any of
+those files, or the folder, grants **anything at all** to group or others, naming the
+`chmod` that puts it right. A path that is a symlink is checked where it really leads
+as well as where it is. `npm run demo` tightens its own `.demo-data` folder; the
+container's entry script does the same for the volume. Not checked: the folders above
+it, ACLs, and who else can become the server's user. Not applicable on Windows, where
+the check is skipped.
 
 **A database that has been used in development stays a development database.** The first
 start in `APP_ENV=development` marks the database (it then holds sample accounts and, in
-`dev_seed_codes`, their activation codes in readable form). A strict start **refuses**
-such a database rather than purging it: start a real deployment with a new file. A
-database that has lost the marker saying which encryption key wrote it is refused too,
-whatever key is offered (restore from a backup).
+`dev_seed_codes`, their activation codes in readable form). The mark is part of the
+signed state record, so it cannot be removed by deleting a row. A strict start
+**refuses** such a database rather than purging it, and refuses any database made
+before schema 5 (nothing but development could run then): start a real deployment with
+a new file. A database that has lost the marker saying which encryption key wrote it,
+or its signed state record, is refused too, whatever key is offered (restore from a
+backup).
 
 **Backups.** Do not copy the file while the server is running: with write-ahead logging
 a plain copy can be inconsistent. Use
@@ -1168,8 +1295,8 @@ npm run db:backup -- /path/to/backup.sqlite     # refuses to overwrite an existi
 which takes a consistent snapshot with SQLite's `VACUUM INTO` while the server keeps
 running. The command opens the database read-only, and the backup file is created for
 the owner only (`600`) before anything is written to it; the folder you put it in is
-yours to protect. A database left by an older version is not upgraded by a command:
-start the server once first. The backup holds everything the database does; the
+yours to protect. A database left by an older version is not upgraded by a read-only
+command: start the server once first. The backup holds everything the database does; the
 encryption key is not in it and must be kept separately (and must be kept: without it
 the authenticator keys in the backup cannot be read and the audit chain cannot be
 verified). A backup is also exactly what "an older copy of the database" means for the
