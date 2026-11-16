@@ -496,6 +496,14 @@ test('upgrade: a schema-4 database keeps the end of its log exactly as that vers
   plain.run("DELETE FROM meta WHERE key = 'used_in_development'");
   plain.close();
   assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /has been used in development mode/);
+  // Nor is a database from before schema 5 ever taken on outside development, marker or no marker: nothing but
+  // development could run then.
+  asSchema4(file);
+  const unmarked = new Db(file, MIGRATIONS.slice(0, 4));
+  unmarked.run("DELETE FROM meta WHERE key = 'used_in_development'");
+  unmarked.close();
+  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /made by an earlier version of the server[^]*cannot be used outside development/);
+  assert.equal(versionOf(file), 4);
 
   // A schema-4 database whose newest entries were cut off BEFORE the upgrade: the signed end is carried over, not
   // recomputed from the tables, so the cut is still found.

@@ -218,10 +218,10 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   if (!options.readOnly) {
     // Before anything is written: nothing has been added to the database that could hide or drop audit entries,
     // and the end of the log is the one this server (or the key holder) signed.
-    const structure = audit.structureProblem();
-    if (structure) refuse(`${structure} Refusing to start. Run "npm run audit:verify".`);
     const problem = audit.startProblem();
     if (problem) {
+      // Something added to the database is never acceptable; only an END that is not signed can be accepted, by the key holder.
+      if (audit.structureProblem()) refuse(`${problem} Refusing to start. Run "npm run audit:verify".`);
       if (!accepted(audit.endLabel())) refuse(unsigned(audit, problem));
       try {
         audit.reseal(now(), 'the key holder accepted the log as it stood');
