@@ -249,7 +249,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 192 tests (about four minutes)
+npm test                 # node:test, 230 tests (about five minutes)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
@@ -1249,6 +1249,14 @@ rejections, cancellations and adding a payee.
   staff activation link, reset a staff authenticator (all with approval). An admin
   cannot demote, disable or reset themselves, and the last active ops admin cannot be
   removed.
+- **FX margin:** see a company's margin; change it by request, approved by an ops admin
+  with their password, with a worked example (see "Client rates and Global Connect's
+  margin").
+- **Revenue (ops admins only):** conversions booked since margins were introduced, with
+  the provider's and the client's rate and amounts, the margin and the revenue; totals
+  by company and month; CSV.
+- **Notification state** of a client user: counts and email choices, never contents.
+- **Mail:** the state of the email outbox, never the content of a message.
 - **Audit log:** view and filter by actor, target, action and date.
 
 ### What ops cannot do
@@ -1256,8 +1264,12 @@ rejections, cancellations and adding a payee.
 - See or set anyone's password, authenticator key or recovery codes (a reset removes
   them; the person chooses new ones). There is no route for it.
 - See balances, transactions, payees or payments; create, approve or cancel a payment or
-  a conversion. The only call the console makes to a provider is "does this account
-  exist" when a company is mapped.
+  a conversion. **One exception, by the product owner's decision:** ops **admins** see
+  the conversions on the Revenue page (currencies, amounts, both rates), because that
+  is what revenue is counted from. The only calls the console makes to a provider are
+  "does this account exist" when a company is mapped and "what is the rate for this
+  pair now" for the worked example of a margin change.
+- Read, send or change a person's notifications or rate alerts.
 - Sign in as a client. A staff session is refused by the client API and a client
   session is refused by `/ops` (tested in both directions), and no console page ever
   contains an activation link or code. A test plays a lone staff member trying every

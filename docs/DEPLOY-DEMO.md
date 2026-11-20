@@ -476,6 +476,17 @@ downloaded.
   payment to a payee you added before a restart is then refused as "payee changed",
   which is the server doing its job with a provider that lost its data. For a clean
   showing, use the seeded payees on Northfield, or add the payee again.
+- **The sample rates move.** Both mock providers move their rates a little every 20
+  seconds (a fixed, repeatable pattern, not market data), so the Rates screen, rate
+  alerts and held quotes behave as they would with a market open. Rate alerts are
+  checked once a minute; for a showing where you want one to fire quickly, set
+  `fly secrets set ALERT_CHECK_SECONDS=10` (it restarts the machine).
+- **Notifications are in the app and "by email".** Without the SMTP settings below,
+  every email (a notification, a password reset, a security notice) is printed in the
+  log (`fly logs`) instead of being sent. There are no push notifications.
+- **A machine that is stopped checks nothing.** Rate alerts and expiry warnings are only
+  looked at while the machine runs (see "Stopping it, and what it costs"); they are
+  caught up on when it next starts, and nothing is sent twice.
 - **First visit after a stop is slow** (a few seconds) while the machine starts.
 - **Signing in takes about a second.** Password checks are deliberately expensive; the
   machine size was chosen for them (see below).
