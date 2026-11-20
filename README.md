@@ -104,10 +104,40 @@ To try it:
    change to a company's payment-approval rule and a client authenticator reset that
    second person is also asked for their password.
 
-**There is no email.** Whenever the server "sends an activation email" (from the ops
-console or the operator commands below) the whole message, link included, is printed in
-the terminal the server runs in, marked `DEVELOPMENT OUTBOX`. That is the only place a
-link appears: it is never shown in the ops console and never returned over HTTP.
+8. **A forgotten password.** Sign out, press **Forgot your password?**, type the email.
+   The reset email is printed in the server's terminal (`DEVELOPMENT OUTBOX`); open its
+   link. The page asks for a new password **and** a code from the authenticator app:
+   the link alone changes nothing (try it with a wrong code).
+9. **Your rates.** Open **Rates**: each pair shows "Sell GBP" and "Buy GBP", labelled
+   "Your rate · Indicative". They move every 20 seconds or so (the mock rates wander;
+   pull down to refresh). Tap one to open Convert for that trade; the held quote is at
+   the same rate, apart from movement in between.
+10. **A margin change with its worked example.** In the ops console open a company,
+    **FX margin**, change the default (say from 50 to 80) and press **Change FX
+    margin**. The confirmation shows what it does to a real trade ("selling GBP 10,000
+    for USD: the client rate changes from ... to ..."). Confirm; it becomes a request.
+    Sign in as a second ops **admin**, open it under **Approvals**, confirm with the
+    password. Refresh Rates in the app: the client's rates have moved. **Revenue** (ops
+    admins) lists a conversion booked afterwards with the provider rate, the client
+    rate and what was earned.
+11. **A rate alert firing.** On Rates press **New alert**, choose "Sell GBP" and set the
+    target a little above the rate shown (two or three points in the fourth decimal
+    place). The server checks alerts every 60 seconds (`ALERT_CHECK_SECONDS`; set it to
+    10 for a demo: `ALERT_CHECK_SECONDS=10 npm run demo`). When the wandering rate
+    reaches the target, the bell on Home shows 1, the list says what was reached and
+    that it is indicative, an email is printed in the terminal, and the alert shows
+    "Reached ...; turn on to be told again". It does not fire a second time.
+12. **An approver being notified.** As Amira create a payment. Dana (the other person in
+    Northfield) gets "A payment is waiting for your approval" in the bell and an email
+    in the terminal: amount, payee name, who created it, when it expires; no bank
+    details. Dana rejects it with a reason: Amira is told who rejected it and why.
+    Approve another: Amira is told it was sent for processing.
+
+**Email in the demo is printed, not sent.** Whenever the server sends an email (an
+activation link, a password reset, a security notice, a notification) the whole message
+is printed in the terminal the server runs in, marked `DEVELOPMENT OUTBOX`, unless an
+SMTP server is configured (see "Email"). That is the only place a link appears: it is
+never shown in the ops console and never returned over HTTP.
 
 **Demo data is kept between runs.** `npm run demo` keeps everything in a SQLite
 database, `.demo-data/globalconnect.sqlite` (git-ignored), and says so when it starts:
@@ -742,8 +772,9 @@ is true for every company with a rule of 1 or 2.
 a payee you added in the demo no longer exists at the "provider", and a held payment to
 it is (correctly) blocked as "payee changed" when someone approves it; use the seeded
 payees on provider A to see a held payment survive a restart and go through. Listing
-who can approve reads every membership; fine at this size. There is no notification to
-approvers (no email or push): they see the payment when they open the app.
+who can approve reads every membership; fine at this size. Approvers are told about a
+waiting payment in the app and by email (see "Rate alerts and notifications"); there is
+no push notification.
 
 ### Client rates and Global Connect's margin
 
@@ -871,6 +902,100 @@ conversion is found again by its key.
   1.28% from it). It is the same on every machine and after a restart, and it is not
   market data. `MOCK_MOVING_RATES=0` turns it off. The in-app demo (no server) keeps
   fixed sample rates and has no margin: it shows one rate for both directions.
+
+### Rate alerts and notifications
+
+**Rate alerts are kept and checked by the server** (`server/src/alerts/service.ts`).
+An alert says "tell me when I can **sell** (or **buy**) the first currency of this pair
+at this rate **or better**". It belongs to one person in one company and is checked
+against **that company's client rate** (the provider's rate with the company's margin):
+the same indicative rate the person sees on the Rates screen, never the provider's own
+rate. Selling fires when the client's sell rate is at or above the target; buying when
+their buy rate is at or below it.
+
+- Checked every `ALERT_CHECK_SECONDS` (default 60). One rate is fetched per provider
+  and pair for each check, however many companies and alerts want it; the margin is
+  then applied per company.
+- **An alert fires once.** It is then shown as reached and stays off until its owner
+  turns it on again in the app. It cannot fire twice across a crash or a restart: the
+  notification is made first, under a key of the alert and its current arming (a
+  notification with a key that exists is not made again), and only then is the alert
+  marked as fired. A crash in between repeats the first step, which does nothing.
+- At most `ALERTS_PER_USER` (default 20) per person. A pair the company's provider has
+  no rate for is refused. Only the owner can see, pause, re-arm or delete an alert.
+- What it says: the pair, the direction, the client's rate that was reached and when,
+  that the rate is **indicative** and not held, and that converting means getting a
+  rate in the app. It promises nothing.
+- If a person is disabled or leaves the company, their alert is kept but not checked.
+  If the rate limit below is hit at the moment an alert fires, the alert is still marked
+  as fired and that one notification is lost (the audit log records it).
+- The app keeps its `AlertsStore` interface. Against the server it uses a
+  server-backed implementation (the app's "at or above" is selling, "at or below" is
+  buying); the in-app demo keeps alerts on the device, where nothing checks them.
+
+**Notifications** (`server/src/notify/notifier.ts`) have two channels:
+
+| Channel | What it is |
+| --- | --- |
+| In the app | A list kept on the server, opened from the bell on Home, with an unread count. Tap one to mark it read, or mark all. Always on. |
+| Email | Through the mail queue (see "Email"): written to the outbox first, retried, never sent twice for one event. Can be turned off per kind. |
+
+**Push is not built.** `PushChannel` in `notifier.ts` is the interface a push sender
+would implement (it is given the person and the words); nothing implements it, no
+device token is stored and the app does not ask for notification permission. Building
+it needs Expo push (or APNs and FCM) credentials, a table of device tokens with their
+own consent and sign-out handling, and a decision about what may appear on a lock
+screen.
+
+**Who is told what:**
+
+| Event | Who | Says |
+| --- | --- | --- |
+| A rate alert is reached | its owner | pair, direction, the rate reached, indicative |
+| A payment is waiting for approval | every active approver or administrator of the company except its creator and anyone who already approved | amount, currency, payee **name**, who created it, when it expires |
+| A waiting payment is about to expire (`PAYMENT_EXPIRY_WARNING_HOURS` before, default 6) | the same people, and its creator | the same |
+| Approved (being sent) / sent for processing | its creator | amount and payee name |
+| Rejected | its creator | who rejected it, and the reason they gave |
+| Cancelled by someone else / expired / stopped because the payee changed | its creator | that it was not sent |
+| Needs attention: not sent; outcome being checked ("do not create it again"); sent but not as approved | its creator | what is known |
+
+No notification contains bank details. A payment sent straight to the provider (a
+company with no approval rule) makes no notification: its creator sees the result at
+once.
+
+**How they are produced.** The payment code is not hooked. After every payment action,
+and once a minute, the server looks at the held payments as they are and works out
+which notifications are due (`server/src/notify/payments.ts`); each is made under a key
+of the payment, the event and the person, **once**, so looking again after a restart,
+or twice at once, sends nothing twice. A payment that closed more than 24 hours ago is
+not news.
+
+**Preferences.** Each person chooses, in the app, whether rate alerts, payments to
+approve and news of their own payments are **also emailed**. The in-app list is always
+on. **Security notices cannot be turned off** and are not part of these choices (the
+API refuses a request that tries). A change is in the audit log.
+
+**Limits.** One person is sent at most `NOTIFICATIONS_PER_USER_PER_HOUR` (default 60);
+beyond that an event is held back and recorded once in the audit log (a payment still
+waiting is notified later, when the scan next looks). The mail queue has its own limits
+per address and overall.
+
+**The reason for a rejection.** An approver may type a reason (optional, at most 200
+characters, no control characters or line breaks; the server refuses them). The creator
+sees it in the notification and on the payment. It is another person's free text and is
+treated as such everywhere: one line, any `scheme://` removed so it cannot become a
+link, escaped in the HTML part of an email, shown as plain text in the app; the audit
+log stores it as data and the ops console escapes everything it prints.
+
+**The audit log** records alert create / pause / re-arm / delete / fired (pair,
+direction, target, rate), each notification (who, which kind, whether email was queued:
+never what it said) and preference changes. The body of a notification is stored
+encrypted and is deleted after 30 days once read (60 if unread).
+
+**Ops console.** A client user's page shows their notification state: how many are
+kept and unread, their email choices and how many alerts are on, fired or paused. Not
+what any of them says, and there is no console action that reads, sends or changes
+them.
 
 ### Provider routing and isolation
 
@@ -1643,8 +1768,10 @@ forwards) are a choice made for the demo, not a statement about the real product
 - **Supported currencies, watchlist pairs, payee countries**: short hard-coded lists.
 - **Payee rules**: simplified. Real rules come from the provider's
   `beneficiary_required_details`.
-- **Rate alerts**: stored on the device only. Nothing watches rates and no notification
-  is ever sent.
+- **Rate alerts in the in-app demo (no server)**: stored on the device only; nothing
+  watches rates and nothing is sent. With the server they are kept and checked there
+  (see "Rate alerts and notifications").
+- **Push notifications**: not built. Notifications are a list in the app and email.
 - **App icon and splash**: the Expo template images.
 - **Developer panel**: shown whenever the mock backend is active. Hide it before release.
 - **Sample people and companies**: a seed directory of made-up people and companies,

@@ -193,6 +193,15 @@ test('alerts belong to one person in one company: a cap per person, validation, 
   assert.equal(mine.length, 3);
   assert.equal((await audit('client.alert.create')).length, 3);
 
+  // ...and when they reach the service at the very same moment (the rate they all wait for is one shared answer).
+  const benUser = (await h.stores.directory.getUser(ben.id)) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getUser>>>;
+  const castlebrook = (await h.stores.directory.getCompany('co_castlebrook')) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getCompany>>>;
+  await h.call('GET', '/v1/rates/GBP/USD', { token: ben.token });
+  const together = await Promise.allSettled(Array.from({ length: 6 }, (_, index) => h.alerts.create(benUser, castlebrook, { base: 'GBP', quote: 'USD', side: 'sell', targetRate: `1.5${index}` }, 'test')));
+  assert.equal(together.filter((result) => result.status === 'fulfilled').length, 3);
+  assert.equal((await h.stores.alerts.count({ userId: ben.id })), 3);
+  for (const item of await h.stores.alerts.list({ userId: ben.id })) await h.stores.alerts.delete(item.id);
+
   // Ben sees none of them and can do nothing to them.
   assert.deepEqual(await alertsOf(ben.token), []);
   assert.equal((await h.call('POST', `/v1/alerts/${mine[0]?.id}`, { token: ben.token, body: { enabled: false } })).status, 404);

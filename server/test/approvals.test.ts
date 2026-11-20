@@ -1264,6 +1264,12 @@ for (const company of COMPANIES) {
     assert.equal((await act(creator, fifth, 'cancel')).status, 200);
     assert.equal((await notesOf(creator)).items.length, count);
 
+    // An administrator who creates a payment is not asked to approve their own: only the others are told.
+    const waitingFor = async (who: Person) => (await titlesOf(who)).filter((title) => title === 'A payment is waiting for your approval').length;
+    const [adminBefore, approverBefore] = [await waitingFor(admin), await waitingFor(approver)];
+    assert.equal((await create(company, admin, payee)).reply.status, 200);
+    assert.deepEqual([await waitingFor(admin), await waitingFor(approver)], [adminBefore, approverBefore + 1]);
+
     // The audit log has who was told and which kind; nothing a notification said.
     const entries = await audit('notification');
     assert.ok(entries.length >= 9);

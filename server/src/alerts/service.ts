@@ -68,6 +68,8 @@ const view = (record: RateAlertRecord): AlertView => ({
   triggeredAt: record.triggeredAt === null ? null : new Date(record.triggeredAt).toISOString(),
   triggeredRate: record.triggeredRate,
 });
+/** An alert is its owner's, in the company it was made in. Nobody else can change or delete it. */
+const owns = (record: RateAlertRecord, user: Pick<UserRecord, 'id'>, company: Pick<CompanyRecord, 'id'>): boolean => record.userId === user.id && record.companyId === company.id;
 const partyOf = (user: Pick<UserRecord, 'id' | 'email'>) => ({ type: 'client' as const, id: user.id, label: user.email });
 
 export class RateAlerts {
@@ -112,7 +114,7 @@ export class RateAlerts {
     const stored = await this.deps.stores.alerts.mutate(
       id,
       (current) => {
-        if (!current || current.userId !== user.id || current.companyId !== company.id) return undefined;
+        if (!current || !owns(current, user, company)) return undefined;
         if (enabled) return current.status === 'active' ? undefined : { ...current, status: 'active', armedAt: at, arming, triggeredAt: null, triggeredRate: null };
         return current.status === 'paused' ? undefined : { ...current, status: 'paused' };
       },
@@ -127,7 +129,7 @@ export class RateAlerts {
     await this.deps.stores.alerts.mutate(
       id,
       (current) => {
-        if (!current || current.userId !== user.id || current.companyId !== company.id) return undefined;
+        if (!current || !owns(current, user, company)) return undefined;
         removed = current;
         return null;
       },
