@@ -218,6 +218,7 @@ export const payment: z.ZodType<Payment> = z.object({
       canApprove: z.boolean(),
       canCancel: z.boolean(),
       approvers: z.array(text),
+      rejection: z.object({ by: text, reason: z.string().max(200).nullable() }).optional(),
     })
     .optional(),
 });

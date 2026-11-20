@@ -128,7 +128,7 @@ export class Notifier {
 
   /** A person's own notifications, newest first, and how many are unread. */
   async list(userId: string, limit = 50): Promise<{ items: NotificationView[]; unread: number }> {
-    const rows = (await this.stores.notifications.list({ userId })).sort((a, b) => b.createdAt - a.createdAt);
+    const rows = (await this.stores.notifications.list({ userId })).reverse().sort((a, b) => b.createdAt - a.createdAt);
     return { items: rows.slice(0, limit).map((row) => this.view(row)), unread: rows.filter((row) => row.readAt === null).length };
   }
 

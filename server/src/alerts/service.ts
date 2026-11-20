@@ -95,7 +95,7 @@ export class RateAlerts {
     await this.deps.withProvider(company, (provider) => this.deps.rates.providerRate(company, provider, base, quote));
     const write = async (): Promise<AlertView> => {
       const at = this.deps.now();
-      const record: RateAlertRecord = { id: `alr_${randomToken().slice(0, 16)}`, userId: user.id, companyId: company.id, base, quote, side: input.side, targetRate: new Big(input.targetRate).toFixed(), status: 'active', createdAt: at, armedAt: at, triggeredAt: null, triggeredRate: null };
+      const record: RateAlertRecord = { id: `alr_${randomToken().slice(0, 16)}`, userId: user.id, companyId: company.id, base, quote, side: input.side, targetRate: new Big(input.targetRate).toFixed(), status: 'active', createdAt: at, armedAt: at, arming: randomToken().slice(0, 12), triggeredAt: null, triggeredRate: null };
       if ((await this.deps.stores.alerts.count({ userId: user.id })) >= this.deps.perUser) throw new ApiError('validation', { reason: 'too_many_alerts' });
       await this.deps.stores.alerts.mutate(record.id, () => record, () => this.entry('client.alert.create', user, company, source, record));
       return view(record);
@@ -108,14 +108,15 @@ export class RateAlerts {
   /** Turning a paused or a fired alert on arms it afresh; turning it off pauses it. Only the owner's own alert, in this company. */
   async setEnabled(user: UserRecord, company: CompanyRecord, id: string, enabled: boolean, source: string): Promise<AlertView> {
     const at = this.deps.now();
+    const arming = randomToken().slice(0, 12);
     const stored = await this.deps.stores.alerts.mutate(
       id,
       (current) => {
         if (!current || current.userId !== user.id || current.companyId !== company.id) return undefined;
-        if (enabled) return current.status === 'active' ? undefined : { ...current, status: 'active', armedAt: at, triggeredAt: null, triggeredRate: null };
+        if (enabled) return current.status === 'active' ? undefined : { ...current, status: 'active', armedAt: at, arming, triggeredAt: null, triggeredRate: null };
         return current.status === 'paused' ? undefined : { ...current, status: 'paused' };
       },
-      (record) => (record && record.userId === user.id && record.companyId === company.id && (enabled ? record.armedAt === at : record.status === 'paused') ? this.entry(enabled ? 'client.alert.enable' : 'client.alert.pause', user, company, source, record) : null),
+      (record) => (record && record.userId === user.id && record.companyId === company.id && (enabled ? record.arming === arming : record.status === 'paused') ? this.entry(enabled ? 'client.alert.enable' : 'client.alert.pause', user, company, source, record) : null),
     );
     if (!stored || stored.userId !== user.id || stored.companyId !== company.id) throw new ApiError('not_found');
     return view(stored);
@@ -191,10 +192,10 @@ export class RateAlerts {
       if (!reached) continue;
       const at = now();
       // FIRST the notification (made once per alert and arming, whatever happens next), THEN the alert is marked.
-      await notifier.notify(noteOf({ userId: alert.userId, companyId: company.id, category: 'rates', kind: 'rate_alert', note: { base: alert.base, quote: alert.quote, side: alert.side, target: alert.targetRate, rate, at }, dedupe: `alert:${alert.id}:${alert.armedAt}` }));
+      await notifier.notify(noteOf({ userId: alert.userId, companyId: company.id, category: 'rates', kind: 'rate_alert', note: { base: alert.base, quote: alert.quote, side: alert.side, target: alert.targetRate, rate, at }, dedupe: `alert:${alert.id}:${alert.arming}` }));
       const stored = await stores.alerts.mutate(
         alert.id,
-        (current) => (current && current.status === 'active' && current.armedAt === alert.armedAt ? { ...current, status: 'triggered', triggeredAt: at, triggeredRate: rate } : undefined),
+        (current) => (current && current.status === 'active' && current.arming === alert.arming ? { ...current, status: 'triggered', triggeredAt: at, triggeredRate: rate } : undefined),
         (record) => (record && record.status === 'triggered' && record.triggeredAt === at ? { at, actor: { type: 'system', id: null, label: 'rate alerts' }, target: { type: 'client', id: alert.userId, label: member.email }, action: 'client.alert.triggered', outcome: 'success', source: 'server', detail: { alert: alert.id, pair: `${alert.base}${alert.quote}`, side: alert.side, target: alert.targetRate, rate } } : null),
       );
       if (stored?.status === 'triggered' && stored.triggeredAt === at) fired += 1;

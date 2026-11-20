@@ -340,6 +340,8 @@ export interface PaymentHold {
   canCancel: boolean;
   /** Display names of the people who could still approve it. Empty means nobody can: the company needs another approver. */
   approvers: string[];
+  /** On a rejected payment: who rejected it and the reason they typed, if any. Free text from a colleague: show it as text. */
+  rejection?: { by: string; reason: string | null };
 }
 
 export interface NewPayment {

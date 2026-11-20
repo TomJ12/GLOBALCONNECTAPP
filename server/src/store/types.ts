@@ -577,8 +577,9 @@ export interface RateAlertRecord {
   targetRate: string;
   status: 'active' | 'paused' | 'triggered';
   createdAt: number;
-  /** When it was last turned on. One notification per arming, however often it is checked. */
+  /** When it was last turned on, and a random mark of that arming. One notification per arming, however often it is checked. */
   armedAt: number;
+  arming: string;
   triggeredAt: number | null;
   /** The client's rate that set it off. */
   triggeredRate: string | null;

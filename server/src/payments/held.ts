@@ -145,6 +145,8 @@ export class HeldPayments {
         canApprove: awaiting && CAN_APPROVE.includes(viewer.role) && viewer.user.id !== record.createdBy && !approved.has(viewer.user.id),
         canCancel: awaiting && (viewer.user.id === record.createdBy || viewer.role === 'admin'),
         approvers: awaiting ? approvers.map((member) => member.name) : [],
+        // Who rejected it and the reason they gave (their own words: shown as plain text, never as markup).
+        ...(record.status === 'rejected' ? { rejection: { by: (record.closedBy && names.get(record.closedBy)) || 'Someone no longer on this account', reason: record.note } } : {}),
       },
     };
   }
