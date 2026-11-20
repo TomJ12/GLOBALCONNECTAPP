@@ -203,12 +203,29 @@ export function clientTermsOf(provider: ProviderTerms, bps: number): ClientTerms
   return { direction, rate: rate.toFixed(RATE_DECIMALS), sellAmount: sell.toFixed(sellDp), buyAmount: provider.buyAmount, revenue: { amount: sell.minus(limit).toFixed(sellDp), currency: provider.sellCurrency } };
 }
 
-/** For staff, on the confirmation of a margin change: what it does to one concrete trade. Never shown to a client. */
-export function workedExample(before: MarginConfig, after: MarginConfig, providerRate: string, pair = 'GBPUSD', amount = '10000'): string {
+/** One line of a margin configuration in words, for staff and the audit log. */
+export function describeMargin(config: MarginConfig): string {
+  return [
+    `default ${config.defaultBps} bp`,
+    config.forwardBps === null ? 'forwards as spot' : `forwards ${config.forwardBps} bp`,
+    ...config.overrides.map((item) => `${item.pair} ${item.direction} ${item.bps} bp`),
+    ...config.tiers.map((item) => `from ${item.fromAmount}: ${item.bps} bp`),
+  ].join('; ');
+}
+
+/**
+ * For staff, on the confirmation of a margin change: what it does to one concrete trade of `amount` of the
+ * pair's base currency. Never shown to a client.
+ */
+export function workedExample(before: MarginConfig, after: MarginConfig, providerRate: string, pair = 'GBPUSD', amount = '10000', direction: Direction = 'sell', kind: 'spot' | 'forward' = 'spot'): string {
   const [base, quote] = [pair.slice(0, 3), pair.slice(3)];
-  const terms: ProviderTerms = { sellCurrency: base, buyCurrency: quote, sellAmount: amount, buyAmount: new Big(amount).times(providerRate).round(currencyDecimals(quote), Big.roundDown).toFixed(currencyDecimals(quote)), fixedSide: 'sell', rateBase: base, rateQuote: quote, rate: providerRate };
-  const side = (config: MarginConfig) => clientTermsOf(terms, marginBps(config, { pair, direction: 'sell', kind: 'spot', baseAmount: amount }));
+  const other = new Big(amount).times(providerRate).round(currencyDecimals(quote), direction === 'sell' ? Big.roundDown : Big.roundUp).toFixed(currencyDecimals(quote));
+  const terms: ProviderTerms = direction === 'sell' ? { sellCurrency: base, buyCurrency: quote, sellAmount: amount, buyAmount: other, fixedSide: 'sell', rateBase: base, rateQuote: quote, rate: providerRate } : { sellCurrency: quote, buyCurrency: base, sellAmount: other, buyAmount: amount, fixedSide: 'buy', rateBase: base, rateQuote: quote, rate: providerRate };
+  const side = (config: MarginConfig) => clientTermsOf(terms, marginBps(config, { pair, direction, kind, baseAmount: amount }));
   const [old, next] = [side(before), side(after)];
   const figure = new Intl.NumberFormat('en-GB').format(Number(amount));
-  return `selling ${base} ${figure} for ${quote}: the client rate changes from ${old.rate} to ${next.rate}, so they receive ${quote} ${next.buyAmount} instead of ${quote} ${old.buyAmount} (Global Connect keeps ${quote} ${next.revenue.amount} instead of ${quote} ${old.revenue.amount})`;
+  const what = kind === 'forward' ? 'a forward ' : '';
+  return direction === 'sell'
+    ? `${what}selling ${base} ${figure} for ${quote}: the client rate changes from ${old.rate} to ${next.rate}, so they receive ${quote} ${next.buyAmount} instead of ${quote} ${old.buyAmount}`
+    : `${what}buying ${base} ${figure} with ${quote}: the client rate changes from ${old.rate} to ${next.rate}, so they pay ${quote} ${next.sellAmount} instead of ${quote} ${old.sellAmount}`;
 }

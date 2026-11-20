@@ -109,7 +109,7 @@ async function activateClient(email: string, password = PASSWORD) {
 
 /** One staff member asks, a different one approves. Returns the approver's reply and the request id. */
 /** Approving these asks the approver for their password again: staff management, company create and re-point, a change of a company's payment-approval rule, client authenticator reset. */
-const PASSWORD_APPROVALS = ['ops.staff.invite', 'ops.staff.role', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.activation_link', 'ops.staff.unlock', 'ops.staff.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.company.approvals', 'ops.client.reset_authenticator'];
+const PASSWORD_APPROVALS = ['ops.staff.invite', 'ops.staff.role', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.activation_link', 'ops.staff.unlock', 'ops.staff.reset_authenticator', 'ops.company.create', 'ops.company.edit', 'ops.company.approvals', 'ops.company.margin', 'ops.client.reset_authenticator'];
 
 async function fourEyes(requester: Staff, approver: Staff, url: string, form: Record<string, string> = {}) {
   const asked = await requester.act(url, form);
@@ -293,7 +293,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
 
   // (Finishing or closing an interrupted request needs one that was interrupted: those two have their own test.)
   const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate|forgot|reset)/.test(route.url) && !/\/(resume|abandon)$/.test(route.url) && !/authenticator-resets/.test(route.url));
-  assert.ok(actions.length >= 23, `only ${actions.length} action routes`);
+  assert.ok(actions.length >= 24, `only ${actions.length} action routes`);
   const urlOf = (route: string) =>
     route.startsWith('/ops/approvals')
       ? route.replace(':id', route.endsWith('approve') ? toApprove : route.endsWith('reject') ? toReject : toCancel)
@@ -311,6 +311,10 @@ test('ops: every action needs its confirmation (bound to session, action and pay
     role: route.startsWith('/ops/staff') ? 'ops' : 'approver',
     verification: 'Called back on the number on file',
     approvalsRequired: '2',
+    defaultBps: '65',
+    forwardBps: '',
+    overrides: '',
+    tiers: '',
   });
   const state = async () =>
     JSON.stringify([
@@ -403,7 +407,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
     }
   }
   assert.deepEqual(viaApproval.sort(), [
-    'ops.client.activation_link', 'ops.client.create', 'ops.client.enable', 'ops.client.membership.set', 'ops.client.reset_authenticator', 'ops.company.approvals', 'ops.company.create', 'ops.company.edit', 'ops.company.reactivate',
+    'ops.client.activation_link', 'ops.client.create', 'ops.client.enable', 'ops.client.membership.set', 'ops.client.reset_authenticator', 'ops.company.approvals', 'ops.company.create', 'ops.company.edit', 'ops.company.margin', 'ops.company.reactivate',
     'ops.staff.activation_link', 'ops.staff.disable', 'ops.staff.enable', 'ops.staff.invite', 'ops.staff.reset_authenticator', 'ops.staff.role', 'ops.staff.unlock',
   ]);
   const names = new Set((await audit()).map((entry) => entry.action));

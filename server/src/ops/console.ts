@@ -26,6 +26,7 @@
  * that reaches a provider's balances, transactions or payments, and none that
  * starts a client session.
  */
+import Big from 'big.js';
 import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -49,7 +50,9 @@ import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate
 import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type ApprovalsRequired, type AuditInput, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { h, Html, layout, qrSvg, when } from './html';
-import type { ClientRates } from '../rates/service';
+import { currencyDecimals } from '@/lib/money';
+import { checkMarginConfig, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
+import { marginConfigOf, type ClientRates } from '../rates/service';
 
 export interface OpsDeps {
   config: Config;
@@ -153,7 +156,7 @@ const asset = (relative: string): Buffer | null => {
 };
 
 export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<{ method: string; url: string }[]> {
-  const { config, stores, auth, opsAuth, registry, mail, notices, authenticatorResets, now, limitAttempts } = deps;
+  const { config, stores, auth, opsAuth, registry, mail, notices, authenticatorResets, rates, now, limitAttempts } = deps;
   const routes: { method: string; url: string }[] = [];
   // Outside development OPS_URL must be https (config.ts), so the cookie is always Secure there.
   const secure = config.opsUrl.startsWith('https://');
@@ -1143,6 +1146,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const users = await Promise.all(memberships.map(async (item) => ({ role: item.role, user: await stores.directory.getUser(item.userId) })));
         const gap = company.deactivatedAt ? null : await approverGap(company);
         const required = approvalsRequiredOf(company);
+        const margin = await rates.marginOf(company.id);
         return send(
           reply,
           200,
@@ -1157,6 +1161,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               'Change payment approvals',
               { request: true },
             )}</div>
+<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount; otherwise the default. A change needs a second staff member, an ops admin, who types their password again.</p>`, 'Change FX margin', { request: true })}</div>
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
                 ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company', { request: true })
@@ -1277,6 +1282,169 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           if (!saved) throw new OpsError('No such company.', 404, 'not_found');
           return { target: companyParty(company), detail: { from: params.from ?? '', to: String(wanted) }, redirect: `/ops/companies/${company.id}?done=saved` };
         },
+      });
+
+      // --- FX margin ------------------------------------------------------------------
+      // What Global Connect earns on a client's conversions. Staff can see it; no client API returns any of it.
+      const marginFields = (current: MarginConfig) =>
+        h`<label>Default margin, in basis points (100 = 1%) <input name="defaultBps" inputmode="numeric" required maxlength="5" value="${String(current.defaultBps)}"></label>
+<label>Forward contracts, in basis points (leave empty to price forwards as spot) <input name="forwardBps" inputmode="numeric" maxlength="5" value="${current.forwardBps === null ? '' : String(current.forwardBps)}"></label>
+<label>Overrides for a currency pair and direction, one per line: pair, then sell, buy or both (what the client does with the pair’s FIRST currency), then basis points. Example: GBPUSD sell 40 <textarea name="overrides" rows="3" maxlength="2000">${current.overrides.map((item) => `${item.pair} ${item.direction} ${item.bps}`).join('\n')}</textarea></label>
+<label>Tiers by amount, one per line: from this amount (in the pair’s first currency), then basis points. Larger amounts, smaller margin. Example: 50000 35 <textarea name="tiers" rows="3" maxlength="1000">${current.tiers.map((item) => `${item.fromAmount} ${item.bps}`).join('\n')}</textarea></label>
+<label><input type="checkbox" name="allowHigh" value="yes"> Allow a margin above ${String(MARGIN_USUAL_MAX_BPS)} basis points (${String(MARGIN_USUAL_MAX_BPS / 100)}%) in this request</label>`;
+      const marginOfForm = (input: Form): { config: MarginConfig; allowHigh: boolean } => {
+        const bps = (value: string, what: string): number => {
+          if (!/^\d{1,5}$/.test(value)) throw new OpsError(`${what} must be a whole number of basis points, zero or more (100 = 1%). A negative margin is never accepted.`);
+          return Number(value);
+        };
+        const lines = (name: string): string[] => text(input, name).split(/[\n;,]+/).map((line) => line.trim()).filter(Boolean);
+        const forward = text(input, 'forwardBps');
+        const allowHigh = text(input, 'allowHigh') === 'yes';
+        const wanted: MarginConfig = {
+          defaultBps: bps(text(input, 'defaultBps'), 'The default margin'),
+          forwardBps: forward === '' ? null : bps(forward, 'The margin for forward contracts'),
+          overrides: lines('overrides').map((line) => {
+            const match = /^([A-Za-z]{6})\s+(sell|buy|both)\s+(-?\d+)$/i.exec(line);
+            if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not an override. Write the pair, then sell, buy or both, then basis points: GBPUSD sell 40`);
+            return { pair: (match[1] ?? '').toUpperCase(), direction: (match[2] ?? '').toLowerCase() as MarginOverride['direction'], bps: bps(match[3] ?? '', `The margin for ${(match[1] ?? '').toUpperCase()}`) };
+          }),
+          tiers: lines('tiers').map((line) => {
+            const match = /^(\d+(?:\.\d+)?)\s+(-?\d+)$/.exec(line);
+            if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not a tier. Write the amount it starts from, then basis points: 50000 35`);
+            return { fromAmount: match[1] ?? '', bps: bps(match[2] ?? '', `The margin from ${match[1] ?? ''}`) };
+          }),
+        };
+        try {
+          return { config: checkMarginConfig(wanted, allowHigh), allowHigh };
+        } catch (error) {
+          if (error instanceof MarginError) throw new OpsError(error.message);
+          throw error;
+        }
+      };
+      /** The provider's rate now, for the worked example on the confirmation page. Staff only. */
+      const providerRateFor = async (company: CompanyRecord, pair: string): Promise<string | null> => {
+        try {
+          return (await rates.providerRate(company, await registry.forCompany(company), pair.slice(0, 3), pair.slice(3))).rate;
+        } catch {
+          return null;
+        }
+      };
+      action('/companies/:id/margin', {
+        name: 'company.margin',
+        fourEyes: true,
+        // What every client of this company pays on every conversion: two staff, the second an ops admin who types
+        // their password again.
+        adminApproval: true,
+        danger: true,
+        password: true,
+        async prepare({ form: input, params, aim }) {
+          const company = await companyOf(params.id);
+          aim(companyParty(company));
+          const { config: wanted, allowHigh } = marginOfForm(input);
+          const { config: current, record } = await rates.marginOf(company.id);
+          if (record && JSON.stringify(current) === JSON.stringify(wanted)) throw new OpsError('That is already this company’s margin.');
+          // A WORKED EXAMPLE, at the provider's rate now: the approver sees what the change does to a real trade.
+          const rate = await providerRateFor(company, 'GBPUSD');
+          if (!rate) throw new OpsError('The provider’s rate could not be fetched just now, so the worked example cannot be shown. Nothing was requested; try again in a moment.', 503, 'provider_unavailable');
+          const examples = [workedExample(current, wanted, rate), workedExample(current, wanted, rate, 'GBPUSD', '10000', 'buy')];
+          const topTier = [...wanted.tiers, ...current.tiers].map((item) => item.fromAmount).sort((a, b) => Number(b) - Number(a))[0];
+          if (topTier) examples.push(workedExample(current, wanted, rate, 'GBPUSD', topTier));
+          if (wanted.forwardBps !== current.forwardBps) examples.push(workedExample(current, wanted, rate, 'GBPUSD', '10000', 'sell', 'forward'));
+          for (const item of wanted.overrides.filter((entry) => entry.pair !== 'GBPUSD' && entry.pair !== 'USDGBP').slice(0, 3)) {
+            const other = await providerRateFor(company, item.pair);
+            if (other) examples.push(workedExample(current, wanted, other, item.pair, '10000', item.direction === 'buy' ? 'buy' : 'sell'));
+          }
+          const warnings = [`Every conversion this company’s people book from the moment this is approved is priced with the new margin. Quotes they are already holding keep the rate they were given.`];
+          const highest = Math.max(wanted.defaultBps, wanted.forwardBps ?? 0, ...wanted.overrides.map((item) => item.bps), ...wanted.tiers.map((item) => item.bps));
+          if (highest > MARGIN_USUAL_MAX_BPS) warnings.push(`This sets a margin of ${highest} basis points (${highest / 100}%), above the usual limit of ${MARGIN_USUAL_MAX_BPS}. It was asked for explicitly.`);
+          if (wanted.defaultBps === 0) warnings.push('The default margin becomes ZERO: Global Connect earns nothing on this company’s conversions unless an override or tier applies.');
+          if (rates.appliedBy(company) === 'provider') warnings.push('For this company’s provider the margin is applied BY THE PROVIDER (MARGIN_APPLIED_BY_… = provider). This configuration is stored but is NOT used to price anything while that is so.');
+          return {
+            params: { id: company.id, config: JSON.stringify(wanted), from: JSON.stringify(current), allowHigh: allowHigh ? 'yes' : 'no' },
+            summary: `Change the FX margin for company ${describe(company)} FROM ${describeMargin(current)}${record ? '' : ' (the server default)'} TO ${describeMargin(wanted)}. Worked example at the provider’s rate when this was requested: ${examples.join('; ')}.`,
+            warnings,
+          };
+        },
+        async apply(params, actors) {
+          const company = await companyOf(params.id);
+          let wanted: MarginConfig;
+          try {
+            // Checked again: what is stored is never taken on trust from a request written earlier.
+            wanted = checkMarginConfig(JSON.parse(params.config ?? '') as MarginConfig, params.allowHigh === 'yes');
+          } catch (error) {
+            throw new OpsError(error instanceof MarginError ? error.message : 'That margin configuration cannot be read.');
+          }
+          const fallback = (await rates.marginOf('')).config;
+          let from = params.from ?? '';
+          await stores.margins.mutate(company.id, (current) => {
+            const now_ = JSON.stringify(current ? marginConfigOf(current) : fallback);
+            // What was approved was a change FROM a particular configuration. If it moved since, it is asked for again.
+            if (now_ !== JSON.stringify(wanted) && now_ !== params.from) throw new OpsError('The company’s margin changed since this was requested. Make the request again.', 409, 'stale');
+            from = now_ === JSON.stringify(wanted) ? from : now_;
+            return { ...wanted, companyId: company.id, updatedAt: now(), updatedBy: actors.requester.email, approvedBy: actors.approver?.email ?? null };
+          });
+          return { target: companyParty(company), detail: { from: describeMargin(JSON.parse(from) as MarginConfig), to: describeMargin(wanted) }, redirect: `/ops/companies/${company.id}?done=saved` };
+        },
+      });
+
+      // --- Revenue (ops admins only) -----------------------------------------------------
+      const revenueRows = async (request: FastifyRequest) => {
+        const companyId = queryOf(request, 'company');
+        const day = (name: string, endOfDay: boolean): number | null => {
+          const value = queryOf(request, name);
+          if (value === '') return null;
+          const at = /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(`${value}T00:00:00.000Z`) : Number.NaN;
+          if (Number.isNaN(at)) throw new OpsError('Dates are written YYYY-MM-DD.');
+          return endOfDay ? at + 24 * 60 * 60_000 : at;
+        };
+        const [from, to] = [day('from', false), day('to', true)];
+        const companies = new Map((await stores.directory.listCompanies()).map((company) => [company.id, company.name]));
+        const rows = (await stores.revenue.list(companyId ? { companyId } : {}, (row) => row.status !== 'failed' && (from === null || (row.bookedAt ?? row.createdAt) >= from) && (to === null || (row.bookedAt ?? row.createdAt) < to)))
+          .sort((a, b) => (b.bookedAt ?? b.createdAt) - (a.bookedAt ?? a.createdAt));
+        return { rows, companies, filters: { company: companyId, from: queryOf(request, 'from'), to: queryOf(request, 'to') } };
+      };
+      page('/revenue', { admin: true }, async (ctx, request, reply) => {
+        const { rows, companies, filters } = await revenueRows(request);
+        // Totals by company, month and currency. Only conversions that are booked and whose margin this server applied have a figure.
+        const totals = new Map<string, { company: string; month: string; currency: string; count: number; total: Big }>();
+        for (const row of rows) {
+          if (row.status !== 'booked' || row.revenueAmount === null || row.revenueCurrency === null) continue;
+          const month = new Date(row.bookedAt ?? row.createdAt).toISOString().slice(0, 7);
+          const key = `${row.companyId}:${month}:${row.revenueCurrency}`;
+          const entry = totals.get(key) ?? { company: companies.get(row.companyId) ?? row.companyId, month, currency: row.revenueCurrency, count: 0, total: new Big(0) };
+          totals.set(key, { ...entry, count: entry.count + 1, total: entry.total.plus(row.revenueAmount) });
+        }
+        const query = new URLSearchParams(Object.entries(filters).filter(([, value]) => value !== '')).toString();
+        return send(
+          reply,
+          200,
+          layout(
+            chromeOf(ctx, 'Revenue'),
+            h`<div class="card"><h2>Conversions and what Global Connect earned</h2><p class="muted">For ops admins only. None of this is ever sent to a client. Revenue is the difference between the provider’s side of a conversion and the client’s, in the currency it arises in (the side the client did not fix); it is not converted to one currency here.</p>
+<form method="get" action="/ops/revenue"><label>Company <select name="company"><option value="">All</option>${[...companies].map(([id, name]) => h`<option value="${id}"${id === filters.company ? h` selected` : ''}>${name}</option>`)}</select></label><label>From (YYYY-MM-DD) <input name="from" value="${filters.from}" maxlength="10"></label><label>To (YYYY-MM-DD) <input name="to" value="${filters.to}" maxlength="10"></label><button type="submit">Show</button></form>
+<p><a href="/ops/revenue.csv${query ? `?${query}` : ''}">Download these conversions as CSV</a></p></div>
+<div class="card"><h2>Totals by company and month</h2><table><tr><th>Company</th><th>Month</th><th>Conversions</th><th>Revenue</th></tr>${[...totals.values()].map((item) => h`<tr><td>${item.company}</td><td>${item.month}</td><td>${String(item.count)}</td><td>${item.currency} ${item.total.toFixed(currencyDecimals(item.currency))}</td></tr>`)}</table>${totals.size === 0 && h`<p class="muted">Nothing booked in this period.</p>`}</div>
+<div class="card"><h2>Conversions</h2><table><tr><th>When</th><th>Company</th><th>Trade</th><th>Provider rate</th><th>Client rate</th><th>Margin</th><th>Revenue</th><th>Status</th></tr>${rows.slice(0, 200).map(
+              (row) =>
+                h`<tr><td>${when(row.bookedAt ?? row.createdAt)}</td><td><a href="/ops/companies/${row.companyId}">${companies.get(row.companyId) ?? row.companyId}</a></td><td>${row.kind === 'forward' ? 'Forward: ' : ''}sold ${row.sellCurrency} ${row.clientSellAmount}, bought ${row.buyCurrency} ${row.clientBuyAmount}</td><td>${row.providerRate}</td><td>${row.clientRate}</td><td>${row.marginBps === null ? 'by the provider' : `${row.marginBps} bp`}</td><td>${row.revenueAmount === null ? 'not known here' : `${row.revenueCurrency ?? ''} ${row.revenueAmount}`}</td><td>${row.status === 'booked' ? (row.mismatch ? h`<span class="tag bad">Booked: CHECK, the provider did not confirm the client’s terms</span>` : 'Booked') : h`<span class="tag bad">Not confirmed by the provider</span>`}</td></tr>`,
+            )}</table>${rows.length === 0 && h`<p class="muted">No conversions in this period.</p>`}${rows.length > 200 && h`<p class="muted">Showing the latest 200 of ${String(rows.length)}. The CSV has them all.</p>`}</div>`,
+          ),
+        );
+      });
+      page('/revenue.csv', { admin: true }, async (ctx, request, reply) => {
+        const { rows, companies, filters } = await revenueRows(request);
+        // A cell that a spreadsheet would run as a formula is written as text.
+        const cell = (value: string | number | null): string => {
+          const textValue = value === null ? '' : String(value);
+          const safe = /^[=+\-@\t\r]/.test(textValue) && !/^-?\d+(\.\d+)?$/.test(textValue) ? `'${textValue}` : textValue;
+          return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+        };
+        const header = ['booked_at', 'company_id', 'company', 'conversion_id', 'status', 'kind', 'pair', 'direction', 'sell_currency', 'buy_currency', 'provider_rate', 'client_rate', 'provider_sell_amount', 'provider_buy_amount', 'client_sell_amount', 'client_buy_amount', 'margin_bps', 'margin_applied_by', 'revenue_amount', 'revenue_currency', 'needs_checking'];
+        const lines = rows.map((row) =>
+          [new Date(row.bookedAt ?? row.createdAt).toISOString(), row.companyId, companies.get(row.companyId) ?? '', row.conversionId, row.status, row.kind, row.pair, row.direction, row.sellCurrency, row.buyCurrency, row.providerRate, row.clientRate, row.providerSellAmount, row.providerBuyAmount, row.clientSellAmount, row.clientBuyAmount, row.marginBps, row.appliedBy, row.revenueAmount, row.revenueCurrency, row.mismatch || row.status !== 'booked' ? 'yes' : 'no'].map(cell).join(','),
+        );
+        await append(opsParty(ctx.user), 'ops.revenue.export', 'success', null, request.ip, { rows: String(rows.length), company: filters.company || 'all', from: filters.from || '-', to: filters.to || '-' });
+        return reply.status(200).type('text/csv; charset=utf-8').header('Content-Disposition', 'attachment; filename="global-connect-revenue.csv"').send(`${[header.join(','), ...lines].join('\r\n')}\r\n`);
       });
       for (const [verb, deactivate] of [['deactivate', true], ['reactivate', false]] as const) {
         action(`/companies/:id/${verb}`, {

@@ -4,7 +4,7 @@ import { test } from 'node:test';
 
 import Big from 'big.js';
 
-import { baseAmountOf, checkMarginConfig, clientRate, clientTermsOf, directionOf, MarginError, marginBps, workedExample, type MarginConfig, type ProviderTerms } from '../src/rates/margin';
+import { baseAmountOf, checkMarginConfig, describeMargin, clientRate, clientTermsOf, directionOf, MarginError, marginBps, workedExample, type MarginConfig, type ProviderTerms } from '../src/rates/margin';
 
 const config = (extra: Partial<MarginConfig> = {}): MarginConfig => ({ defaultBps: 50, forwardBps: null, overrides: [], tiers: [], ...extra });
 const sellGbp = (amount: string, rate = '1.2500'): ProviderTerms => ({ sellCurrency: 'GBP', buyCurrency: 'USD', sellAmount: amount, buyAmount: new Big(amount).times(rate).round(2, Big.roundDown).toFixed(2), fixedSide: 'sell', rateBase: 'GBP', rateQuote: 'USD', rate });
@@ -111,6 +111,9 @@ test('bounds: never negative, never absurd, high only when the request says so; 
 test('the worked example for staff says what a change does to a concrete trade', () => {
   assert.equal(
     workedExample(config({ defaultBps: 50 }), config({ defaultBps: 80 }), '1.2500'),
-    'selling GBP 10,000 for USD: the client rate changes from 1.243750 to 1.240000, so they receive USD 12400.00 instead of USD 12437.50 (Global Connect keeps USD 100.00 instead of USD 62.50)',
+    'selling GBP 10,000 for USD: the client rate changes from 1.243750 to 1.240000, so they receive USD 12400.00 instead of USD 12437.50',
   );
+  assert.equal(workedExample(config({ defaultBps: 50 }), config({ defaultBps: 20 }), '1.2500', 'GBPUSD', '10000', 'buy'), 'buying GBP 10,000 with USD: the client rate changes from 1.256250 to 1.252500, so they pay USD 12525.00 instead of USD 12562.50');
+  assert.equal(workedExample(config({ defaultBps: 50 }), config({ defaultBps: 50, forwardBps: 100 }), '1.2500', 'GBPUSD', '10000', 'sell', 'forward'), 'a forward selling GBP 10,000 for USD: the client rate changes from 1.243750 to 1.237500, so they receive USD 12375.00 instead of USD 12437.50');
+  assert.equal(describeMargin(config({ forwardBps: 90, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }], tiers: [{ fromAmount: '50000', bps: 45 }] })), 'default 50 bp; forwards 90 bp; GBPUSD sell 40 bp; from 50000: 45 bp');
 });

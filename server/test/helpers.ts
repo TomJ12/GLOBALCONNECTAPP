@@ -1,3 +1,4 @@
+import type { ClientRates } from '../src/rates/service';
 import { base32Decode, setPasswordCost, totpCode, totpStep } from '../src/crypto';
 import { loadConfig, type Config } from '../src/config';
 import { buildApp } from '../src/http/app';
@@ -32,6 +33,7 @@ export interface Harness {
   clock: { now: number; advance: (ms: number) => void };
   /** Every response body seen, for the "no provider name" scan. */
   bodies: string[];
+  rates: ClientRates;
   call: (method: 'GET' | 'POST', url: string, options?: { token?: string; body?: unknown; headers?: Record<string, string> }) => Promise<Reply>;
   invite: (email: string) => Promise<string>;
   /** Activate an invited user. Returns what a person would be left holding. */
@@ -129,8 +131,8 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
       for (const name of Object.keys(group)) if (name !== 'users') group[name] = withLatency(group[name] as object, options.storeHook);
     }
   }
-  const providerA = options.providers?.a ?? new MockCurrencycloudPlatform({ now, enforceOwnership: options.enforceOwnership });
-  const providerB = options.providers?.b ?? new MockEqualsServer({ now, enforceOwnership: options.enforceOwnership });
+  const providerA = options.providers?.a ?? new MockCurrencycloudPlatform({ now, enforceOwnership: options.enforceOwnership, movingRates: config.mockMovingRates });
+  const providerB = options.providers?.b ?? new MockEqualsServer({ now, enforceOwnership: options.enforceOwnership, movingRates: config.mockMovingRates });
   const registry = new ProviderRegistry({
     currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: providerA, now, ignorePayeeFields: config.payeeDigestIgnore.currencycloud }),
     equals: equalsFactory({ credentials: config.providers.equals, transport: providerB, keys: stores.providerKeys, now, ignorePayeeFields: config.payeeDigestIgnore.equals }),
@@ -164,6 +166,10 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
       ...(options.body !== undefined ? { payload: options.body as object } : {}),
     });
     bodies.push(response.body, JSON.stringify(response.headers));
+    // EVERY response the client API gives, in every test, is scanned: nothing about the provider's rate, the
+    // margin or what Global Connect earns may be in it, under any name.
+    const leaked = forbiddenInClientResponse(response.body) ?? forbiddenInClientResponse(JSON.stringify(response.headers));
+    if (leaked) throw new Error(`${method} ${url} sent a client something it must never see: ${leaked}`);
     let json: unknown = null;
     try {
       json = JSON.parse(response.body);
@@ -201,7 +207,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { mail: built.mail, notices: built.notices, authenticatorResets: built.authenticatorResets, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
+  return { rates: built.rates, mail: built.mail, notices: built.notices, authenticatorResets: built.authenticatorResets, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
     close: async () => {
       await app.close();
       await admin.close();
@@ -221,6 +227,17 @@ export function dumpDatabase(stores: SqliteStores): string {
 }
 
 /** The password every test staff account has. */
+/**
+ * What no client API response may contain: a field (at any depth) or a word that speaks of the provider's rate,
+ * the mid-market rate, the margin, or revenue. Returns what it found, or null.
+ */
+const FORBIDDEN_MID = /"(mid|mid_?(market|rate|price)[^"]*|[^"]*_mid)"\s*:/i;
+const FORBIDDEN_FIELD = /"[^"]*(margin|markup|spread|bps|basis|wholesale|partner|core_?rate|provider_?(rate|sell|buy|amount|terms|quote)|revenue|applied_?by|mismatch)[^"]*"\s*:/i;
+const FORBIDDEN_WORD = /mid[- ]?market|\bmargin|mark-?up|basis points?|\bbps\b|wholesale|revenue/i;
+export function forbiddenInClientResponse(body: string): string | null {
+  return FORBIDDEN_MID.exec(body)?.[0] ?? FORBIDDEN_FIELD.exec(body)?.[0] ?? FORBIDDEN_WORD.exec(body)?.[0] ?? null;
+}
+
 export const OPS_PASSWORD = 'staff horse battery staple';
 
 /**
