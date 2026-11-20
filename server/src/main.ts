@@ -7,12 +7,16 @@ const config = loadConfig();
 const runtime = createRuntime(config);
 const { stores, registry, mailer } = runtime;
 if (stores.acceptedLogEnd) console.error('AUDIT_ACCEPT_LOG_END was used: the audit log was accepted as it stood and that is recorded in it. REMOVE THE SETTING NOW; the server will not start again while it is set.');
-const { app, admin, auth, opsAuth, held, mail } = await buildApp({ config, stores, registry, mailer });
+const { app, admin, auth, opsAuth, held, mail, authenticatorResets } = await buildApp({ config, stores, registry, mailer });
 // The email outbox: attempts cut off by the last stop are due again, and what is due is sent now and every 15 seconds.
 await mail.recover();
 void mail.pump();
 setInterval(() => void mail.pump(), 15_000).unref();
 setInterval(() => void mail.sweep(), 60 * 60_000).unref();
+// Authenticator resets whose delay has passed are carried out now and every minute.
+const resets = () => authenticatorResets.runDue().catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'authenticator resets failed'));
+await resets();
+setInterval(() => void resets(), 60_000).unref();
 // Held payments: at start-up every send that a crash or restart left unfinished is settled (by its idempotency key)
 // before the server takes requests; after that, once a minute, payments that waited too long expire and any send
 // still unanswered is looked at again.

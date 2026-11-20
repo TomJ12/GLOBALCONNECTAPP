@@ -57,6 +57,8 @@ export interface Harness {
   /** Every "email" the server sent. */
   outbox: ConsoleOutbox;
   mail: Awaited<ReturnType<typeof buildApp>>['mail'];
+  notices: Awaited<ReturnType<typeof buildApp>>['notices'];
+  authenticatorResets: Awaited<ReturnType<typeof buildApp>>['authenticatorResets'];
   /** The activation code in the newest email to this address. */
   mailedCode: (email: string) => string;
   providerA: MockCurrencycloudPlatform;
@@ -109,7 +111,7 @@ function withLatency<T extends object>(target: T, hook?: (operation: string) => 
 }
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory(), options: HarnessOptions = {}): Promise<Harness> {
-  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, mailPerRecipientPerHour: 100_000, mailGlobalPerHour: 100_000, ...overrides };
+  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, mailPerRecipientPerHour: 100_000, mailGlobalPerHour: 100_000, authenticatorResetDelayMs: 0, ...overrides };
   const clock = options.clock ?? {
     now: Date.UTC(2026, 10, 11, 10, 0, 0),
     advance(ms: number) {
@@ -142,7 +144,8 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
   };
   const admin = built.admin as NonNullable<typeof built.admin>;
   const mailedCode = (email: string): string => {
-    const message = [...outbox.sent].reverse().find((item) => item.to === email);
+    // The latest email to that address that carries an activation link (notices carry none).
+    const message = [...outbox.sent].reverse().find((item) => item.to === email && /\/activate#code=/.test(item.text));
     const code = /#code=([A-Z2-7-]+)/.exec(message?.text ?? '')?.[1];
     if (!code) throw new Error(`no activation email for ${email}`);
     return code;
@@ -198,7 +201,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { mail: built.mail, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
+  return { mail: built.mail, notices: built.notices, authenticatorResets: built.authenticatorResets, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
     close: async () => {
       await app.close();
       await admin.close();

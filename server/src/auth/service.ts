@@ -38,10 +38,27 @@ import {
 import { ApiError } from '../errors';
 import type { AuditParty, CompanyRecord, SessionRecord, Stores, UserRecord } from '../store/types';
 import { isKnownSource, Lockout, withKnownSource, type Attempt, type LockScope } from './lockout';
+import type { MailQueue } from '../mail/queue';
+import { mailOf, type SecurityNotice } from '../mail/templates';
+import type { SecurityNotices } from '../notify/security';
 
 const ISSUER = 'Global Connect';
 const RECOVERY_CODE_COUNT = 10;
 const MAX_CHALLENGE_ATTEMPTS = 5;
+/** A password-reset link works once, for half an hour. */
+export const PASSWORD_RESET_TTL_MS = 30 * 60_000;
+/** Reset links emailed to one account per hour. Asking more often changes nothing and sends nothing. */
+export const RESET_REQUESTS_PER_HOUR = 3;
+const ROUGH_MS = 15 * 60_000;
+
+/** "Chrome on Windows": the family of browser or app and of system, from what the client said about itself. Never the string itself. */
+export function agentFamily(userAgent: string): string {
+  const ua = userAgent.slice(0, 400);
+  const system = /Windows/i.test(ua) ? 'Windows' : /iPhone|iPad|iOS|CFNetwork|Darwin/i.test(ua) ? (/Macintosh|Mac OS X/i.test(ua) && !/iPhone|iPad/i.test(ua) ? 'macOS' : 'iPhone or iPad') : /Android|okhttp/i.test(ua) ? 'Android' : /Macintosh|Mac OS X/i.test(ua) ? 'macOS' : /Linux|X11/i.test(ua) ? 'Linux' : null;
+  const browser = /okhttp|CFNetwork|Expo|GlobalConnect/i.test(ua) ? 'Global Connect app' : /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : null;
+  if (!system && !browser) return 'Unknown device';
+  return `${browser ?? 'A browser'} on ${system ?? 'an unknown system'}`;
+}
 
 /** How often, at most, a session's "last seen" time is written. */
 export const SEEN_WRITE_MS = 60_000;
@@ -82,6 +99,26 @@ export class AuthService {
     private readonly now: () => number = Date.now,
   ) {
     this.lockout = new Lockout(stores.auth.attempts, config, now);
+  }
+
+  /** The email outbox and the security notices, attached once the app has built them. Without them nothing is emailed (tests of this class alone). */
+  private mail: MailQueue | null = null;
+  private notices: SecurityNotices | null = null;
+  attach(mail: MailQueue, notices: SecurityNotices): void {
+    this.mail = mail;
+    this.notices = notices;
+  }
+  private notice(user: UserRecord, kind: SecurityNotice, extra: { until?: number } = {}): Promise<void> {
+    return this.notices?.send({ id: user.id, email: user.email, name: user.name }, 'client', kind, extra) ?? Promise.resolve();
+  }
+  /** Work started by a request and finished after its answer (so that the answer's timing says nothing). Tests wait for it with `settle`. */
+  private readonly background = new Set<Promise<unknown>>();
+  private later(work: Promise<unknown>): void {
+    const tracked = work.catch(() => {}).finally(() => this.background.delete(tracked));
+    this.background.add(tracked);
+  }
+  async settle(): Promise<void> {
+    while (this.background.size > 0) await Promise.all([...this.background]);
   }
 
   /** Writes an audit event. `detail` holds neutral facts only: never a password, key, code or token. */
@@ -201,7 +238,11 @@ export class AuthService {
     // No usable account: the same answer after comparable work, from a budget that cannot starve real sign-ins.
     const matches = usable ? await verifyPassword(password, user.passwordHash as string) : await decoyVerify(password);
     if (!usable || !matches) {
-      if (attempt.locked) await this.record('client.lockout', 'failure', who, source, { guarded: 'password' });
+      if (attempt.locked) {
+        await this.record('client.lockout', 'failure', who, source, { guarded: 'password' });
+        // The owner is told (at most once an hour, however long the guessing goes on).
+        if (usable) await this.notice(user, 'account_locked');
+      }
       throw new ApiError('validation', { reason: 'invalid_credentials' });
     }
     await this.lockout.succeed(attempt);
@@ -234,7 +275,10 @@ export class AuthService {
     };
     if (!check.ok) {
       if (check.reason === 'reused') return reused();
-      if (attempt.locked) await this.record('client.lockout', 'failure', partyOf(user), source, { guarded: scope });
+      if (attempt.locked) {
+        await this.record('client.lockout', 'failure', partyOf(user), source, { guarded: scope });
+        await this.notice(user, 'account_locked');
+      }
       throw new ApiError('validation', { reason: 'invalid_code', fields: ['code'] });
     }
     // Atomic: of two requests carrying the same code, one burns the step and the other finds it burnt.
@@ -256,7 +300,10 @@ export class AuthService {
         )
       : null;
     if (!updated) {
-      if (attempt.locked) await this.record('client.lockout', 'failure', partyOf(user), source, { guarded: 'code' });
+      if (attempt.locked) {
+        await this.record('client.lockout', 'failure', partyOf(user), source, { guarded: 'code' });
+        await this.notice(user, 'account_locked');
+      }
       throw new ApiError('validation', { reason: 'invalid_code', fields: ['code'] });
     }
     await this.lockout.succeed(attempt);
@@ -264,7 +311,7 @@ export class AuthService {
   }
 
   /** Step 2. An authenticator code, or a recovery code that is then spent. */
-  async verifyLogin(challengeId: string, code: string, method: CodeMethod, source = ''): Promise<SignedIn> {
+  async verifyLogin(challengeId: string, code: string, method: CodeMethod, source = '', agent = ''): Promise<SignedIn> {
     const challengeKey = sha256(challengeId);
     const challenge = await this.stores.auth.challenges.get(challengeKey);
     const found = challenge && challenge.expiresAt > this.now() ? await this.stores.directory.getUser(challenge.userId) : null;
@@ -286,9 +333,14 @@ export class AuthService {
     }
     // One challenge makes one session.
     if (!(await this.stores.auth.challenges.take(challengeKey))) throw new ApiError('validation', { reason: 'challenge_expired' });
-    // A full sign-in (password and code) from here: remember the network.
+    // A full sign-in (password and code) from here: remember the network. If the account has been used before and
+    // never from this network, its owner is told.
+    const newNetwork = (user.knownSources ?? []).length > 0 && !isKnownSource(user, source);
     user = (await this.stores.directory.updateUser(user.id, (current) => ({ ...current, lastSignInAt: this.now(), knownSources: withKnownSource(current.knownSources, source) }))) ?? user;
-    await this.record('client.sign_in', 'success', partyOf(user), source, { method });
+    await this.record('client.sign_in', 'success', partyOf(user), source, { method, ...(newNetwork ? { network: 'new' } : {}) });
+    if (newNetwork) await this.notice(user, 'new_network_sign_in');
+    // The real owner is here, with the credentials a pending authenticator reset would have thrown away: it is cancelled.
+    await this.cancelAuthenticatorResets(user, 'signed in', source);
 
     const companies = await this.companiesOf(user.id);
     const token = randomToken();
@@ -300,6 +352,7 @@ export class AuthService {
       companyId: companies.length === 1 ? (companies[0]?.company.id ?? null) : null,
       createdAt: this.now(),
       lastSeenAt: this.now(),
+      agent: agentFamily(agent),
     };
     await this.stores.auth.sessions.put(tokenHash, session);
     return {
@@ -422,6 +475,196 @@ export class AuthService {
     await this.stores.auth.activations.deleteWhere({ userId });
     await this.unlock(user);
     return this.revokeAllSessions(userId);
+  }
+
+  // --- Forgotten password ---------------------------------------------------------
+  //
+  // EMAIL ALONE IS NEVER ENOUGH. The emailed link proves control of the mailbox; choosing a new password also needs
+  // a current code from the authenticator app, or an unused recovery code. A reset never touches the authenticator.
+  // Someone who has lost the authenticator AND the recovery codes has no self-service way back: staff reset it, with
+  // two people and a delay (see the ops console).
+
+  /**
+   * Always the same answer, after the same work as a sign-in attempt, whether
+   * or not the address belongs to an account: what follows happens after the
+   * answer has gone. If the account exists, is activated and is enabled, a
+   * single-use link is emailed to it; an earlier link stops working. At most
+   * RESET_REQUESTS_PER_HOUR links an hour for one account.
+   */
+  async requestPasswordReset(email: string, source = ''): Promise<void> {
+    const address = email.trim().toLowerCase();
+    this.later(this.issuePasswordReset(address, source));
+    await decoyVerify(address);
+  }
+  private async issuePasswordReset(address: string, source: string): Promise<void> {
+    const user = await this.stores.directory.findUserByEmail(address);
+    if (!user || user.activatedAt === null || user.disabledAt || user.passwordHash === null) {
+      await this.record('client.password_reset.request', 'failure', { type: 'client', id: null, label: address }, source, { reason: 'no_usable_account' });
+      return;
+    }
+    const since = this.now() - 60 * 60_000;
+    const recent = await this.stores.mail.count({}, (row) => row.to === user.email && row.template === 'reset.client' && row.createdAt > since);
+    if (recent >= RESET_REQUESTS_PER_HOUR) {
+      await this.record('client.password_reset.request', 'failure', partyOf(user), source, { reason: 'rate_limited' });
+      return;
+    }
+    // A new link kills the old one.
+    await this.stores.auth.passwordResets.deleteWhere({ userId: user.id });
+    const resetCode = randomCode(4);
+    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
+    await this.stores.auth.passwordResets.put(sha256(normaliseCode(resetCode)), { userId: user.id, expiresAt, attempts: 0 });
+    // The code is in the link's fragment, which browsers do not send to servers: it is in no request log.
+    await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.client', data: { name: user.name, link: `${this.config.appUrl}/reset#code=${resetCode}`, expiresAt }, key: `reset:${sha256(resetCode)}`, category: 'security' }));
+    await this.record('client.password_reset.request', 'success', partyOf(user), source, { expires: new Date(expiresAt).toISOString() });
+  }
+
+  private async passwordReset(resetCode: string) {
+    const key = sha256(normaliseCode(resetCode));
+    const record = await this.stores.auth.passwordResets.get(key);
+    const user = record && record.expiresAt > this.now() ? await this.stores.directory.getUser(record.userId) : null;
+    // One answer for unknown, expired, used, replaced, and an account that has since been disabled or reset.
+    if (!record || !user || user.activatedAt === null || user.disabledAt) throw new ApiError('validation', { reason: 'reset_invalid' });
+    return { key, record, user };
+  }
+
+  /** Whether the link is (still) good, and the password rules. Nothing about whose account it is. */
+  async passwordResetStart(resetCode: string) {
+    await this.passwordReset(resetCode);
+    return { passwordPolicy: { minLength: PASSWORD_MIN_LENGTH } };
+  }
+
+  /**
+   * The link AND a second factor, then the new password. Wrong codes count
+   * toward the same lock as wrong sign-in codes, and five of them withdraw
+   * the link. On success every session is ended and the owner is told.
+   */
+  async passwordResetComplete(resetCode: string, code: string, method: CodeMethod, password: string, source = ''): Promise<void> {
+    const { key, user } = await this.passwordReset(resetCode);
+    if (passwordProblem(password) !== null) throw new ApiError('validation', { reason: 'weak_password', fields: ['password'] });
+    let verified: UserRecord;
+    try {
+      verified = method === 'totp' ? await this.verifyUserTotp(user, code, 'code', source) : await this.verifyRecoveryCode(user, code, source);
+    } catch (error) {
+      if (reasonOf(error) !== 'code_reused') {
+        await this.stores.auth.passwordResets.mutate(key, (current) => (current === null ? undefined : current.attempts + 1 >= MAX_CHALLENGE_ATTEMPTS ? null : { ...current, attempts: current.attempts + 1 }));
+      }
+      await this.record('client.password_reset', 'failure', partyOf(user), source, { stage: 'code', method, reason: reasonOf(error) });
+      throw error;
+    }
+    const passwordHash = await hashPassword(password);
+    // One request takes the link, and only while it is still the one that was checked.
+    const taken = await this.stores.auth.passwordResets.take(key);
+    if (!taken || taken.userId !== user.id || taken.expiresAt <= this.now()) throw new ApiError('validation', { reason: 'reset_invalid' });
+    // ONLY the password. The authenticator key and the recovery codes are not this function's to change.
+    const saved = await this.stores.directory.updateUser(user.id, (current) => (current.activatedAt === null || current.disabledAt || current.totpSecret !== verified.totpSecret ? null : { ...current, passwordHash }));
+    if (!saved) throw new ApiError('validation', { reason: 'reset_invalid' });
+    const sessions = await this.revokeAllSessions(user.id);
+    await this.lockout.unlock([`email:${user.email}`]);
+    await this.record('client.password_reset', 'success', partyOf(user), source, { method, sessionsEnded: String(sessions) });
+    await this.notice(saved, 'password_reset');
+  }
+
+  // --- Signed in: your own security settings -----------------------------------------
+
+  /** The current password AND an authenticator code. Every OTHER session is ended. */
+  async changePassword(context: SessionContext, currentPassword: string, code: string, newPassword: string, source = ''): Promise<void> {
+    const { user } = context;
+    const who = partyOf(user);
+    const fail = async (reason: string, error: ApiError): Promise<never> => {
+      await this.record('client.password_change', 'failure', who, source, { reason });
+      throw error;
+    };
+    if (passwordProblem(newPassword) !== null) await fail('weak_password', new ApiError('validation', { reason: 'weak_password', fields: ['newPassword'] }));
+    const attempt = await this.begin('password', `email:${user.email}`, source, isKnownSource(user, source));
+    if (user.passwordHash === null || !(await verifyPassword(currentPassword, user.passwordHash))) {
+      if (attempt.locked) {
+        await this.record('client.lockout', 'failure', who, source, { guarded: 'password' });
+        await this.notice(user, 'account_locked');
+      }
+      await fail('invalid_credentials', new ApiError('validation', { reason: 'invalid_credentials', fields: ['currentPassword'] }));
+    }
+    await this.lockout.succeed(attempt);
+    let verified: UserRecord;
+    try {
+      verified = await this.verifyUserTotp(user, code, 'stepup', source);
+    } catch (error) {
+      return fail(reasonOf(error), error as ApiError);
+    }
+    const passwordHash = await hashPassword(newPassword);
+    const saved = await this.stores.directory.updateUser(user.id, (current) => (current.passwordHash === verified.passwordHash && !current.disabledAt ? { ...current, passwordHash } : null));
+    if (!saved) await fail('changed_meanwhile', new ApiError('validation', { reason: 'invalid_credentials' }));
+    const others = await this.revokeSessionsExcept(user.id, context.session.id);
+    await this.stores.auth.passwordResets.deleteWhere({ userId: user.id });
+    await this.record('client.password_change', 'success', who, source, { otherSessionsEnded: String(others) });
+    await this.notice(user, 'password_changed');
+  }
+
+  /** An authenticator code buys a fresh set of recovery codes, shown once. The old ones stop working. */
+  async regenerateRecoveryCodes(context: SessionContext, code: string, source = ''): Promise<{ recoveryCodes: string[] }> {
+    const { user } = context;
+    let verified: UserRecord;
+    try {
+      verified = await this.verifyUserTotp(user, code, 'stepup', source);
+    } catch (error) {
+      await this.record('client.recovery_codes.regenerate', 'failure', partyOf(user), source, { reason: reasonOf(error) });
+      throw error;
+    }
+    const recoveryCodes = Array.from({ length: RECOVERY_CODE_COUNT }, () => randomCode(RECOVERY_CODE_GROUPS));
+    const recoveryCodeHashes = await hashRecoveryCodes(recoveryCodes);
+    const saved = await this.stores.directory.updateUser(user.id, (current) => (current.totpSecret === verified.totpSecret && !current.disabledAt ? { ...current, recoveryCodeHashes } : null));
+    if (!saved) throw new ApiError('validation', { reason: 'invalid_code' });
+    await this.record('client.recovery_codes.regenerate', 'success', partyOf(user), source, { count: String(recoveryCodes.length) });
+    await this.notice(user, 'recovery_codes_regenerated');
+    return { recoveryCodes };
+  }
+
+  /** Your own live sessions: what kind of device, and roughly when. Never an address, never a token. */
+  async listSessions(context: SessionContext): Promise<{ id: string; current: boolean; device: string; signedInAt: string; lastActiveAt: string }[]> {
+    const now = this.now();
+    const live = await this.stores.auth.sessions.list({ userId: context.user.id }, (session) => now - session.lastSeenAt <= this.config.sessionIdleMs && now - session.createdAt <= this.config.sessionAbsoluteMs);
+    // Times to the quarter hour: enough to recognise a session, not a log of anyone's movements.
+    const rough = (at: number) => new Date(Math.floor(at / ROUGH_MS) * ROUGH_MS).toISOString();
+    return live
+      .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+      .map((session) => ({ id: sha256(`session-ref:${session.id}`).slice(0, 24), current: session.id === context.session.id, device: session.agent ?? 'Unknown device', signedInAt: rough(session.createdAt), lastActiveAt: rough(session.lastSeenAt) }));
+  }
+
+  /** Ends one of your own sessions, by the reference `listSessions` gave. Someone else's reference is simply not found. */
+  async revokeOwnSession(context: SessionContext, reference: string, source = ''): Promise<void> {
+    const mine = await this.stores.auth.sessions.list({ userId: context.user.id });
+    const target = mine.find((session) => sha256(`session-ref:${session.id}`).slice(0, 24) === reference);
+    if (!target) throw new ApiError('not_found');
+    await this.stores.auth.sessions.deleteWhere({ userId: context.user.id }, (session) => session.id === target.id);
+    await this.stores.auth.stepUps.deleteWhere({ userId: context.user.id }, (grant) => grant.sessionId === target.id);
+    await this.record('client.session.revoke', 'success', partyOf(context.user), source, { which: target.id === context.session.id ? 'this one' : 'another', device: target.agent ?? 'Unknown device' });
+    if (target.id !== context.session.id) await this.notice(context.user, 'session_revoked');
+  }
+
+  private async revokeSessionsExcept(userId: string, keepSessionId: string): Promise<number> {
+    const others = await this.stores.auth.sessions.count({ userId }, (session) => session.id !== keepSessionId);
+    await this.stores.auth.sessions.deleteWhere({ userId }, (session) => session.id !== keepSessionId);
+    await this.stores.auth.stepUps.deleteWhere({ userId }, (grant) => grant.sessionId !== keepSessionId);
+    await this.stores.auth.challenges.deleteWhere({ userId });
+    return others;
+  }
+
+  // --- Authenticator resets waiting out their delay (started by staff; see the ops console) ---------------
+
+  /** Cancels every authenticator reset that is waiting for this person. Returns how many there were. */
+  async cancelAuthenticatorResets(user: UserRecord, by: string, source = ''): Promise<number> {
+    const waiting = await this.stores.auth.authenticatorResets.list({ userId: user.id, status: 'waiting' });
+    let cancelled = 0;
+    for (const item of waiting) {
+      const at = this.now();
+      const stored = await this.stores.auth.authenticatorResets.mutate(
+        item.id,
+        (current) => (current && current.status === 'waiting' ? { ...current, status: 'cancelled', closedAt: at, closedBy: by } : undefined),
+        (saved) => (saved && saved.status === 'cancelled' && saved.closedAt === at ? { at, actor: { type: 'system', id: null, label: 'authenticator reset' }, target: partyOf(user), action: 'system.client.reset_authenticator.cancelled', outcome: 'success', source, detail: { reset: item.id, request: item.requestId, by } } : null),
+      );
+      if (stored?.status === 'cancelled' && stored.closedAt === at) cancelled += 1;
+    }
+    if (cancelled > 0) await this.notice(user, 'authenticator_reset_cancelled');
+    return cancelled;
   }
 
   // --- Step-up ----------------------------------------------------------------

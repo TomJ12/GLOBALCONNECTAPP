@@ -42,6 +42,7 @@ export type ProviderErrorReason =
   | 'locked'
   | 'challenge_expired'
   | 'activation_invalid'
+  | 'reset_invalid'
   | 'weak_password'
   | 'step_up_required'
   | 'step_up_invalid'
@@ -61,6 +62,7 @@ const REASON_MESSAGES: Record<ProviderErrorReason, string> = {
   locked: 'Too many attempts. Wait a while before trying again.',
   challenge_expired: 'That took too long. Start again.',
   activation_invalid: 'That activation code is not valid or has expired. Ask Global Connect for a new one.',
+  reset_invalid: 'That reset link is not valid any more: it was used, replaced or has expired. Ask for a new one.',
   weak_password: 'That password is not allowed. Use at least 12 characters and avoid common passwords.',
   step_up_required: 'This needs a code from your authenticator app. Try again.',
   step_up_invalid: 'The code check for this action has expired or does not match. Try again.',

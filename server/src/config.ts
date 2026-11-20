@@ -26,6 +26,8 @@ export interface Config {
   openOnNetwork: boolean;
   /** The key holder's one-off acceptance of an audit log whose end is not signed (AUDIT_ACCEPT_LOG_END): the label of that exact log end. */
   auditAcceptLogEnd: string | null;
+  /** How long an approved authenticator reset waits before anything changes (AUTHENTICATOR_RESET_DELAY_HOURS, default 24; 0 = at once). */
+  authenticatorResetDelayMs: number;
   /** The SMTP server emails are sent through, or null (development: the console outbox). */
   smtp: SmtpSettings | null;
   /** Emails queued for one address, and for everyone together, per hour. Beyond these a message is recorded as suppressed, not sent. */
@@ -302,6 +304,9 @@ export function loadConfig(env: Env = process.env): Config {
   const approvalHours = Number(env.PAYMENT_APPROVAL_HOURS ?? 48);
   if (!(approvalHours > 0 && approvalHours <= 24 * 30)) throw new Error('PAYMENT_APPROVAL_HOURS must be a number of hours between 0 and 720 (default 48).');
 
+  const resetDelayHours = Number(env.AUTHENTICATOR_RESET_DELAY_HOURS ?? 24);
+  if (!(resetDelayHours >= 0 && resetDelayHours <= 24 * 14)) throw new Error('AUTHENTICATOR_RESET_DELAY_HOURS must be a number of hours between 0 and 336 (default 24).');
+  if (strict && resetDelayHours < 1) throw new Error('AUTHENTICATOR_RESET_DELAY_HOURS must be at least 1 outside development: an authenticator reset that happens at once is the classic account takeover.');
   const reconcileHours = Number(env.PAYMENT_RECONCILE_HOURS ?? 72);
   if (!(reconcileHours > 0 && reconcileHours <= 24 * 30)) throw new Error('PAYMENT_RECONCILE_HOURS must be a number of hours between 0 and 720 (default 72).');
   const fieldList = (value: string | undefined): string[] => {
@@ -311,6 +316,7 @@ export function loadConfig(env: Env = process.env): Config {
   };
 
   return {
+    authenticatorResetDelayMs: Math.round(resetDelayHours * 60 * 60_000),
     paymentReconcileMs: Math.round(reconcileHours * 60 * 60_000),
     payeeDigestIgnore: { currencycloud: fieldList(env.PAYEE_DIGEST_IGNORE_CURRENCYCLOUD), equals: fieldList(env.PAYEE_DIGEST_IGNORE_EQUALS) },
     paymentApprovalMs: Math.round(approvalHours * 60 * 60_000),

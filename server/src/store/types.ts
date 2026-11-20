@@ -123,9 +123,39 @@ export interface LoginChallengeRecord {
   attempts: number;
 }
 
+/** A password-reset link that was emailed. Keyed by the hash of its code; it works once, for half an hour, and never by itself. */
+export interface PasswordResetRecord {
+  userId: string;
+  expiresAt: number;
+  /** Wrong second factors entered with this link. At five the link is withdrawn. */
+  attempts: number;
+}
+
+/**
+ * An authenticator reset that staff have approved and that has not happened yet. During the delay the person's
+ * credentials still work; a successful sign-in with them cancels it, and so can any ops admin.
+ */
+export interface AuthenticatorResetRecord {
+  id: string;
+  userId: string;
+  /** The approval request it came from. */
+  requestId: string;
+  requestedBy: string;
+  approvedBy: string;
+  approvedAt: number;
+  /** When the credentials are cleared and the new activation link is emailed. */
+  dueAt: number;
+  status: 'waiting' | 'done' | 'cancelled';
+  closedAt: number | null;
+  /** Who or what cancelled it: a staff email, or "signed in". */
+  closedBy: string | null;
+}
+
 export interface SessionRecord {
   id: string;
   userId: string;
+  /** What kind of device or browser signed in ("Chrome on Windows"): a family, never the full identifying string. */
+  agent?: string;
   /** Null until the person picks a company (only when they have several). */
   companyId: string | null;
   createdAt: number;
@@ -192,6 +222,8 @@ export interface AuthStore {
   sessions: Table<SessionRecord>;
   stepUps: Table<StepUpRecord>;
   attempts: Table<AttemptRecord>;
+  passwordResets: Table<PasswordResetRecord>;
+  authenticatorResets: Table<AuthenticatorResetRecord>;
 }
 
 // --- Operations staff: a separate account table and separate session tables ---
@@ -263,6 +295,7 @@ export interface OpsStore {
   sessions: Table<OpsSessionRecord>;
   attempts: Table<AttemptRecord>;
   approvals: Table<ApprovalRecord>;
+  passwordResets: Table<PasswordResetRecord>;
   /** Confirmation tokens that have been used, by their random part, until they would have expired anyway. A token works once. */
   confirmations: Table<{ expiresAt: number }>;
 }

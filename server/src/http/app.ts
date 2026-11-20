@@ -25,6 +25,8 @@ import { ApiError } from '../errors';
 import { ConsoleOutbox, maskEmail, type Mailer } from '../mailer';
 import { MailQueue } from '../mail/queue';
 import { activationMail } from '../mail/templates';
+import { SecurityNotices } from '../notify/security';
+import { AuthenticatorResets } from '../auth/authenticatorResets';
 import { assertAmount } from '../money';
 import { networkOf, sourceOf } from '../net';
 import { emailDomain, hasControlCharacters, isEmail } from '../validate';
@@ -260,6 +262,9 @@ export async function buildApp(deps: AppDeps) {
     delivery: deps.mailDelivery ?? (deps.mailer instanceof ConsoleOutbox ? 'inline' : 'background'),
     onError: (message) => app.log.error({ message }, 'mail queue failed'),
   });
+  const notices = new SecurityNotices(mail, now, (message) => app.log.error({ message }, 'security notice failed'));
+  auth.attach(mail, notices);
+  const authenticatorResets = new AuthenticatorResets(deps.stores, auth, mail, notices, config.authenticatorResetDelayMs, now);
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
 
   const app = Fastify({
@@ -483,7 +488,7 @@ export async function buildApp(deps: AppDeps) {
       );
       api.post('/auth/login/verify', { preHandler: limitAttempts }, async (request) => {
         const method = (request.body as { method?: unknown } | null)?.method === 'recovery' ? 'recovery' : 'totp';
-        const signedIn = await auth.verifyLogin(field(request.body, 'challengeId', text(128)), field(request.body, 'code', text(32)), method, request.ip);
+        const signedIn = await auth.verifyLogin(field(request.body, 'challengeId', text(128)), field(request.body, 'code', text(32)), method, request.ip, String(request.headers['user-agent'] ?? ''));
         const { context } = signedIn;
         return {
           token: signedIn.token,
@@ -494,6 +499,32 @@ export async function buildApp(deps: AppDeps) {
       });
       api.post('/auth/logout', async (request) => {
         await auth.logout(bearer(request), request.ip);
+        return { ok: true };
+      });
+      // --- Forgotten password: the emailed link AND a second factor (see AuthService) ---
+      api.post('/auth/password-reset/request', { preHandler: limitAttempts }, async (request) => {
+        // The same answer whoever the address belongs to, or nobody.
+        await auth.requestPasswordReset(field(request.body, 'email', text(254)), request.ip);
+        return { ok: true };
+      });
+      api.post('/auth/password-reset/start', { preHandler: limitAttempts }, async (request) => auth.passwordResetStart(field(request.body, 'resetCode', text(64))));
+      api.post('/auth/password-reset/complete', { preHandler: limitAttempts }, async (request) => {
+        const method = (request.body as { method?: unknown } | null)?.method === 'recovery' ? 'recovery' : 'totp';
+        await auth.passwordResetComplete(field(request.body, 'resetCode', text(64)), field(request.body, 'code', text(32)), method, field(request.body, 'password', text(1000)), request.ip);
+        return { ok: true };
+      });
+
+      // --- Your own security settings (signed in; no company needed) -----------
+      api.post('/account/password', { preHandler: limitAttempts }, async (request) => {
+        await auth.changePassword(await sessionOf(request), field(request.body, 'currentPassword', text(1000)), field(request.body, 'code', text(16)), field(request.body, 'newPassword', text(1000)), request.ip);
+        return { ok: true };
+      });
+      api.post('/account/recovery-codes', { preHandler: limitAttempts }, async (request) => auth.regenerateRecoveryCodes(await sessionOf(request), field(request.body, 'code', text(16)), request.ip));
+      api.get('/account/sessions', async (request) => ({ items: await auth.listSessions(await sessionOf(request)) }));
+      api.post('/account/sessions/:id/revoke', async (request) => {
+        const { id } = request.params as { id: string };
+        if (!/^[0-9a-f]{24}$/.test(id)) throw new ApiError('not_found');
+        await auth.revokeOwnSession(await sessionOf(request), id, request.ip);
         return { ok: true };
       });
       api.post('/session/company', async (request) => {
@@ -741,7 +772,7 @@ export async function buildApp(deps: AppDeps) {
     { prefix: '/v1' },
   );
 
-  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, now, limitAttempts });
+  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, notices, authenticatorResets, now, limitAttempts });
   // Null when no ADMIN_TOKEN is set: the operator commands are then off.
   const admin = config.adminToken ? await buildAdminApp({ config, stores: deps.stores, auth, opsAuth, mail, now }) : null;
 
@@ -761,5 +792,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, admin, auth, opsAuth, opsRoutes, held, mail };
+  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets };
 }

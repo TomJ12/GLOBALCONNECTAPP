@@ -136,4 +136,14 @@ CREATE TABLE direct_payments (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 CREATE TABLE mail_outbox (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 CREATE INDEX mail_outbox_status ON mail_outbox (json_extract(data, '$.status'));
 `,
+  // 7: self-service password reset (clients and staff), and authenticator resets waiting out their delay.
+  `
+CREATE TABLE password_resets (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX password_resets_user ON password_resets (json_extract(data, '$.userId'));
+CREATE TABLE ops_password_resets (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX ops_password_resets_user ON ops_password_resets (json_extract(data, '$.userId'));
+CREATE TABLE authenticator_resets (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX authenticator_resets_user ON authenticator_resets (json_extract(data, '$.userId'));
+CREATE INDEX authenticator_resets_status ON authenticator_resets (json_extract(data, '$.status'));
+`,
 ];

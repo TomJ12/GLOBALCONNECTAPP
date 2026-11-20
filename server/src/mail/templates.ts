@@ -36,6 +36,26 @@ const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 16).r
 const safe = (value: string): string => singleLine(value).slice(0, 200);
 const NOT_YOU = `If this was not you, tell Global Connect at once: ${MAIL_CONTACT}`;
 
+/** What each security notice says. One or two plain sentences; never a link, a code, an amount or an address. */
+export const SECURITY_NOTICES = {
+  password_changed: () => ['The password of your account was changed. Every other signed-in session was signed out.'],
+  password_reset: () => ['The password of your account was reset using an emailed link and a code from your authenticator. Every signed-in session was signed out.'],
+  recovery_codes_regenerated: () => ['New recovery codes were made for your account. The old ones no longer work.'],
+  new_network_sign_in: () => ['Your account was signed in to from a network it had not been used from before.'],
+  account_locked: () => ['Too many wrong passwords or codes were entered for your account, so sign-in is locked for a while. If it was you, wait and try again; nothing else is needed.'],
+  account_disabled: () => ['Your account has been disabled by Global Connect. You cannot sign in until it is enabled again.'],
+  account_enabled: () => ['Your account has been enabled again by Global Connect.'],
+  authenticator_reset_requested: (data: { until?: number }) => [
+    'Global Connect staff have approved a reset of the authenticator on your account.',
+    `It has NOT happened yet. On ${utc(data.until ?? 0)} your current password, authenticator and recovery codes will stop working and a new activation link will be emailed to this address.`,
+    'If you did not ask for this: sign in now with your current password and authenticator code (that cancels the reset), and tell Global Connect.',
+  ],
+  authenticator_reset_cancelled: () => ['The reset of the authenticator on your account was cancelled. Nothing was changed: your password, authenticator and recovery codes work as before.'],
+  authenticator_reset_completed: () => ['The authenticator on your account has been reset. Your earlier password, authenticator and recovery codes no longer work. A separate email carries a new activation link.'],
+  session_revoked: () => ['One of the signed-in sessions of your account was signed out from your security settings.'],
+} satisfies Record<string, (data: { until?: number }) => string[]>;
+export type SecurityNotice = keyof typeof SECURITY_NOTICES;
+
 export const TEMPLATES = {
   'activation.client': (data: { name: string; link: string; expiresAt: number }): Draft => ({
     subject: 'Activate your Global Connect account',
@@ -60,6 +80,36 @@ export const TEMPLATES = {
       `The link works once and expires ${utc(data.expiresAt)}. Any earlier link no longer works.`,
       'If you were not expecting this, do not use the link and tell Global Connect.',
     ],
+  }),
+  // The link ALONE resets nothing: the page it opens also asks for a code from the authenticator app (or a recovery code).
+  'reset.client': (data: { name: string; link: string; expiresAt: number }): Draft => ({
+    subject: 'Reset the password of your Global Connect account',
+    lines: [
+      `Hello ${safe(data.name)},`,
+      '',
+      'A password reset was asked for on your Global Connect account. To choose a new password, open this link:',
+      { link: data.link },
+      '',
+      `The link works once and expires ${utc(data.expiresAt)}. You will also be asked for a code from your authenticator app, or one of your recovery codes: the link alone changes nothing.`,
+      'If you did not ask for this, you need do nothing: your password has not changed. If it keeps happening, tell Global Connect.',
+    ],
+  }),
+  'reset.staff': (data: { name: string; link: string; expiresAt: number }): Draft => ({
+    subject: 'Reset the password of your Global Connect staff account',
+    lines: [
+      `Hello ${safe(data.name)},`,
+      '',
+      'A password reset was asked for on your Global Connect staff account. To choose a new password, open this link:',
+      { link: data.link },
+      '',
+      `The link works once and expires ${utc(data.expiresAt)}. You will also be asked for a code from your authenticator app, or one of your recovery codes: the link alone changes nothing.`,
+      'If you did not ask for this, you need do nothing: your password has not changed. Tell an ops admin.',
+    ],
+  }),
+  // A NOTICE: it tells, it never asks. No link, no code, nothing to click.
+  'security.notice': (data: { name: string; audience: 'client' | 'staff'; kind: SecurityNotice; at: number; until?: number }): Draft => ({
+    subject: data.audience === 'staff' ? 'Security notice for your Global Connect staff account' : 'Security notice for your Global Connect account',
+    lines: [`Hello ${safe(data.name)},`, '', ...SECURITY_NOTICES[data.kind](data), '', `Time: ${utc(data.at)}.`, NOT_YOU],
   }),
 } satisfies Record<string, (data: never) => Draft>;
 
@@ -115,4 +165,3 @@ export const mailOf = <N extends TemplateName>(request: MailRequest<N>): MailReq
 export function activationMail(invite: { activationLink: string; expiresAt: number }, to: string, name: string, kind: 'client' | 'staff'): MailRequest {
   return mailOf({ to, template: kind === 'staff' ? 'activation.staff' : 'activation.client', data: { name, link: invite.activationLink, expiresAt: invite.expiresAt }, key: `activation:${sha256(invite.activationLink)}`, category: 'activation' });
 }
-void NOT_YOU;

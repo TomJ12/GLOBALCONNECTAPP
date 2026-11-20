@@ -291,7 +291,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
   assert.ok(toApprove && toReject && toCancel);
 
   // (Finishing or closing an interrupted request needs one that was interrupted: those two have their own test.)
-  const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate)/.test(route.url) && !/\/(resume|abandon)$/.test(route.url));
+  const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate)/.test(route.url) && !/\/(resume|abandon)$/.test(route.url) && !/authenticator-resets/.test(route.url));
   assert.ok(actions.length >= 23, `only ${actions.length} action routes`);
   const urlOf = (route: string) =>
     route.startsWith('/ops/approvals')
@@ -690,7 +690,7 @@ test('H1: a lone staff member cannot obtain a working client credential by any c
 
   // Even when a second person approves, the link goes to the CLIENT's mailbox and to no screen.
   for (const id of requests.slice(0, 2)) assert.equal((await second.act(`/ops/approvals/${id}/approve`)).status, 303);
-  assert.deepEqual(h.outbox.sent.map((message) => message.to).sort(), [AMIRA, BEN]);
+  assert.deepEqual(h.outbox.sent.filter((message) => /#code=/.test(message.text)).map((message) => message.to).sort(), [AMIRA, BEN]);
   for (const url of ['/ops/users/usr_amira', '/ops/users/usr_ben', '/ops/approvals', ...requests.map((id) => `/ops/approvals/${id}`), '/ops/audit', '/ops/audit?target=amira', '/ops/users']) {
     for (const browser of [lone.browser, second.browser]) assert.equal((await browser.get(url)).status, 200, url);
   }

@@ -6,7 +6,7 @@ import { loadConfig } from '../src/config';
 import { ConsoleOutbox } from '../src/mailer';
 import { MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue } from '../src/mail/queue';
 import { SmtpMailer, failureCode } from '../src/mail/smtp';
-import { activationMail, MAIL_FOOTER, render, TEMPLATES, type TemplateName } from '../src/mail/templates';
+import { activationMail, MAIL_FOOTER, render, SECURITY_NOTICES, TEMPLATES, type TemplateName } from '../src/mail/templates';
 import { createRuntime } from '../src/startup';
 import { harness, type Harness } from './helpers';
 import { FakeSmtp } from './support/smtp';
@@ -29,7 +29,14 @@ const settings = (port: number, extra: Record<string, string> = {}) => loadConfi
 const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'activation.client': { name: 'Amira Shah', link: LINK, expiresAt: 0 },
   'activation.staff': { name: 'Amira Shah', link: `${OPS}/ops/activate#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
+  'reset.client': { name: 'Amira Shah', link: `${APP}/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
+  'reset.staff': { name: 'Amira Shah', link: `${OPS}/ops/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
+  'security.notice': { name: 'Amira Shah', audience: 'client', kind: 'password_changed', at: 0 },
 };
+/** Every variant of every template: each security notice is its own wording. */
+const VARIANTS: [TemplateName, unknown][] = (Object.keys(TEMPLATES) as TemplateName[]).flatMap((name): [TemplateName, unknown][] =>
+  name === 'security.notice' ? (Object.keys(SECURITY_NOTICES) as (keyof typeof SECURITY_NOTICES)[]).flatMap((kind) => (['client', 'staff'] as const).map((audience): [TemplateName, unknown] => [name, { name: 'Amira Shah', audience, kind, at: 0, until: 86_400_000 }])) : [[name, SAMPLES[name]]],
+);
 
 /** A queue over a harness's database, sending through `transport`, on the harness's clock. */
 function queueOf(transport: ConstructorParameters<typeof MailQueue>[0]['transport'], extra: Partial<ConstructorParameters<typeof MailQueue>[0]> = {}): MailQueue {
@@ -40,9 +47,10 @@ const request = (n: number, to = 'amira@northfield.example') => activationMail({
 const rows = async () => (h as Harness).stores.mail.list();
 
 test('templates: every message has a harmless subject, the same lines as text and as simple HTML, the placeholder footer, and links only to this server', () => {
-  const samples = SAMPLES;
-  for (const name of Object.keys(TEMPLATES) as TemplateName[]) {
-    const mail = render(name, samples[name] as never, [APP, OPS]);
+  for (const [name, sample] of VARIANTS) {
+    const mail = render(name, sample as never, [APP, OPS]);
+    // Only an activation or a reset email carries a link; a notice never does.
+    assert.equal(/https?:/.test(mail.text), name.startsWith('activation.') || name.startsWith('reset.'), name);
     // Subject: the brand, and nothing about the person, the money or the secret.
     assert.match(mail.subject, /Global Connect/, name);
     assert.doesNotMatch(mail.subject, /Amira|Harbour|125|GBP|ABCDE|code|https?:|[\r\n]/, name);

@@ -42,6 +42,8 @@ import { ApiError } from '../errors';
 import { maskEmail } from '../mailer';
 import { MAIL_MAX_ATTEMPTS, type MailQueue } from '../mail/queue';
 import { activationMail } from '../mail/templates';
+import type { SecurityNotices } from '../notify/security';
+import type { AuthenticatorResets } from '../auth/authenticatorResets';
 import type { ProviderRegistry } from '../providers/adapter';
 import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate';
 import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type ApprovalsRequired, type AuditInput, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
@@ -55,6 +57,8 @@ export interface OpsDeps {
   opsAuth: OpsAuthService;
   registry: ProviderRegistry;
   mail: MailQueue;
+  notices: SecurityNotices;
+  authenticatorResets: AuthenticatorResets;
   now: () => number;
   limitAttempts: (request: FastifyRequest) => Promise<void>;
 }
@@ -146,7 +150,7 @@ const asset = (relative: string): Buffer | null => {
 };
 
 export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<{ method: string; url: string }[]> {
-  const { config, stores, auth, opsAuth, registry, mail, now, limitAttempts } = deps;
+  const { config, stores, auth, opsAuth, registry, mail, notices, authenticatorResets, now, limitAttempts } = deps;
   const routes: { method: string; url: string }[] = [];
   // Outside development OPS_URL must be https (config.ts), so the cookie is always Secure there.
   const secure = config.opsUrl.startsWith('https://');
@@ -641,6 +645,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         disabled: 'Disabled.',
         enabled: 'Re-enabled.',
         mailed: 'An activation email was sent to the address on file. The link is not shown to staff.',
+        reset_scheduled: 'The authenticator reset is approved and waiting out its delay. Nothing has changed yet; the client has been told by email, and can cancel it by signing in.',
+        reset_cancelled: 'The authenticator reset was cancelled. Nothing was changed.',
         requested: 'Request created. Nothing has changed yet: a different staff member must approve it.',
         approved: 'Approved and carried out.',
         rejected: 'Request rejected. Nothing was changed.',
@@ -811,12 +817,20 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           h`<tr><td><a href="/ops/approvals/${item.id}">${item.summary}</a></td><td>${item.requestedBy.email}</td><td>${when(item.requestedAt)}</td><td>${statusTag(item)}</td><td>${item.status === 'pending' ? `expires ${when(item.expiresAt)}` : item.decidedBy ? `${item.decidedBy.email}, ${when(item.decidedAt)}` : when(item.decidedAt)}</td></tr>`;
         const pending = all.filter((item) => item.status === 'pending');
         const interrupted = all.filter((item) => item.status === 'applying' && !carrying.has(item.id));
+        const resets = (await authenticatorResets.waiting()).sort((a, b) => a.dueAt - b.dueAt);
+        const people = new Map(await Promise.all(resets.map(async (item) => [item.userId, await stores.directory.getUser(item.userId)] as const)));
+        const resetsCard =
+          resets.length > 0
+            ? h`<div class="card"><h2>Authenticator resets waiting out their delay</h2><p class="muted">Approved, and nothing has changed yet. Each takes effect at the time shown unless the client signs in with their current credentials first, or an ops admin cancels it.</p><table><tr><th>Client</th><th>Requested by</th><th>Approved by</th><th>Takes effect</th><th></th></tr>${resets.map(
+                (item) => h`<tr><td><a href="/ops/users/${item.userId}">${people.get(item.userId)?.name ?? item.userId}</a></td><td>${item.requestedBy}</td><td>${item.approvedBy}</td><td>${when(item.dueAt)}</td><td>${ctx.user.role === 'ops_admin' ? form(ctx, `/ops/authenticator-resets/${item.id}/cancel`, h``, 'Cancel reset') : h`<span class="muted">an ops admin can cancel</span>`}</td></tr>`,
+              )}</table></div>`
+            : '';
         return send(
           reply,
           200,
           layout(
             chromeOf(ctx, 'Approvals', flashOf(request)),
-            h`${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
+            h`${resetsCard}${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
 <div class="card"><h2>Decided (latest 50)</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th>Decided</th></tr>${all.filter((item) => item.status !== 'pending' && item.status !== 'applying').slice(0, 50).map(row)}</table></div>`,
           ),
         );
@@ -1332,6 +1346,10 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const sessions = await auth.activeSessionCount(user.id);
         const nameOf = (companyId: string) => companies.find((company) => company.id === companyId)?.name ?? companyId;
         const free = companies.filter((company) => !company.deactivatedAt && !memberships.some((item) => item.companyId === company.id));
+        const pendingReset = (await stores.auth.authenticatorResets.list({ userId: user.id, status: 'waiting' }))[0];
+        const pendingResetCard = pendingReset
+          ? h`<div class="card"><h2>Authenticator reset waiting</h2><p class="warn">Approved by ${pendingReset.approvedBy} on ${when(pendingReset.approvedAt)}. Nothing has changed yet. It takes effect on ${when(pendingReset.dueAt)} unless this person signs in with their current credentials first, or an ops admin cancels it.</p>${ctx.user.role === 'ops_admin' ? form(ctx, `/ops/authenticator-resets/${pendingReset.id}/cancel`, h``, 'Cancel reset') : ''}</div>`
+          : '';
         // Status only. No credential of the person is read into this page.
         return send(
           reply,
@@ -1342,7 +1360,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
 <div class="card"><h2>Companies</h2><table><tr><th>Company</th><th>Role</th><th></th></tr>${memberships.map(
               (item) => h`<tr><td><a href="/ops/companies/${item.companyId}">${nameOf(item.companyId)}</a></td><td>${form(ctx, `${base}/memberships`, h`<input type="hidden" name="companyId" value="${item.companyId}"><label>Role ${roleSelect('role', CLIENT_ROLES, item.role)}</label>`, 'Change role', { request: true })}</td><td>${form(ctx, `${base}/memberships/remove`, h`<input type="hidden" name="companyId" value="${item.companyId}">`, 'Remove', { danger: true })}</td></tr>`,
             )}</table>${free.length > 0 && h`<h2>Attach to a company</h2>${form(ctx, `${base}/memberships`, h`<label>Company <select name="companyId" required>${free.map((company) => h`<option value="${company.id}">${company.name}</option>`)}</select></label><label>Role ${roleSelect('role', CLIENT_ROLES)}</label>`, 'Attach', { request: true })}`}</div></div>
-<div>${
+<div>${pendingResetCard}${
               user.activatedAt === null
                 ? h`<div class="card"><h2>Activation link</h2><p class="muted">Emails a new link to ${maskEmail(user.email)} and cancels any earlier one. Valid for 72 hours. The link is never shown to staff.</p>${fourEyesNote}${form(ctx, `${base}/activation-link`, h``, 'Email activation link', { request: true })}</div>`
                 : h`<div class="card"><h2>Reset authenticator</h2><p class="warn">${VERIFY_WARNING}</p><p class="muted">Removes the authenticator, the recovery codes and the password, ends every session and emails a new activation link to ${maskEmail(user.email)}.</p>${fourEyesNote}<form method="post" action="${base}/reset-authenticator">${csrfInput(ctx)}${verifyField}<div class="row tight"><button class="danger">${config.fourEyes ? 'Request: reset authenticator' : 'Reset authenticator'}</button></div></form></div>`
@@ -1422,10 +1440,25 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         if (user.disabledAt) throw new OpsError('Re-enable this person first.');
         return user;
       };
+      const delayHours = config.authenticatorResetDelayMs / 3_600_000;
+      const delayText = `${String(Math.round(delayHours * 10) / 10)} ${delayHours === 1 ? 'hour' : 'hours'}`;
+      // Cancelling is the safe direction, so one ops admin is enough; it is confirmed and audited like any action.
+      post('/authenticator-resets/:id/cancel', { name: 'authenticator_reset.cancel', admin: true }, async ({ ctx, params, source, aim, confirm }) => {
+        const item = await stores.auth.authenticatorResets.get(params.id ?? '');
+        if (!item || item.status !== 'waiting') throw new OpsError('This reset is no longer waiting.', 409, 'not_pending');
+        const user = await clientOf(item.userId);
+        aim(clientParty(user));
+        await confirm({
+          title: `Cancel the authenticator reset of client ${user.name} <${user.email}>`,
+          notes: [`Approved by ${item.approvedBy} on ${when(item.approvedAt)} (requested by ${item.requestedBy}). It would take effect on ${when(item.dueAt)}.`],
+          effect: 'The reset will not happen. Nothing about the account is changed: its password, authenticator and recovery codes go on working. The client is told by email.',
+        });
+        if (!(await authenticatorResets.cancel(item.id, ctx.user.email, source))) throw new OpsError('This reset is no longer waiting.', 409, 'not_pending');
+        return { detail: { reset: item.id, request: item.requestId, approvedBy: item.approvedBy }, redirect: `/ops/users/${user.id}?done=reset_cancelled` };
+      });
       action('/users/:id/reset-authenticator', {
         name: 'client.reset_authenticator',
         fourEyes: true,
-        mails: true,
         danger: true,
         password: true,
         async prepare({ form: input, params, aim }) {
@@ -1438,21 +1471,25 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             summary: `Reset the authenticator of client ${user.name} <${user.email}>`,
             warnings: [
               `Removes their password, authenticator and recovery codes, ends ${sessions === 1 ? 'their 1 active session' : `their ${sessions} active sessions`}, and emails a new activation link to ${maskEmail(user.email)}. Whoever reads that mailbox gets the account.`,
+              config.authenticatorResetDelayMs > 0
+                ? `Once approved, NOTHING changes for ${delayText}: the client is emailed a notice at once, their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it. Only after ${delayText} are the credentials cleared and the link sent.`
+                : 'THE DELAY IS SWITCHED OFF (AUTHENTICATOR_RESET_DELAY_HOURS=0, development only): the reset happens as soon as it is approved.',
               `How their identity was verified: “${identityVerification}”. Check this before approving.`,
             ],
           };
         },
-        async apply(params, { requester, source }) {
+        async apply(params, { requester, approver, source, requestId }) {
           const user = await clientOf(params.id);
           if (user.disabledAt) throw new OpsError('Re-enable this person first.');
-          // If an earlier try cleared the credentials and then could not send the email, the person is already
-          // "not activated". That must not block the retry: the clearing is skipped and the email is sent.
-          if (user.activatedAt !== null) {
-            const total = await auth.clearCredentials(user.id);
-            await append(opsParty(requester), 'client.session_revoked', 'success', clientParty(user), source, { sessions: String(total), why: 'authenticator reset' });
-          }
-          const fresh = await clientOf(user.id);
-          return { target: clientParty(user), detail: { identityVerification: params.identityVerification ?? '', ...(await mailClientLink(fresh)) }, redirect: `/ops/users/${user.id}?done=mailed` };
+          // NOTHING is cleared here. The reset is put down to happen after the delay; the client is told now, can cancel
+          // it by simply signing in, and so can any ops admin (see auth/authenticatorResets.ts). One reset per request,
+          // however often this is carried out.
+          const reset = await authenticatorResets.schedule(user, { id: requestId ?? `direct_${randomToken().slice(0, 12)}`, requestedBy: requester.email, approvedBy: (approver ?? requester).email }, source);
+          return {
+            target: clientParty(user),
+            detail: { identityVerification: params.identityVerification ?? '', reset: reset.id, status: reset.status, takesEffect: when(reset.dueAt), noticeTo: maskEmail(user.email) },
+            redirect: `/ops/users/${user.id}?done=${reset.status === 'done' ? 'mailed' : 'reset_scheduled'}`,
+          };
         },
       });
       /** Client actions on one person. Those that take access away are immediate; giving it back (`fourEyes`) needs a second person. */
@@ -1479,6 +1516,9 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: now() }));
         await stores.auth.activations.deleteWhere({ userId: user.id });
         await revokeClientSessions(requester, user, source, 'user disabled');
+        // A reset that was waiting has nobody left to reset.
+        await auth.cancelAuthenticatorResets(user, 'account disabled', source);
+        await notices.send({ id: user.id, email: user.email, name: user.name }, 'client', 'account_disabled');
       });
       // Re-enabling restores the person's old password and authenticator: a second person has to agree.
       simple(
@@ -1488,6 +1528,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         { verb: 'Re-enable', consequence: () => 'They can sign in again with the password and authenticator they had before.' },
         async (user) => {
           await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: null }));
+          await notices.send({ id: user.id, email: user.email, name: user.name }, 'client', 'account_enabled');
         },
         true,
       );

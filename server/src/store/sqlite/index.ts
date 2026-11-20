@@ -15,6 +15,8 @@ import type {
   CompanyRecord,
   LoginChallengeRecord,
   MailRecord,
+  PasswordResetRecord,
+  AuthenticatorResetRecord,
   Membership,
   OpsSessionRecord,
   ProviderKeyRecord,
@@ -252,6 +254,9 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const opsAttempts = new SqlTable<AttemptRecord>(db, 'ops_attempts', { indexed: ['subject'] });
   const approvals = new SqlTable<ApprovalRecord>(db, 'ops_approvals', { indexed: ['status'], audit });
   const confirmations = new SqlTable<{ expiresAt: number }>(db, 'ops_confirmations');
+  const passwordResets = new SqlTable<PasswordResetRecord>(db, 'password_resets', { indexed: ['userId'] });
+  const opsPasswordResets = new SqlTable<PasswordResetRecord>(db, 'ops_password_resets', { indexed: ['userId'] });
+  const authenticatorResets = new SqlTable<AuthenticatorResetRecord>(db, 'authenticator_resets', { indexed: ['userId', 'status'], audit });
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
   const mail = new SqlTable<MailRecord>(db, 'mail_outbox', { indexed: ['status'], secret: { field: 'body', keys } });
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
@@ -270,8 +275,8 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
     mail,
     payments: new SqlHeldPayments(db, directory, audit),
     directory,
-    auth: { activations, challenges, sessions, stepUps, attempts },
-    ops: { users: opsUsers, activations: opsActivations, challenges: opsChallenges, sessions: opsSessions, attempts: opsAttempts, approvals, confirmations },
+    auth: { activations, challenges, sessions, stepUps, attempts, passwordResets, authenticatorResets },
+    ops: { users: opsUsers, activations: opsActivations, challenges: opsChallenges, sessions: opsSessions, attempts: opsAttempts, approvals, confirmations, passwordResets: opsPasswordResets },
     audit,
     providerKeys,
     seedCodes,
@@ -290,7 +295,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
     },
     async sweep(sessionMaxAgeMs, opsSessionMaxAgeMs) {
       const at = now();
-      for (const table of [activations, opsActivations, challenges, opsChallenges] as Table<{ expiresAt: number }>[]) await table.deleteWhere((row) => row.expiresAt <= at);
+      for (const table of [activations, opsActivations, challenges, opsChallenges, passwordResets, opsPasswordResets] as Table<{ expiresAt: number }>[]) await table.deleteWhere((row) => row.expiresAt <= at);
       await confirmations.deleteWhere((row) => row.expiresAt <= at);
       await stepUps.deleteWhere((row) => row.expiresAt <= at);
       // A live lock is never removed. A counter goes only once it is neither locked nor recent.
