@@ -63,7 +63,7 @@ function TotalBalance({ balances }: { balances: Balance[] }) {
       {missing.length === 0 ? (
         <AppText variant="caption" tone="muted">
           {needsRates
-            ? `Across ${count} currencies. Estimated at indicative rates${rates.asOf ? ` as of ${formatTimeOfDay(rates.asOf)}` : ''}.`
+            ? `Across ${count} currencies. A valuation, estimated at your current sell rates${rates.asOf ? ` as of ${formatTimeOfDay(rates.asOf)}` : ''}.`
             : `Across ${count} ${count === 1 ? 'currency' : 'currencies'}.`}
         </AppText>
       ) : (

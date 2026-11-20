@@ -38,16 +38,48 @@ function RateRow({ base, quote }: { base: string; quote: string }) {
   const history = useRateHistory(base, quote);
   const pair = `${base} / ${quote}`;
 
+  // The customer's OWN rates, one for each direction: what they get selling the base currency, what they pay
+  // buying it. (The in-app demo has one sample rate for both.) Each opens Convert set up for that trade.
+  if (rate.data) {
+    const sell = formatRate(rate.data.rate);
+    const buy = formatRate(rate.data.buyRate ?? rate.data.rate);
+    const side = (label: string, value: string, from: string, to: string, testID: string) => (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${label}, your rate ${value} ${quote} per ${base}, indicative`}
+        accessibilityHint={`Opens Convert with ${from} to ${to}`}
+        onPress={() => router.push({ pathname: '/convert', params: { sell: from, buy: to } })}
+        style={({ pressed }) => [styles.side, pressed ? styles.pressed : null]}
+        testID={testID}
+      >
+        <AppText variant="caption" tone="muted">
+          {label}
+        </AppText>
+        <AppText variant="title">{value}</AppText>
+      </Pressable>
+    );
+    return (
+      <View style={styles.rateRow}>
+        <View style={styles.rateHead}>
+          <View style={styles.grow}>
+            <AppText variant="bodyStrong">{pair}</AppText>
+            <AppText variant="caption" tone="muted">
+              Your rate · Indicative
+            </AppText>
+          </View>
+          {history.data ? <Sparkline points={history.data.points} /> : <View style={styles.sparkSpace} />}
+        </View>
+        <View style={styles.sides}>
+          {side(`Sell ${base}`, sell, base, quote, `rate-${base}${quote}`)}
+          {side(`Buy ${base}`, buy, quote, base, `rate-buy-${base}${quote}`)}
+        </View>
+      </View>
+    );
+  }
+
   let trailing;
   let spoken: string;
-  if (rate.data) {
-    trailing = (
-      <AppText variant="title" testID={`rate-${base}${quote}`}>
-        {formatRate(rate.data.rate)}
-      </AppText>
-    );
-    spoken = `${base} to ${quote}, ${formatRate(rate.data.rate)}`;
-  } else if (rate.isError) {
+  if (rate.isError) {
     trailing = <Pill label="Unavailable" tone="warning" />;
     spoken = `${base} to ${quote}, rate unavailable`;
   } else if (rate.fetchStatus === 'paused') {
@@ -249,6 +281,10 @@ export function RatesScreen() {
 
 const styles = StyleSheet.create({
   rateTrailing: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  rateRow: { paddingHorizontal: spacing.lg, paddingVertical: spacing.md, gap: spacing.sm },
+  rateHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  sides: { flexDirection: 'row', gap: spacing.md },
+  side: { flex: 1, minHeight: sizes.touchTarget, justifyContent: 'center', paddingVertical: spacing.xs, paddingHorizontal: spacing.md, borderRadius: 10, borderWidth: 1, borderColor: colors.hairline },
   sparkSpace: { width: 72, height: 28 },
   alertRow: { paddingHorizontal: spacing.lg, paddingVertical: spacing.md, gap: spacing.sm },
   alertMain: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, minHeight: sizes.touchTarget },

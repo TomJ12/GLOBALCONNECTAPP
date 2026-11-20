@@ -82,7 +82,7 @@ export function useRate(base: CurrencyCode, quote: CurrencyCode) {
 }
 
 /**
- * Rates from one base currency to several others, for totals.
+ * Rates from one base currency to several others, for totals: the customer's own sell-side rate for each.
  * `rates[c]` is undefined until that rate has loaded.
  */
 export function useRatesFromBase(base: CurrencyCode, currencies: readonly CurrencyCode[]) {
@@ -93,7 +93,9 @@ export function useRatesFromBase(base: CurrencyCode, currencies: readonly Curren
       const rates: Record<CurrencyCode, DecimalString | undefined> = {};
       results.forEach((result, index) => {
         const currency = wanted[index];
-        if (currency) rates[currency] = result.data?.rate;
+        // A balance in another currency is valued at what the customer would get by SELLING it for the base
+        // currency: that is the rate at which they BUY the base (`buyRate`), not the rate at which they sell it.
+        if (currency) rates[currency] = result.data?.buyRate ?? result.data?.rate;
       });
       // The oldest of the rates used, so the screen can say how fresh the total is.
       const times = results.map((result) => result.data?.asOf).filter((value): value is string => Boolean(value));
