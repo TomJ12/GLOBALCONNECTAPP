@@ -46,10 +46,10 @@ export class MockCurrencycloudPlatform implements Transport {
   /** Every request received, for tests: path and the scope it carried. */
   readonly seen: { path: string; onBehalfOf: string | undefined }[] = [];
 
-  constructor(options: { accounts?: MockAccountA[]; now?: () => number; enforceOwnership?: boolean } = {}) {
+  constructor(options: { accounts?: MockAccountA[]; now?: () => number; enforceOwnership?: boolean; movingRates?: boolean } = {}) {
     this.enforceOwnership = options.enforceOwnership ?? true;
     for (const [index, account] of (options.accounts ?? MOCK_ACCOUNTS_A).entries()) {
-      const mock = new MockCurrencycloudServer({ getControls: () => ({ ...DEFAULT_MOCK_CONTROLS, latencyMs: 0 }), now: options.now, idNamespace: `a${index + 1}-` });
+      const mock = new MockCurrencycloudServer({ getControls: () => ({ ...DEFAULT_MOCK_CONTROLS, latencyMs: 0 }), now: options.now, idNamespace: `a${index + 1}-`, movingRates: options.movingRates });
       this.accounts.set(account.contactId, { account, mock, token: null });
     }
   }

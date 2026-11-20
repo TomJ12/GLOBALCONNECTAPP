@@ -305,6 +305,10 @@ export class CurrencycloudClient implements ProviderClient {
       quote_id: quote.id,
       conversion_date: quote.kind === 'forward' ? (quote.settlementDate ?? undefined) : undefined,
       unique_request_id: request.idempotencyKey,
+      // The client's own terms, when Global Connect's margin is applied by the server. UNVERIFIED against the
+      // provider: confirm these two parameters, and how the difference is settled, before going live.
+      client_buy_amount: request.clientTerms?.buyAmount,
+      client_sell_amount: request.clientTerms?.sellAmount,
     });
     return mapConversion(raw);
   }

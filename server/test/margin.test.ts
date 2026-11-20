@@ -83,6 +83,8 @@ test('which margin applies: forwards, then a pair override, then the tier for th
   assert.deepEqual([at('EURUSD', 'sell'), at('EURUSD', 'buy')], [35, 35]);
   assert.deepEqual([at('GBPEUR', 'sell', '49999.99'), at('GBPEUR', 'sell', '50000'), at('GBPEUR', 'buy', '249999.99'), at('GBPEUR', 'sell', '250000.00'), at('GBPEUR', 'sell', '9000000')], [60, 45, 45, 30, 30]);
   assert.equal(at('GBPUSD', 'sell', '9000000'), 40, 'an override is not undercut by a tier');
+  // The same trade spelled the other way round is the same trade.
+  assert.deepEqual([at('USDGBP', 'buy'), at('USDGBP', 'sell'), at('USDEUR', 'sell'), at('USDEUR', 'buy')], [40, 60, 35, 35]);
   assert.equal(at('GBPUSD', 'sell', '10', 'forward'), 90);
   assert.equal(marginBps(config({ defaultBps: 60 }), { pair: 'GBPUSD', direction: 'sell', kind: 'forward' }), 60, 'no forward margin set: priced as spot');
 });
@@ -98,6 +100,8 @@ test('bounds: never negative, never absurd, high only when the request says so; 
   for (const value of [1.5, Number.NaN, '50' as unknown as number, Infinity]) assert.throws(() => checkMarginConfig(config({ defaultBps: value }), true), /whole number of basis points/);
   for (const pair of ['GBP', 'GBPGBP', 'gbpusd', 'GBP/USD', '<b>USD']) assert.throws(() => checkMarginConfig(config({ overrides: [{ pair, direction: 'sell', bps: 10 }] }), false), /is not a currency pair/);
   assert.throws(() => checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'both', bps: 10 }, { pair: 'GBPUSD', direction: 'sell', bps: 20 }] }), false), /listed twice/);
+  assert.throws(() => checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 10 }, { pair: 'USDGBP', direction: 'buy', bps: 20 }] }), false), /listed twice/);
+  assert.equal(checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 10 }, { pair: 'USDGBP', direction: 'sell', bps: 20 }] }), false).overrides.length, 2);
   assert.throws(() => checkMarginConfig(config({ tiers: [{ fromAmount: '50000', bps: 60 }] }), false), /HIGHER margin/);
   assert.throws(() => checkMarginConfig(config({ tiers: [{ fromAmount: '50000', bps: 40 }, { fromAmount: '50000', bps: 30 }] }), false), /ascending order/);
   assert.throws(() => checkMarginConfig(config({ tiers: [{ fromAmount: '50000', bps: 30 }, { fromAmount: '100000', bps: 40 }] }), false), /HIGHER margin/);

@@ -5,6 +5,8 @@
  */
 import { Big } from 'big.js';
 
+import { walkedRate } from '@/api/adapters/mockRateWalk';
+
 import type { EqualsRequest, EqualsTransport } from './raw';
 
 type Json = Record<string, unknown>;
@@ -53,7 +55,10 @@ export class MockEqualsServer implements EqualsTransport {
   /** Every request received, for tests. */
   readonly seen: { path: string; accountId: string | undefined }[] = [];
 
-  constructor(options: { accounts?: string[]; now?: () => number; enforceOwnership?: boolean } = {}) {
+  private readonly movingRates: boolean;
+
+  constructor(options: { accounts?: string[]; now?: () => number; enforceOwnership?: boolean; movingRates?: boolean } = {}) {
+    this.movingRates = options.movingRates ?? false;
     this.now = options.now ?? Date.now;
     this.enforceOwnership = options.enforceOwnership ?? true;
     for (const accountId of options.accounts ?? MOCK_ACCOUNTS_B) this.states.set(accountId, this.seed(accountId));
@@ -192,7 +197,9 @@ export class MockEqualsServer implements EqualsTransport {
   private rateBetween(from: string, to: string): Big | null {
     const a = UNITS_PER_GBP[from];
     const b = UNITS_PER_GBP[to];
-    return a && b ? new Big(b).div(a).round(6, Big.roundHalfUp) : null;
+    if (!a || !b) return null;
+    const sample = new Big(b).div(a);
+    return (this.movingRates && from !== to ? walkedRate(from, to, sample, this.now()) : sample).round(6, Big.roundHalfUp);
   }
 
   private rate(query: Record<string, string>) {
@@ -255,11 +262,17 @@ export class MockEqualsServer implements EqualsTransport {
     const held = this.state.quotes.get(String(body.quoteRequestId ?? ''));
     if (!held || held.body.orderId !== orderId) return this.fail(404, 'quote_not_found');
     if (held.expiresAtMs <= this.now()) return this.fail(410, 'quote_expired');
-    const { from, to } = held.body.quote as { from: { amount: number; currency: string }; to: { amount: number; currency: string } };
+    const quoted = held.body.quote as { from: { amount: number; currency: string }; to: { amount: number; currency: string } };
+    // MOCK-ONLY FIELD (not in the provider's API): the partner's own terms for the client. They can only be worse
+    // for the client than the quote. Balances move by them; the quote itself (the provider's price) is kept.
+    const client = body.clientAmounts as { from?: number; to?: number } | undefined;
+    if (client && (typeof client.from !== 'number' || typeof client.to !== 'number' || client.from < quoted.from.amount || !(client.to > 0) || client.to > quoted.to.amount)) return this.fail(400, 'invalid_client_amounts', 'clientAmounts');
+    const from = { amount: client?.from ?? quoted.from.amount, currency: quoted.from.currency };
+    const to = { amount: client?.to ?? quoted.to.amount, currency: quoted.to.currency };
     if ((this.state.balances.get(from.currency) ?? new Big(0)).lt(from.amount)) return this.fail(422, 'insufficient_funds');
     this.move(from.currency, new Big(from.amount).neg(), { type: 'exchange', description: `Exchange to ${to.currency}`, reference: orderId });
     this.move(to.currency, new Big(to.amount), { type: 'exchange', description: `Exchange from ${from.currency}`, reference: orderId });
-    const trade = { ...held.body, status: 'complete', createdAt: this.iso() };
+    const trade = { ...held.body, ...(client ? { clientAmounts: { from: from.amount, to: to.amount } } : {}), status: 'complete', createdAt: this.iso() };
     this.state.trades.set(orderId, trade);
     return this.ok(trade);
   }

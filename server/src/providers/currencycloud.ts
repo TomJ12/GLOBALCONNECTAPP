@@ -25,10 +25,12 @@ export interface CurrencycloudFactoryOptions {
   now?: () => number;
   /** Payee fields left out of the payee digest, beyond the adapter's own list. */
   ignorePayeeFields?: string[];
+  /** MOCK ONLY: the sample rates move over time. */
+  movingRates?: boolean;
 }
 
 export function currencycloudFactory(options: CurrencycloudFactoryOptions): ProviderFactory {
-  const transport = options.transport ?? new MockCurrencycloudPlatform({ now: options.now });
+  const transport = options.transport ?? new MockCurrencycloudPlatform({ now: options.now, movingRates: options.movingRates });
   const mock = options.transport === undefined || options.transport instanceof MockCurrencycloudPlatform;
 
   const clientFor = async (mapping: ProviderMapping): Promise<CurrencycloudClient> => {

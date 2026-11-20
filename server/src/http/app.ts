@@ -16,7 +16,7 @@ import { z } from 'zod';
 
 import { isProviderError, type ProviderError } from '@/api/errors';
 import * as schemas from '@/api/schemas';
-import type { NewBeneficiary, Quote, Session, StepUpAction, UserRole } from '@/api/types';
+import type { NewBeneficiary, Session, StepUpAction, UserRole } from '@/api/types';
 
 import { AuthService, partyOf, reasonOf, type SessionContext } from '../auth/service';
 import type { Config } from '../config';
@@ -33,6 +33,8 @@ import { emailDomain, hasControlCharacters, isEmail } from '../validate';
 import { isActiveStaff, OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
 import { registerDemoGate } from './demoGate';
+import { MarginError } from '../rates/margin';
+import { ClientRates, type HeldQuote } from '../rates/service';
 import { HeldPayments, type HeldPaymentsDeps } from '../payments/held';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
@@ -264,6 +266,7 @@ export async function buildApp(deps: AppDeps) {
   });
   const notices = new SecurityNotices(mail, now, (message) => app.log.error({ message }, 'security notice failed'));
   auth.attach(mail, notices);
+  const rates = new ClientRates(deps.stores, config, now);
   opsAuth.attach(mail, notices);
   const authenticatorResets = new AuthenticatorResets(deps.stores, auth, mail, notices, config.authenticatorResetDelayMs, now);
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
@@ -456,11 +459,22 @@ export async function buildApp(deps: AppDeps) {
   };
 
   /** Quotes this server handed out, per company, so a booking can only use a quote that company was really given. PLACEHOLDER: in memory. */
-  const quotes = new Map<string, Quote>();
-  const rememberQuote = (companyId: string, quote: Quote): void => {
-    for (const [key, held] of quotes) if (Date.parse(held.expiresAt) < now() - 60_000) quotes.delete(key);
+  const quotes = new Map<string, HeldQuote>();
+  const rememberQuote = (held: HeldQuote): void => {
+    for (const [key, old] of quotes) if (Date.parse(old.client.expiresAt) < now() - 60_000) quotes.delete(key);
     while (quotes.size >= (deps.maxHeldQuotes ?? MAX_HELD_QUOTES)) quotes.delete(quotes.keys().next().value as string);
-    quotes.set(`${companyId}:${quote.id}`, quote);
+    quotes.set(`${held.companyId}:${held.client.id}`, held);
+  };
+  /** A margin problem is the server's, not the client's: they are told the conversion is unavailable, never why. */
+  const priced = async <T>(run: () => Promise<T>): Promise<T> => {
+    try {
+      return await run();
+    } catch (error) {
+      if (!(error instanceof MarginError)) throw error;
+      if (/too small/.test(error.message)) throw new ApiError('validation', { fields: ['amount'] });
+      app.log.error({ err: error.message }, 'client rate could not be worked out');
+      throw new ApiError('server');
+    }
   };
 
   await app.register(
@@ -572,12 +586,13 @@ export async function buildApp(deps: AppDeps) {
       api.get('/rates/:base/:quote', async (request) => {
         const context = await companyOf(request);
         const [base, quote] = pairOf(request);
-        return withProvider(context, (provider) => provider.getRate(base, quote));
+        // THE CLIENT'S RATE (rates/service.ts). The provider's rate never leaves the server.
+        return priced(() => withProvider(context, (provider) => rates.indicative(context.company, provider, base, quote)));
       });
       api.get('/rates/:base/:quote/history', async (request) => {
         const context = await companyOf(request);
         const [base, quote] = pairOf(request);
-        return withProvider(context, (provider) => provider.getRateHistory(base, quote));
+        return priced(async () => rates.history(context.company, await withProvider(context, (provider) => provider.getRateHistory(base, quote))));
       });
 
       /**
@@ -611,9 +626,10 @@ export async function buildApp(deps: AppDeps) {
         if (input.kind === 'forward' && !provider.capabilities.forwardContracts) {
           throw new ApiError('validation', { reason: 'not_supported', fields: ['kind'] });
         }
-        const quote = await withProvider(context, () => provider.createQuote(input));
-        rememberQuote(context.company.id, quote);
-        return quote;
+        const held = await priced(async () => rates.quote(context.company, await withProvider(context, () => provider.createQuote(input))));
+        rememberQuote(held);
+        // Only the client's side is returned. `held.provider` stays here.
+        return held.client;
       });
       api.post('/conversions', async (request) => {
         const context = await companyOf(request);
@@ -627,9 +643,21 @@ export async function buildApp(deps: AppDeps) {
           async () => {
             await authorize(request, context, 'conversion.book', { quoteId, idempotencyKey });
             // Only a quote this server issued to THIS company can be booked: the id alone is not trusted.
-            const quote = quotes.get(`${context.company.id}:${quoteId}`);
-            if (!quote) throw new ApiError('quote_expired');
-            return withProvider(context, (provider) => provider.bookConversion({ quote, idempotencyKey }));
+            const held = quotes.get(`${context.company.id}:${quoteId}`);
+            if (!held) throw new ApiError('quote_expired');
+            // On record BEFORE the provider is asked, so a booking whose answer is lost is not lost to the books.
+            const record = await rates.beginBooking(held, context.user.id, keyHash(idempotencyKey));
+            const clientTerms = record.appliedBy === 'server' ? { sellAmount: record.clientSellAmount, buyAmount: record.clientBuyAmount } : undefined;
+            try {
+              const conversion = await withProvider(context, (provider) => provider.bookConversion({ quote: held.provider, idempotencyKey, clientTerms }));
+              const booked = await rates.completeBooking(record.key, conversion);
+              if (booked?.mismatch) app.log.error({ conversion: conversion.id }, 'the provider booked a conversion without the client terms it was sent');
+              return rates.present(conversion, booked ?? record);
+            } catch (error) {
+              // Only a definite refusal means nothing was booked. Anything else (no answer, a server error) leaves the record open.
+              if (isProviderError(error) && ['validation', 'quote_expired', 'insufficient_funds', 'forbidden', 'not_found'].includes(error.kind)) await rates.failBooking(record.key);
+              throw error;
+            }
           },
           (conversion) => ({ conversion: conversion.id, sell: `${conversion.sellAmount} ${conversion.sellCurrency}`, buy: `${conversion.buyAmount} ${conversion.buyCurrency}` }),
         );
@@ -637,13 +665,17 @@ export async function buildApp(deps: AppDeps) {
       api.get('/conversions/by-key/:key', async (request) => {
         const context = await companyOf(request);
         const key = parse(schemas.idempotencyKey, (request.params as { key: string }).key);
-        return withProvider(context, (provider) => provider.findConversionByIdempotencyKey(key));
+        const conversion = await withProvider(context, (provider) => provider.findConversionByIdempotencyKey(key));
+        if (!conversion) return conversion;
+        // Found at the provider: if this server's record of it was left open (the answer was lost), it is closed now.
+        const record = (await rates.completeBooking(`${context.company.id}:${keyHash(key)}`, conversion)) ?? (await rates.recordFor(context.company.id, keyHash(key)));
+        return rates.present(conversion, record);
       });
       api.get('/forwards', async (request) => {
         const context = await companyOf(request);
         const provider = await providerOf(context);
         const items = provider.capabilities.forwardContracts ? await withProvider(context, () => provider.listForwardContracts()) : [];
-        return { items, truncated: false };
+        return { items: await Promise.all(items.map((item) => rates.presentById(context.company.id, item))), truncated: false };
       });
 
       // --- Payees and payments ------------------------------------------------
@@ -773,7 +805,7 @@ export async function buildApp(deps: AppDeps) {
     { prefix: '/v1' },
   );
 
-  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, notices, authenticatorResets, now, limitAttempts });
+  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, notices, authenticatorResets, rates, now, limitAttempts });
   // Null when no ADMIN_TOKEN is set: the operator commands are then off.
   const admin = config.adminToken ? await buildAdminApp({ config, stores: deps.stores, auth, opsAuth, mail, now }) : null;
 
@@ -793,5 +825,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets };
+  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets, rates };
 }

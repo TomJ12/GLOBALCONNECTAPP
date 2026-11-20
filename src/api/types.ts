@@ -160,11 +160,20 @@ export interface PageRequest {
 
 // --- Rates and conversions --------------------------------------------------
 
-/** `rate` is how many units of `quote` one unit of `base` buys. */
+/**
+ * `rate` is how many units of `quote` one unit of `base` is worth.
+ *
+ * From the Global Connect server this is THE CUSTOMER'S OWN RATE, and there
+ * are two of them: `rate` is what they get when they SELL the base currency,
+ * `buyRate` what they pay when they BUY it. `indicative` says it is not a
+ * held rate. (Without `buyRate`, both directions use `rate`.)
+ */
 export interface RatePair {
   base: CurrencyCode;
   quote: CurrencyCode;
   rate: DecimalString;
+  buyRate?: DecimalString;
+  indicative?: boolean;
   asOf: IsoDateTime;
 }
 
@@ -234,6 +243,8 @@ export interface BookConversionRequest {
   quote: Quote;
   /** Same key on a retry means the provider must not book twice. */
   idempotencyKey: string;
+  /** SERVER ONLY: the customer's side of the trade when it differs from the provider's quote. */
+  clientTerms?: { sellAmount: DecimalString; buyAmount: DecimalString };
 }
 
 export interface ForwardContract {

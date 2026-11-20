@@ -61,6 +61,13 @@ export interface MarginConfig {
 
 export class MarginError extends Error {}
 
+/**
+ * One pair has two spellings: selling the base of GBPUSD is buying the base of USDGBP. An override written
+ * either way covers both, so a rate asked for "the other way round" can never slip past it.
+ */
+const flip = (direction: Direction): Direction => (direction === 'sell' ? 'buy' : 'sell');
+const canonical = (pair: string, direction: Direction): string => (pair.slice(0, 3) < pair.slice(3) ? `${pair}:${direction}` : `${pair.slice(3)}${pair.slice(0, 3)}:${flip(direction)}`);
+
 const isBps = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value);
 
 /**
@@ -83,8 +90,8 @@ export function checkMarginConfig(config: MarginConfig, allowHigh: boolean): Mar
     if (!/^[A-Z]{6}$/.test(item.pair) || item.pair.slice(0, 3) === item.pair.slice(3)) throw new MarginError(`“${String(item.pair).slice(0, 12)}” is not a currency pair. Write it base first, like GBPUSD.`);
     if (item.direction !== 'sell' && item.direction !== 'buy' && item.direction !== 'both') throw new MarginError(`The direction for ${item.pair} must be sell, buy or both.`);
     for (const direction of item.direction === 'both' ? (['sell', 'buy'] as const) : [item.direction]) {
-      if (seen.has(`${item.pair}:${direction}`)) throw new MarginError(`${item.pair} (${direction}) is listed twice.`);
-      seen.add(`${item.pair}:${direction}`);
+      if (seen.has(canonical(item.pair, direction))) throw new MarginError(`${item.pair} (${direction}) is listed twice. (Selling the base of GBPUSD is the same trade as buying the base of USDGBP.)`);
+      seen.add(canonical(item.pair, direction));
     }
     return { pair: item.pair, direction: item.direction, bps: bps(item.bps, `The margin for ${item.pair}`) };
   });
@@ -106,13 +113,15 @@ export function checkMarginConfig(config: MarginConfig, allowHigh: boolean): Mar
 /**
  * The margin, in basis points, for one trade. In order: forwards use the
  * forward margin if one is set; otherwise an override for this pair and
- * direction; otherwise the tier for the amount; otherwise the default.
+ * direction (in either spelling of the pair); otherwise the tier for the
+ * amount; otherwise the default.
  * `baseAmount` is the trade's size in the pair's base currency; without one
  * (an indicative rate, which is for no particular amount) no tier applies.
  */
 export function marginBps(config: MarginConfig, trade: { pair: string; direction: Direction; kind: 'spot' | 'forward'; baseAmount?: string | null }): number {
   if (trade.kind === 'forward' && config.forwardBps !== null) return config.forwardBps;
-  const override = config.overrides.find((item) => item.pair === trade.pair && (item.direction === 'both' || item.direction === trade.direction));
+  const wanted = canonical(trade.pair, trade.direction);
+  const override = config.overrides.find((item) => (item.direction === 'both' ? (['sell', 'buy'] as const) : [item.direction]).some((direction) => canonical(item.pair, direction) === wanted));
   if (override) return override.bps;
   if (trade.baseAmount) {
     const amount = new Big(trade.baseAmount);

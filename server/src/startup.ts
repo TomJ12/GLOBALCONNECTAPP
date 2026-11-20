@@ -112,8 +112,8 @@ export function createRuntime(config: Config, options: RuntimeOptions = {}): Run
     });
   }
   const registry = new ProviderRegistry({
-    currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: options.transports?.currencycloud, now: options.now, ignorePayeeFields: config.payeeDigestIgnore.currencycloud }),
-    equals: equalsFactory({ credentials: config.providers.equals, transport: options.transports?.equals, keys: stores.providerKeys, now: options.now, ignorePayeeFields: config.payeeDigestIgnore.equals }),
+    currencycloud: currencycloudFactory({ credentials: config.providers.currencycloud, transport: options.transports?.currencycloud, now: options.now, ignorePayeeFields: config.payeeDigestIgnore.currencycloud, movingRates: config.mockMovingRates }),
+    equals: equalsFactory({ credentials: config.providers.equals, transport: options.transports?.equals, keys: stores.providerKeys, now: options.now, ignorePayeeFields: config.payeeDigestIgnore.equals, movingRates: config.mockMovingRates }),
   });
   const mocked = registry.mocked();
   if (config.strict && mocked.length > 0) {

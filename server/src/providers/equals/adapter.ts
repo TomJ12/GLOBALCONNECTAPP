@@ -332,11 +332,11 @@ export class EqualsAdapter implements ProviderAdapter {
       status: raw.status === 'complete' ? 'settled' : raw.status === 'cancelled' ? 'cancelled' : 'pending',
       sellCurrency: raw.quote.from.currency,
       buyCurrency: raw.quote.to.currency,
-      sellAmount: money(raw.quote.from.amount, raw.quote.from.currency),
-      buyAmount: money(raw.quote.to.amount, raw.quote.to.currency),
+      sellAmount: money(raw.clientAmounts?.from ?? raw.quote.from.amount, raw.quote.from.currency),
+      buyAmount: money(raw.clientAmounts?.to ?? raw.quote.to.amount, raw.quote.to.currency),
       rateBase: raw.quote.from.currency,
       rateQuote: raw.quote.to.currency,
-      rate: new Big(raw.quote.rate).toFixed(4),
+      rate: raw.clientAmounts ? new Big(raw.clientAmounts.to).div(raw.clientAmounts.from).round(6, Big.roundDown).toFixed(6) : new Big(raw.quote.rate).toFixed(4),
       settlementDate: isoDate(raw.settlement.date),
       createdAt: raw.createdAt,
     };
@@ -347,7 +347,11 @@ export class EqualsAdapter implements ProviderAdapter {
     if (!orderId) throw new ProviderError('quote_expired');
     // Remembered BEFORE sending, so a lost reply can still be reconciled by key.
     await this.remember('key', request.idempotencyKey, orderId);
-    return this.mapTrade(await this.call(rawTradeOrder, 'POST', '/v2/orders/trade', {}, { orderId, quoteRequestId: request.quote.id }));
+    // `clientAmounts` is INVENTED: this provider's public API has no way for a partner to set the client's side of
+    // a trade. It exists so that the server-side margin works against the mock. How the margin is really collected
+    // with this provider (or whether it must be configured on their side: MARGIN_APPLIED_BY_EQUALS=provider) is open.
+    const client = request.clientTerms ? { clientAmounts: { from: wireAmount(request.clientTerms.sellAmount), to: wireAmount(request.clientTerms.buyAmount) } } : {};
+    return this.mapTrade(await this.call(rawTradeOrder, 'POST', '/v2/orders/trade', {}, { orderId, quoteRequestId: request.quote.id, ...client }));
   }
 
   async findConversionByIdempotencyKey(idempotencyKey: string): Promise<Conversion | null> {
@@ -457,10 +461,12 @@ export interface EqualsFactoryOptions {
   now?: () => number;
   /** Recipient fields left out of the payee digest, beyond PAYEE_DIGEST_IGNORED. */
   ignorePayeeFields?: string[];
+  /** MOCK ONLY: the sample rates move over time. */
+  movingRates?: boolean;
 }
 
 export function equalsFactory(options: EqualsFactoryOptions): ProviderFactory {
-  const transport = options.transport ?? new MockEqualsServer({ now: options.now });
+  const transport = options.transport ?? new MockEqualsServer({ now: options.now, movingRates: options.movingRates });
   return {
     mock: options.transport === undefined || options.transport instanceof MockEqualsServer,
     async forCompany(company) {

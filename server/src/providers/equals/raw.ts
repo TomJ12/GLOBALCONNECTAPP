@@ -102,7 +102,8 @@ export const rawPaymentOrder = z.object({
 export const rawPaymentOrders = list(rawPaymentOrder);
 
 /** INVENTED: GET /v2/orders/{orderId}, the booked trade behind an order id. */
-export const rawTradeOrder = rawOrderQuote.extend({ status: z.string(), createdAt: z.string() });
+/** `clientAmounts` is INVENTED (see the adapter's bookConversion): the partner's own terms for the client. */
+export const rawTradeOrder = rawOrderQuote.extend({ status: z.string(), createdAt: z.string(), clientAmounts: z.object({ from: z.number(), to: z.number() }).optional() });
 
 /** INVENTED: GET /v2/activity */
 export const rawActivity = list(

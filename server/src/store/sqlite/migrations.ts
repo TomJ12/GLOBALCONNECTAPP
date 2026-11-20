@@ -146,4 +146,11 @@ CREATE TABLE authenticator_resets (key TEXT PRIMARY KEY, data TEXT NOT NULL) STR
 CREATE INDEX authenticator_resets_user ON authenticator_resets (json_extract(data, '$.userId'));
 CREATE INDEX authenticator_resets_status ON authenticator_resets (json_extract(data, '$.status'));
 `,
+  // 8: each company's FX margin, and what was earned on each conversion. Server-side only.
+  `
+CREATE TABLE company_margins (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE TABLE fx_revenue (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX fx_revenue_company ON fx_revenue (json_extract(data, '$.companyId'));
+CREATE INDEX fx_revenue_conversion ON fx_revenue (json_extract(data, '$.conversionId'));
+`,
 ];

@@ -8,6 +8,7 @@
  * APP_ENV=development is set explicitly. `npm run demo` sets it. Leaving
  * NODE_ENV unset does NOT make the server lenient.
  */
+import { MARGIN_USUAL_MAX_BPS } from './rates/margin';
 import type { SmtpSettings } from './mail/smtp';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
@@ -40,6 +41,19 @@ export interface Config {
   paymentReconcileMs: number;
   /** Payee fields left out of the payee digest for each provider, beyond the adapter's own short list (PAYEE_DIGEST_IGNORE_CURRENCYCLOUD / _EQUALS). */
   payeeDigestIgnore: { currencycloud: string[]; equals: string[] };
+  /**
+   * Where Global Connect's FX margin is applied, per provider (MARGIN_APPLIED_BY_CURRENCYCLOUD / _EQUALS).
+   * `server`: this server works out the client's rate from the provider's (rates/margin.ts).
+   * `provider`: the provider already returns the client's rate, with the markup configured on its side, so the
+   * server adds NOTHING.
+   */
+  marginAppliedBy: { currencycloud: 'server' | 'provider'; equals: 'server' | 'provider' };
+  /** The margin, in basis points, for a company that has no margin configuration of its own (DEFAULT_MARGIN_BPS). */
+  defaultMarginBps: number;
+  /** How long a provider's rate for a pair is reused for indicative rates and alerts (RATE_CACHE_SECONDS, default 5). */
+  rateCacheMs: number;
+  /** MOCK providers only: the sample rates move over time (MOCK_MOVING_RATES, default on). */
+  mockMovingRates: boolean;
   /** Only with APP_ENV=development. */
   development: boolean;
   /** Everything else. */
@@ -315,7 +329,24 @@ export function loadConfig(env: Env = process.env): Config {
     return names;
   };
 
+  const appliedBy = (name: string): 'server' | 'provider' => {
+    const value = env[name] ?? 'server';
+    if (value !== 'server' && value !== 'provider') throw new Error(`${name} must be "server" (this server applies the margin) or "provider" (the provider's rate already includes it).`);
+    return value;
+  };
+  // PLACEHOLDER figure in development (a sample, not Global Connect's pricing). Outside development there is no
+  // default: a company without its own configuration would otherwise trade at a margin nobody chose.
+  if (strict && env.DEFAULT_MARGIN_BPS === undefined) throw new Error('DEFAULT_MARGIN_BPS must be set: the margin, in basis points, for a company with no margin configuration of its own (0 is allowed, but it has to be said).');
+  const defaultMarginBps = Number(env.DEFAULT_MARGIN_BPS ?? 50);
+  if (!Number.isInteger(defaultMarginBps) || defaultMarginBps < 0 || defaultMarginBps > MARGIN_USUAL_MAX_BPS) throw new Error(`DEFAULT_MARGIN_BPS must be a whole number of basis points between 0 and ${MARGIN_USUAL_MAX_BPS}.`);
+  const rateCacheSeconds = Number(env.RATE_CACHE_SECONDS ?? 5);
+  if (!(rateCacheSeconds >= 0 && rateCacheSeconds <= 300)) throw new Error('RATE_CACHE_SECONDS must be a number of seconds between 0 and 300 (default 5).');
+
   return {
+    marginAppliedBy: { currencycloud: appliedBy('MARGIN_APPLIED_BY_CURRENCYCLOUD'), equals: appliedBy('MARGIN_APPLIED_BY_EQUALS') },
+    defaultMarginBps,
+    rateCacheMs: Math.round(rateCacheSeconds * 1000),
+    mockMovingRates: env.MOCK_MOVING_RATES !== '0',
     authenticatorResetDelayMs: Math.round(resetDelayHours * 60 * 60_000),
     paymentReconcileMs: Math.round(reconcileHours * 60 * 60_000),
     payeeDigestIgnore: { currencycloud: fieldList(env.PAYEE_DIGEST_IGNORE_CURRENCYCLOUD), equals: fieldList(env.PAYEE_DIGEST_IGNORE_EQUALS) },

@@ -49,6 +49,7 @@ import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate
 import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type ApprovalsRequired, type AuditInput, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { h, Html, layout, qrSvg, when } from './html';
+import type { ClientRates } from '../rates/service';
 
 export interface OpsDeps {
   config: Config;
@@ -59,6 +60,7 @@ export interface OpsDeps {
   mail: MailQueue;
   notices: SecurityNotices;
   authenticatorResets: AuthenticatorResets;
+  rates: ClientRates;
   now: () => number;
   limitAttempts: (request: FastifyRequest) => Promise<void>;
 }

@@ -92,7 +92,7 @@ test('configuration: SMTP needs a from-address and TLS; without TLS only a mail 
   // No TLS: never to another machine, and never outside development.
   assert.throws(() => dev({ SMTP_HOST: 'smtp.mail.example', MAIL_FROM: 'a@b.example', SMTP_TLS: 'off' }), /SMTP_TLS=off is refused/);
   assert.equal(dev({ SMTP_HOST: '127.0.0.1', MAIL_FROM: 'a@b.example', SMTP_TLS: 'off' }).smtp?.tls, 'off');
-  const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: OPS, SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/gc/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
+  const LIVE = { DEFAULT_MARGIN_BPS: '40', CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: OPS, SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/gc/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
   assert.throws(() => loadConfig({ ...LIVE, SMTP_HOST: '127.0.0.1', MAIL_FROM: 'a@b.example', SMTP_TLS: 'off' }), /SMTP_TLS=off is refused/);
   // Outside development: no mailer, no start; with SMTP the mailer is real, and the server then stops at the mock providers, as before.
   assert.throws(() => createRuntime(loadConfig(LIVE)), /No mailer is configured[^]*SMTP_HOST/);

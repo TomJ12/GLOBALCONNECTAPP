@@ -110,7 +110,7 @@ export function listResult<T>(item: z.ZodType<T>): z.ZodType<ListResult<T>> {
   return z.object({ items: z.array(item), truncated: z.boolean() });
 }
 
-export const ratePair: z.ZodType<RatePair> = z.object({ base: currency, quote: currency, rate: decimal, asOf: text });
+export const ratePair: z.ZodType<RatePair> = z.object({ base: currency, quote: currency, rate: decimal, buyRate: decimal.optional(), indicative: z.boolean().optional(), asOf: text });
 export const rateHistory: z.ZodType<RateHistory> = z.object({
   base: currency,
   quote: currency,

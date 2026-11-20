@@ -7,6 +7,8 @@
  */
 import type { Beneficiary, StepUpAction, UserRole } from '@/api/types';
 
+import type { MarginConfig } from '../rates/margin';
+
 export type ProviderKey = 'currencycloud' | 'equals';
 
 export interface UserRecord {
@@ -511,7 +513,58 @@ export interface MailRecord {
   lastError: string | null;
 }
 
+/**
+ * A company's FX margin (rates/margin.ts). SERVER-SIDE ONLY: no client API ever returns any of it. Keyed by the
+ * company id. A company without one uses DEFAULT_MARGIN_BPS.
+ */
+export interface MarginRecord extends MarginConfig {
+  companyId: string;
+  updatedAt: number;
+  /** The staff member who asked for the change and the one who approved it (emails). */
+  updatedBy: string;
+  approvedBy: string | null;
+}
+
+/**
+ * What Global Connect earned on one conversion. SERVER-SIDE ONLY, for ops admins. Written BEFORE the provider is
+ * asked to book (status `booking`), so a booking whose answer was lost is still on record, and completed after.
+ */
+export interface RevenueRecord {
+  /** `${companyId}:${hash of the idempotency key}`. */
+  key: string;
+  companyId: string;
+  userId: string;
+  quoteId: string;
+  conversionId: string | null;
+  status: 'booking' | 'booked' | 'failed';
+  kind: 'spot' | 'forward';
+  /** Who applied the margin. `provider`: the server added none and does not know the revenue. */
+  appliedBy: 'server' | 'provider';
+  pair: string;
+  direction: 'sell' | 'buy';
+  sellCurrency: string;
+  buyCurrency: string;
+  /** The provider's side of the trade. */
+  providerRate: string;
+  providerSellAmount: string;
+  providerBuyAmount: string;
+  /** The client's side. */
+  clientRate: string;
+  clientSellAmount: string;
+  clientBuyAmount: string;
+  marginBps: number | null;
+  /** The difference, in the currency it arises in (the side the client did not fix). Null when the provider applies the margin. */
+  revenueAmount: string | null;
+  revenueCurrency: string | null;
+  /** True when the provider's answer did not carry the client's terms it was sent: needs a person to look. */
+  mismatch: boolean;
+  createdAt: number;
+  bookedAt: number | null;
+}
+
 export interface Stores {
+  margins: Table<MarginRecord>;
+  revenue: Table<RevenueRecord>;
   mail: Table<MailRecord>;
   payments: HeldPaymentStore;
   directory: Directory;

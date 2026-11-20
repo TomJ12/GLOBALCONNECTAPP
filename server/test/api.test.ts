@@ -327,7 +327,7 @@ test('step-up: approve, reject and add payee need it; conversions do not unless 
   const booked = await h.call('POST', '/v1/conversions', { token: amira.token, body: { quoteId: quote.id }, headers: { 'idempotency-key': 'conv-key-0001' } });
   assert.equal(booked.status, 200);
   schemas.conversion.parse(booked.json);
-  assert.equal(booked.json.buyAmount, '1300.00');
+  assert.equal(booked.json.buyAmount, '1293.50'); // the CLIENT's amount: 1,000 at 1.3000 less the sample 50 bp margin
   assert.equal((await h.call('GET', '/v1/conversions/by-key/conv-key-0001', { token: amira.token })).json.id, booked.json.id);
   await h.close();
 
@@ -378,7 +378,7 @@ test('the second provider: payee, stepped-up payment, idempotent retry and a con
   assert.deepEqual(tooMuch.json, { error: { kind: 'insufficient_funds' } });
 
   const quote = (await h.call('POST', '/v1/quotes', { token: ben.token, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'EUR', fixedSide: 'buy', amount: '1180.00' } })).json;
-  assert.equal(schemas.quote.parse(quote).sellAmount, '1000.00');
+  assert.equal(schemas.quote.parse(quote).sellAmount, '1005.03'); // 1,180 / (1.18 less 50 bp), rounded up
   const book = () => h.call('POST', '/v1/conversions', { token: ben.token, body: { quoteId: quote.id }, headers: { 'idempotency-key': 'conv-ben-0001' } });
   const booked = await book();
   assert.equal(booked.status, 200);
@@ -386,7 +386,7 @@ test('the second provider: payee, stepped-up payment, idempotent retry and a con
   assert.equal((await h.call('GET', '/v1/conversions/by-key/conv-ben-0001', { token: ben.token })).json.id, booked.json.id);
   assert.equal((await h.call('GET', '/v1/conversions/by-key/conv-ben-9999', { token: ben.token })).json, null);
   const gbp = (await h.call('GET', '/v1/balances', { token: ben.token })).json.items.find((row: any) => row.currency === 'GBP');
-  assert.equal(gbp.amount, '47250.75');
+  assert.equal(gbp.amount, '47245.72');
 
   // A quote that has run out is refused with the neutral kind.
   const late = (await h.call('POST', '/v1/quotes', { token: ben.token, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'EUR', fixedSide: 'sell', amount: '10.00' } })).json;

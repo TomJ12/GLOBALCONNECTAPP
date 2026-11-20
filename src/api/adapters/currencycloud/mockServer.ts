@@ -11,6 +11,7 @@
 import { Big } from 'big.js';
 
 import { currencyDecimals } from '../../../lib/money';
+import { walkedRate } from '../mockRateWalk';
 import type { MockControls } from '../../mockControls';
 import type { Transport, TransportParams, TransportRequest, TransportResponse } from './transport';
 
@@ -79,6 +80,8 @@ export interface MockServerOptions {
   random?: () => number;
   /** Put into every id this instance generates, so several instances never produce the same id. */
   idNamespace?: string;
+  /** The sample rates move over time (see mockRateWalk.ts). Off unless asked for: tests rely on fixed rates. */
+  movingRates?: boolean;
 }
 
 function one(params: TransportParams | undefined, key: string): string | undefined {
@@ -138,11 +141,13 @@ export class MockCurrencycloudServer implements Transport {
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly idNamespace: string;
+  private readonly movingRates: boolean;
   private state: State;
 
   constructor(options: MockServerOptions) {
     this.idNamespace = options.idNamespace ?? '';
     this.getControls = options.getControls;
+    this.movingRates = options.movingRates ?? false;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
     this.state = this.seed();
@@ -416,8 +421,9 @@ export class MockCurrencycloudServer implements Transport {
   /** Rate for any orientation; the inverse of a convention pair is derived, not stored. */
   private rateBetween(base: string, quote: string): Big {
     const convention = pairFor(base, quote);
-    if (convention.base === base) return rateFor(base, quote);
-    return new Big(UNITS_PER_GBP[quote] ?? '1').div(new Big(UNITS_PER_GBP[base] ?? '1')).round(6, Big.roundHalfUp);
+    const places = convention.base === base ? 4 : 6;
+    const sample = convention.base === base ? rateFor(base, quote) : new Big(UNITS_PER_GBP[quote] ?? '1').div(new Big(UNITS_PER_GBP[base] ?? '1'));
+    return (this.movingRates ? walkedRate(base, quote, sample, this.now()) : sample).round(places, Big.roundHalfUp);
   }
 
   private rateHistory(params: TransportParams | undefined): TransportResponse {
@@ -460,7 +466,7 @@ export class MockCurrencycloudServer implements Transport {
     }
 
     const { base, quote } = pairFor(buy, sell);
-    const rate = rateFor(base, quote);
+    const rate = this.rateBetween(base, quote);
     const fixed = new Big(amount);
     let sellAmount: Big;
     let buyAmount: Big;
@@ -531,8 +537,16 @@ export class MockCurrencycloudServer implements Transport {
     }
     const buy = quote.buy_currency ?? '';
     const sell = quote.sell_currency ?? '';
-    const buyAmount = new Big(quote.client_buy_amount ?? '0');
-    const sellAmount = new Big(quote.client_sell_amount ?? '0');
+    // The partner may set the CLIENT's side of the trade (its own margin on top of the quote). It can only make
+    // the client's terms worse than the quote, never better. Balances move by the client's amounts.
+    const clientBuy = one(params, 'client_buy_amount') ?? quote.client_buy_amount ?? '0';
+    const clientSell = one(params, 'client_sell_amount') ?? quote.client_sell_amount ?? '0';
+    if (!isDecimal(clientBuy) || new Big(clientBuy).lte(0) || new Big(clientBuy).gt(quote.client_buy_amount ?? '0')) return bad('client_buy_amount', 'client_buy_amount_is_out_of_range');
+    if (!isDecimal(clientSell) || new Big(clientSell).lt(quote.client_sell_amount ?? '0')) return bad('client_sell_amount', 'client_sell_amount_is_out_of_range');
+    const buyAmount = new Big(clientBuy);
+    const sellAmount = new Big(clientSell);
+    const sellsBase = (quote.currency_pair ?? '').startsWith(sell);
+    const clientRate = clientBuy === quote.client_buy_amount && clientSell === quote.client_sell_amount ? (quote.client_rate ?? '0') : (sellsBase ? buyAmount.div(sellAmount) : sellAmount.div(buyAmount)).round(6, Big.roundHalfUp).toFixed(6);
     const isForward = stored.conversionDate !== null;
 
     if (!isForward && this.balanceRow(sell).amount.lt(sellAmount)) {
@@ -557,18 +571,18 @@ export class MockCurrencycloudServer implements Transport {
       fixed_side: quote.fixed_side,
       partner_buy_amount: quote.client_buy_amount,
       partner_sell_amount: quote.client_sell_amount,
-      client_buy_amount: quote.client_buy_amount,
-      client_sell_amount: quote.client_sell_amount,
+      client_buy_amount: money(buyAmount, buy),
+      client_sell_amount: money(sellAmount, sell),
       mid_market_rate: quote.client_rate,
       core_rate: quote.client_rate,
       partner_rate: quote.client_rate,
-      client_rate: quote.client_rate,
+      client_rate: clientRate,
       deposit_required: false,
       deposit_amount: '0.00',
       deposit_currency: sell,
       deposit_status: 'not_required',
       deposit_required_at: '',
-      unallocated_funds: quote.client_buy_amount,
+      unallocated_funds: money(buyAmount, buy),
       payment_ids: [],
       unique_request_id: uniqueRequestId ?? '',
       created_at: this.iso(),
