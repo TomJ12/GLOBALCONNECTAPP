@@ -6,7 +6,7 @@ import { loadConfig } from '../src/config';
 import { ConsoleOutbox } from '../src/mailer';
 import { MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue } from '../src/mail/queue';
 import { SmtpMailer, failureCode } from '../src/mail/smtp';
-import { activationMail, MAIL_FOOTER, render, SECURITY_NOTICES, TEMPLATES, type TemplateName } from '../src/mail/templates';
+import { activationMail, MAIL_FOOTER, NOTIFICATIONS, notificationText, render, SECURITY_NOTICES, TEMPLATES, type NotificationKind, type TemplateName } from '../src/mail/templates';
 import { createRuntime } from '../src/startup';
 import { harness, type Harness } from './helpers';
 import { FakeSmtp } from './support/smtp';
@@ -25,6 +25,8 @@ const OPS = 'https://ops.globalconnect.example';
 const LINK = `${APP}/activate#code=ABCDE-FGHIJ-KLMNO-PQRST`;
 const settings = (port: number, extra: Record<string, string> = {}) => loadConfig({ APP_ENV: 'development', SMTP_HOST: '127.0.0.1', SMTP_PORT: String(port), SMTP_TLS: 'off', MAIL_FROM: 'no-reply@globalconnect.example', MAIL_REPLY_TO: 'help@globalconnect.example', ...extra }).smtp as NonNullable<ReturnType<typeof loadConfig>['smtp']>;
 
+const PAYMENT_NOTE = { amount: '125.00', currency: 'GBP', payee: 'Harbour Freight Ltd', createdBy: 'Amira Shah', expiresAt: 86_400_000, by: 'Dana Okafor', reason: 'Wrong invoice' };
+const ALERT_NOTE = { base: 'GBP', quote: 'USD', side: 'sell' as const, target: '1.2940', rate: '1.2950', at: 0 };
 /** One of each template, with values that would be embarrassing in a subject line. Adding a template without adding it here does not compile. */
 const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'activation.client': { name: 'Amira Shah', link: LINK, expiresAt: 0 },
@@ -32,10 +34,14 @@ const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'reset.client': { name: 'Amira Shah', link: `${APP}/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
   'reset.staff': { name: 'Amira Shah', link: `${OPS}/ops/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
   'security.notice': { name: 'Amira Shah', audience: 'client', kind: 'password_changed', at: 0 },
+  notification: { name: 'Amira Shah', kind: 'payment_awaiting', note: PAYMENT_NOTE },
 };
 /** Every variant of every template: each security notice is its own wording. */
 const VARIANTS: [TemplateName, unknown][] = (Object.keys(TEMPLATES) as TemplateName[]).flatMap((name): [TemplateName, unknown][] =>
-  name === 'security.notice' ? (Object.keys(SECURITY_NOTICES) as (keyof typeof SECURITY_NOTICES)[]).flatMap((kind) => (['client', 'staff'] as const).map((audience): [TemplateName, unknown] => [name, { name: 'Amira Shah', audience, kind, at: 0, until: 86_400_000 }])) : [[name, SAMPLES[name]]],
+  name === 'security.notice' ? (Object.keys(SECURITY_NOTICES) as (keyof typeof SECURITY_NOTICES)[]).flatMap((kind) => (['client', 'staff'] as const).map((audience): [TemplateName, unknown] => [name, { name: 'Amira Shah', audience, kind, at: 0, until: 86_400_000 }]))
+    : name === 'notification'
+      ? (Object.keys(NOTIFICATIONS) as NotificationKind[]).map((kind): [TemplateName, unknown] => [name, { name: 'Amira Shah', kind, note: kind === 'rate_alert' ? ALERT_NOTE : PAYMENT_NOTE }])
+      : [[name, SAMPLES[name]]],
 );
 
 /** A queue over a harness's database, sending through `transport`, on the harness's clock. */
@@ -77,6 +83,24 @@ test('templates: every message has a harmless subject, the same lines as text an
   assert.equal(hostile.text.split('\n')[0], 'Hello Eve Bcc: x@evil.example <b onmouseover=x>"&,');
   assert.match(hostile.html, /Hello Eve Bcc: x@evil\.example &lt;b onmouseover=x&gt;&quot;&amp;,/);
   assert.doesNotMatch(hostile.html, /<b /);
+
+  // NOTIFICATIONS. What a colleague typed (a reason, a payee's name) cannot start a line, become a link or become markup; no bank details; no promise.
+  const rejected = render('notification', { name: 'Amira Shah', kind: 'payment_rejected', note: { ...PAYMENT_NOTE, payee: 'Harbour <b>Freight</b>\r\nBcc: x@evil.example', reason: 'see https://evil.example/pay now\nand <script>alert(1)</script>' } }, [APP, OPS]);
+  assert.match(rejected.text, /Your payment of GBP 125\.00 to Harbour <b>Freight<\/b> Bcc: x@evil\.example was rejected by Dana Okafor\. It was not sent\.\nReason given: “see evil\.example\/pay now and <script>alert\(1\)<\/script>”/);
+  assert.doesNotMatch(rejected.text, /https?:/);
+  assert.doesNotMatch(rejected.html, /<script|<b>/);
+  assert.match(rejected.html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(render('notification', { name: 'A', kind: 'payment_rejected', note: { ...PAYMENT_NOTE, reason: null } }, [APP, OPS]).text, /No reason was given\./);
+  const alert = render('notification', { name: 'Amira Shah', kind: 'rate_alert', note: ALERT_NOTE }, [APP, OPS]).text;
+  assert.match(alert, /Your rate to sell GBP for USD reached 1\.2950 when we checked at 1970-01-01 00:00 UTC\. Your alert was set at 1\.2940 or better\.\nThis rate is indicative: it is not held for you and it may have moved since\./);
+  assert.match(render('notification', { name: 'A', kind: 'rate_alert', note: { ...ALERT_NOTE, side: 'buy' } }, [APP, OPS]).text, /Your rate to buy GBP with USD reached/);
+  for (const kind of Object.keys(NOTIFICATIONS) as NotificationKind[]) {
+    const { title, lines } = notificationText(kind, kind === 'rate_alert' ? ALERT_NOTE : PAYMENT_NOTE);
+    const words = [title, ...lines].join(' ');
+    assert.doesNotMatch(words, /sort code|account number|IBAN|SWIFT|BIC|guarantee|will arrive|within \d|mid-market|margin/i, kind);
+    assert.ok(title.length <= 80 && !/[\r\n]/.test(words), kind);
+  }
+  assert.match(notificationText('payment_awaiting', PAYMENT_NOTE).lines.join(' '), /Amira Shah created a payment of GBP 125\.00 to Harbour Freight Ltd\. It has not been sent\. It needs approval before 1970-01-02 00:00 UTC/);
 });
 
 test('configuration: SMTP needs a from-address and TLS; without TLS only a mail server on this machine in development; strict accepts SMTP as its mailer and still refuses mock providers', () => {

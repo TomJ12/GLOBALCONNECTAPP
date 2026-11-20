@@ -16,6 +16,9 @@ import type {
   LoginChallengeRecord,
   MailRecord,
   MarginRecord,
+  NotificationPrefsRecord,
+  NotificationRecord,
+  RateAlertRecord,
   RevenueRecord,
   PasswordResetRecord,
   AuthenticatorResetRecord,
@@ -261,6 +264,9 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const authenticatorResets = new SqlTable<AuthenticatorResetRecord>(db, 'authenticator_resets', { indexed: ['userId', 'status'], audit });
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
   const mail = new SqlTable<MailRecord>(db, 'mail_outbox', { indexed: ['status'], secret: { field: 'body', keys } });
+  const alerts = new SqlTable<RateAlertRecord>(db, 'rate_alerts', { indexed: ['userId', 'status'], audit });
+  const notifications = new SqlTable<NotificationRecord>(db, 'notifications', { indexed: ['userId'], secret: { field: 'body', keys }, audit });
+  const notificationPrefs = new SqlTable<NotificationPrefsRecord>(db, 'notification_prefs', { audit });
   const margins = new SqlTable<MarginRecord>(db, 'company_margins', { audit });
   const revenue = new SqlTable<RevenueRecord>(db, 'fx_revenue', { indexed: ['companyId', 'conversionId'] });
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
@@ -276,6 +282,9 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const IDLE_COUNTER_MS = 2 * 60 * 60_000;
   return {
     db,
+    alerts,
+    notifications,
+    notificationPrefs,
     margins,
     revenue,
     mail,
@@ -295,7 +304,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
         audit.resignHead();
         if (state) writeState(db, state);
         // All or nothing: a row that cannot be decrypted throws, naming the row, and the whole rotation is rolled back.
-        changed += activations.rotateSecrets(keys.current.id) + opsActivations.rotateSecrets(keys.current.id) + mail.rotateSecrets(keys.current.id);
+        changed += activations.rotateSecrets(keys.current.id) + opsActivations.rotateSecrets(keys.current.id) + mail.rotateSecrets(keys.current.id) + notifications.rotateSecrets(keys.current.id);
         return changed;
       });
     },

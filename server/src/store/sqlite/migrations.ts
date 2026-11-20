@@ -153,4 +153,13 @@ CREATE TABLE fx_revenue (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 CREATE INDEX fx_revenue_company ON fx_revenue (json_extract(data, '$.companyId'));
 CREATE INDEX fx_revenue_conversion ON fx_revenue (json_extract(data, '$.conversionId'));
 `,
+  // 9: rate alerts (checked by the server), each person's in-app notifications and their notification preferences.
+  `
+CREATE TABLE rate_alerts (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX rate_alerts_user ON rate_alerts (json_extract(data, '$.userId'));
+CREATE INDEX rate_alerts_status ON rate_alerts (json_extract(data, '$.status'));
+CREATE TABLE notifications (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX notifications_user ON notifications (json_extract(data, '$.userId'));
+CREATE TABLE notification_prefs (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+`,
 ];

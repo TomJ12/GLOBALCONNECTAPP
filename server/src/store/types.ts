@@ -562,7 +562,55 @@ export interface RevenueRecord {
   bookedAt: number | null;
 }
 
+/**
+ * A rate alert: "tell me when I can SELL (or BUY) the base currency of this pair at this rate or better". It is
+ * checked against the CLIENT's rate for the company it was made in. It fires once and is then `triggered` until
+ * its owner turns it on again.
+ */
+export interface RateAlertRecord {
+  id: string;
+  userId: string;
+  companyId: string;
+  base: string;
+  quote: string;
+  side: 'sell' | 'buy';
+  targetRate: string;
+  status: 'active' | 'paused' | 'triggered';
+  createdAt: number;
+  /** When it was last turned on. One notification per arming, however often it is checked. */
+  armedAt: number;
+  triggeredAt: number | null;
+  /** The client's rate that set it off. */
+  triggeredRate: string | null;
+}
+
+export type NotificationCategory = 'rates' | 'approvals' | 'payments';
+
+/** One entry in a person's in-app notification list. `body` (what it says, as data for the wording in mail/templates.ts) is stored encrypted. */
+export interface NotificationRecord {
+  id: string;
+  /** A hash of what the notification is about and who it is for: the same event never makes two. */
+  key: string;
+  userId: string;
+  companyId: string | null;
+  category: NotificationCategory;
+  kind: string;
+  body: string;
+  createdAt: number;
+  readAt: number | null;
+}
+
+/** Which categories a person also gets by email. Security notices are not here: they cannot be turned off. */
+export interface NotificationPrefsRecord {
+  userId: string;
+  email: Record<NotificationCategory, boolean>;
+  updatedAt: number;
+}
+
 export interface Stores {
+  alerts: Table<RateAlertRecord>;
+  notifications: Table<NotificationRecord>;
+  notificationPrefs: Table<NotificationPrefsRecord>;
   margins: Table<MarginRecord>;
   revenue: Table<RevenueRecord>;
   mail: Table<MailRecord>;

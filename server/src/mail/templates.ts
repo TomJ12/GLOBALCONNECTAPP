@@ -56,6 +56,85 @@ export const SECURITY_NOTICES = {
 } satisfies Record<string, (data: { until?: number }) => string[]>;
 export type SecurityNotice = keyof typeof SECURITY_NOTICES;
 
+/**
+ * NOTIFICATIONS: what each in-app notification and its email say. The same words are used for both.
+ *
+ * Free text that a person typed (a payee's name, a colleague's name, the reason a payment was rejected) is put on
+ * one line, cut to a length and has any web address scheme removed, so it can neither start a new line nor become
+ * a link. The HTML part of the email escapes it; the app shows it as plain text. NO bank details are ever here.
+ * Nothing promises a rate, a time or an outcome.
+ */
+const typed = (value: string | null | undefined, max = 200): string => singleLine(value ?? '').replace(/[a-z][a-z0-9+.-]*:\/\//gi, '').slice(0, max);
+const sum = (data: { amount: string; currency: string }): string => `${typed(data.currency, 3)} ${typed(data.amount, 24)}`;
+export interface PaymentNote {
+  amount: string;
+  currency: string;
+  payee: string;
+  /** The person who created the payment. */
+  createdBy?: string;
+  /** When a waiting payment runs out. */
+  expiresAt?: number;
+  /** Who rejected it, and the reason they gave (their own words). */
+  by?: string;
+  reason?: string | null;
+}
+export interface AlertNote {
+  base: string;
+  quote: string;
+  side: 'sell' | 'buy';
+  target: string;
+  rate: string;
+  at: number;
+}
+interface NoteText {
+  title: string;
+  lines: string[];
+}
+const payment = (data: PaymentNote): string => `${sum(data)} to ${typed(data.payee, 120)}`;
+export const NOTIFICATIONS = {
+  rate_alert: (data: AlertNote): NoteText => ({
+    title: `Rate alert: ${typed(data.base, 3)}/${typed(data.quote, 3)}`,
+    lines: [
+      `Your rate to ${data.side === 'sell' ? 'sell' : 'buy'} ${typed(data.base, 3)} ${data.side === 'sell' ? 'for' : 'with'} ${typed(data.quote, 3)} reached ${typed(data.rate, 24)} when we checked at ${utc(data.at)}. Your alert was set at ${typed(data.target, 24)} or better.`,
+      'This rate is indicative: it is not held for you and it may have moved since. To convert, open the app and get a rate there.',
+      'This alert has now stopped. Turn it on again in the app if you want to be told the next time.',
+    ],
+  }),
+  payment_awaiting: (data: PaymentNote): NoteText => ({
+    title: 'A payment is waiting for your approval',
+    lines: [`${typed(data.createdBy, 120)} created a payment of ${payment(data)}. It has not been sent.`, `It needs approval before ${utc(data.expiresAt ?? 0)}; after that it expires and is not sent. Open the app to review the payee details and approve or reject it.`],
+  }),
+  payment_expiring: (data: PaymentNote): NoteText => ({
+    title: 'A payment waiting for approval is about to expire',
+    lines: [`The payment of ${payment(data)}, created by ${typed(data.createdBy, 120)}, is still waiting for approval. It has not been sent.`, `It expires ${utc(data.expiresAt ?? 0)}. If it is not approved by then it will not be sent and would have to be created again.`],
+  }),
+  payment_approved: (data: PaymentNote): NoteText => ({ title: 'Your payment was approved', lines: [`Your payment of ${payment(data)} has all the approvals it needs and is being sent for processing.`] }),
+  payment_rejected: (data: PaymentNote): NoteText => ({
+    title: 'Your payment was rejected',
+    lines: [`Your payment of ${payment(data)} was rejected by ${typed(data.by, 120)}. It was not sent.`, data.reason ? `Reason given: “${typed(data.reason, 200)}”` : 'No reason was given.'],
+  }),
+  payment_cancelled: (data: PaymentNote): NoteText => ({ title: 'Your payment was cancelled', lines: [`Your payment of ${payment(data)} was cancelled by ${typed(data.by, 120)} before it was approved. It was not sent.`] }),
+  payment_expired: (data: PaymentNote): NoteText => ({ title: 'Your payment expired', lines: [`Your payment of ${payment(data)} was not approved in time and has expired. It was not sent. Create it again if it is still needed.`] }),
+  payment_stopped: (data: PaymentNote): NoteText => ({ title: 'Your payment was stopped', lines: [`Your payment of ${payment(data)} was stopped because the payee’s details changed after you created it. It was not sent. Check the payee and create the payment again if it is still needed.`] }),
+  payment_sent: (data: PaymentNote): NoteText => ({ title: 'Your payment was sent for processing', lines: [`Your payment of ${payment(data)} was approved and has been sent for processing.`] }),
+  payment_failed: (data: PaymentNote): NoteText => ({ title: 'Your payment needs attention: it was not sent', lines: [`Your payment of ${payment(data)} was approved but could not be sent. No money has left the account for it. Open the app for details.`] }),
+  payment_checking: (data: PaymentNote): NoteText => ({
+    title: 'Your payment needs attention: its outcome is being checked',
+    lines: [`Your payment of ${payment(data)} was approved, but we did not get a clear answer when it was sent, so we do not yet know whether it was made. We are checking.`, `Do NOT create it again. If you need to know now, contact Global Connect: ${MAIL_CONTACT}`],
+  }),
+  payment_mismatch: (data: PaymentNote): NoteText => ({
+    title: 'Your payment needs attention: it was not sent as approved',
+    lines: [`Your payment of ${payment(data)} was sent, but what was sent does not match what was approved. Contact Global Connect: ${MAIL_CONTACT}`],
+  }),
+} satisfies Record<string, (data: never) => NoteText>;
+export type NotificationKind = keyof typeof NOTIFICATIONS;
+export type NotificationData<K extends NotificationKind> = Parameters<(typeof NOTIFICATIONS)[K]>[0];
+/** The words of a notification, from its kind and data. */
+export const notificationText = (kind: NotificationKind, data: unknown): NoteText => (NOTIFICATIONS[kind] as (input: unknown) => NoteText)(data);
+/** The subject of a notification email: which kind of thing it is, and nothing about it. */
+const NOTIFICATION_SUBJECT = (kind: NotificationKind): string =>
+  kind === 'rate_alert' ? 'A rate alert on your Global Connect account' : kind === 'payment_awaiting' || kind === 'payment_expiring' ? 'A payment is waiting for your approval in Global Connect' : 'An update on a payment you created in Global Connect';
+
 export const TEMPLATES = {
   'activation.client': (data: { name: string; link: string; expiresAt: number }): Draft => ({
     subject: 'Activate your Global Connect account',
@@ -110,6 +189,11 @@ export const TEMPLATES = {
   'security.notice': (data: { name: string; audience: 'client' | 'staff'; kind: SecurityNotice; at: number; until?: number }): Draft => ({
     subject: data.audience === 'staff' ? 'Security notice for your Global Connect staff account' : 'Security notice for your Global Connect account',
     lines: [`Hello ${safe(data.name)},`, '', ...SECURITY_NOTICES[data.kind](data), '', `Time: ${utc(data.at)}.`, NOT_YOU],
+  }),
+  // A NOTIFICATION the person can turn off (rate alerts, approvals, their own payments). No link, no code, no bank details.
+  notification: (data: { name: string; kind: NotificationKind; note: unknown }): Draft => ({
+    subject: NOTIFICATION_SUBJECT(data.kind),
+    lines: [`Hello ${safe(data.name)},`, '', ...notificationText(data.kind, data.note).lines, '', 'You can choose which of these emails you get in the app, under Notifications.'],
   }),
 } satisfies Record<string, (data: never) => Draft>;
 
