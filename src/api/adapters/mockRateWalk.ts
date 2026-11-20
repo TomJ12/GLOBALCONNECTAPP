@@ -39,6 +39,6 @@ export function walkOffset(pairKey: string, nowMs: number): number {
 /** The sample rate for base/quote, moved. The inverse pair moves the opposite way, so the two always agree. */
 export function walkedRate(base: string, quote: string, sampleRate: Big, nowMs: number): Big {
   const [first, second] = [base, quote].sort();
-  const factor = new Big(200_000 + walkOffset(`${first}${second}`, nowMs)).div(200_000);
+  const factor = new Big(20_000 + walkOffset(`${first}${second}`, nowMs)).div(20_000);
   return base === first ? sampleRate.times(factor) : sampleRate.div(factor);
 }
