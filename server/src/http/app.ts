@@ -33,6 +33,9 @@ import { emailDomain, hasControlCharacters, isEmail } from '../validate';
 import { isActiveStaff, OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
 import { registerDemoGate } from './demoGate';
+import { RateAlerts } from '../alerts/service';
+import { Notifier } from '../notify/notifier';
+import { PaymentNotifications } from '../notify/payments';
 import { MarginError } from '../rates/margin';
 import { ClientRates, type HeldQuote } from '../rates/service';
 import { HeldPayments, type HeldPaymentsDeps } from '../payments/held';
@@ -427,6 +430,26 @@ export async function buildApp(deps: AppDeps) {
     },
   });
 
+  /** Notifications (in-app list and email), who is told what about held payments, and rate alerts. */
+  const notifier = new Notifier(deps.stores, mail, { now, perUserPerHour: config.notificationsPerUserPerHour, push: null, onError: (message) => app.log.error({ message }, 'notification failed') });
+  const paymentNotes = new PaymentNotifications(deps.stores, notifier, { now, expiryWarningMs: config.paymentExpiryWarningMs, onError: (message) => app.log.error({ message }, 'payment notifications failed') });
+  const alerts = new RateAlerts({
+    stores: deps.stores,
+    rates,
+    notifier,
+    now,
+    perUser: config.alertsPerUser,
+    onError: (message) => app.log.error({ message }, 'rate alert check failed'),
+    withProvider: async (company, run) => {
+      try {
+        return await run(await registry.forCompany(company));
+      } catch (error) {
+        if (isProviderError(error) && error.kind === 'unauthorized') registry.invalidate(company.id);
+        throw error;
+      }
+    },
+  });
+
   const sessionView = async (context: CompanyContext): Promise<Session> => ({
     user: { id: context.user.id, email: context.user.email, displayName: context.user.name },
     company: { id: context.company.id, name: context.company.name },
@@ -678,6 +701,53 @@ export async function buildApp(deps: AppDeps) {
         return { items: await Promise.all(items.map((item) => rates.presentById(context.company.id, item))), truncated: false };
       });
 
+      // --- Rate alerts --------------------------------------------------------------
+      // A person's own alerts in the company they are working in. Checked by the server against the company's
+      // CLIENT rate (alerts/service.ts).
+      const alertId = (request: FastifyRequest): string => parse(z.string().regex(/^alr_[\w-]{1,40}$/), (request.params as { id: string }).id);
+      api.get('/alerts', async (request) => {
+        const context = await companyOf(request);
+        return { items: await alerts.list(context.user, context.company) };
+      });
+      api.post('/alerts', async (request) => {
+        const context = await companyOf(request);
+        const input = parse(z.object({ base: z.string().length(3), quote: z.string().length(3), side: z.enum(['sell', 'buy']), targetRate: z.string().max(20) }).strict(), request.body);
+        return priced(() => alerts.create(context.user, context.company, input, request.ip));
+      });
+      api.post('/alerts/:id', async (request) => {
+        const context = await companyOf(request);
+        const { enabled } = parse(z.object({ enabled: z.boolean() }).strict(), request.body);
+        return alerts.setEnabled(context.user, context.company, alertId(request), enabled, request.ip);
+      });
+      api.post('/alerts/:id/delete', async (request) => {
+        const context = await companyOf(request);
+        await alerts.remove(context.user, context.company, alertId(request), request.ip);
+        return { ok: true };
+      });
+
+      // --- Notifications --------------------------------------------------------------
+      // A person's OWN list, whichever company they are working in. Security notices are not here and cannot be turned off.
+      const prefsView = async (userId: string) => ({ email: await notifier.prefsOf(userId), alwaysOn: ['security'] });
+      api.get('/notifications', async (request) => notifier.list((await sessionOf(request)).user.id));
+      api.post('/notifications/read', async (request) => {
+        const context = await sessionOf(request);
+        const { id } = parse(z.object({ id: z.string().regex(/^ntf_[\w-]{1,40}$/).optional() }).strict(), request.body ?? {});
+        await notifier.markRead(context.user.id, id ?? null);
+        return { ok: true, unread: (await notifier.list(context.user.id, 1)).unread };
+      });
+      api.get('/notifications/preferences', async (request) => prefsView((await sessionOf(request)).user.id));
+      api.post('/notifications/preferences', async (request) => {
+        const context = await sessionOf(request);
+        const { email } = parse(z.object({ email: z.object({ rates: z.boolean(), approvals: z.boolean(), payments: z.boolean() }).strict() }).strict(), request.body);
+        const at = now();
+        await deps.stores.notificationPrefs.mutate(
+          context.user.id,
+          () => ({ userId: context.user.id, email, updatedAt: at }),
+          () => ({ at, actor: partyOf(context.user), target: partyOf(context.user), action: 'client.notification_preferences', outcome: 'success', source: request.ip, detail: { rates: email.rates ? 'on' : 'off', approvals: email.approvals ? 'on' : 'off', payments: email.payments ? 'on' : 'off' } }),
+        );
+        return prefsView(context.user.id);
+      });
+
       // --- Payees and payments ------------------------------------------------
       /**
        * An id from the request is acted on only after it has been found among
@@ -719,11 +789,17 @@ export async function buildApp(deps: AppDeps) {
         // Payments this server is holding (or closed without sending) are not in the provider's list: they lead the first page.
         return page.page === 1 ? { ...sent, items: [...(await held.listPayments(context)), ...sent.items] } : sent;
       });
+      /** After a payment action: whoever is now due a notification about this company's held payments gets it. Never fails the action. */
+      const thenNotify = async <T>(context: CompanyContext, action: Promise<T>): Promise<T> => {
+        const result = await action;
+        await paymentNotes.scan(context.company.id);
+        return result;
+      };
       api.post('/payments', async (request) => {
         const context = await companyOf(request);
         const idempotencyKey = idempotencyKeyOf(request);
         const input = parse(schemas.newPaymentBody, request.body);
-        return audited(
+        return thenNotify(context, audited(
           request,
           context,
           'payment.create',
@@ -742,7 +818,7 @@ export async function buildApp(deps: AppDeps) {
           },
           // A held payment's creation is recorded with the payment itself; here, what the provider made is recorded as it is.
           (payment) => (payment.held ? null : { payment: payment.id, status: payment.status, amount: payment.amount, currency: payment.currency, payee: payment.beneficiaryId }),
-        );
+        ));
       });
       api.get('/payments/by-key/:key', async (request) => {
         const context = await companyOf(request);
@@ -768,7 +844,7 @@ export async function buildApp(deps: AppDeps) {
           const given = action === 'payment.reject' ? ((request.body as { reason?: unknown } | null)?.reason ?? null) : null;
           if (given !== null && (typeof given !== 'string' || given.length > 200 || hasControlCharacters(given))) throw new ApiError('validation', { fields: ['reason'] });
           const note = typeof given === 'string' && given.trim() ? given.trim() : null;
-          return audited(
+          return thenNotify(context, audited(
             request,
             context,
             action,
@@ -783,7 +859,7 @@ export async function buildApp(deps: AppDeps) {
             // Recorded by the service, in the same transaction as the decision. (A repeated "approve" that only reports
             // where the payment has got to changes nothing and is not an approval.)
             () => null,
-          );
+          ));
         }
         // Not held here: a payment that was already pending at the provider. It can be approved or rejected there, not cancelled.
         const provider = await providerOf(context);
@@ -825,5 +901,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets, rates };
+  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets, rates, notifier, paymentNotes, alerts };
 }

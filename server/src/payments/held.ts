@@ -67,7 +67,7 @@ const closeAttempt = (attempts: Attempt[] | undefined, outcome: Attempt['outcome
   return list;
 };
 /** True when some attempt to send it went unanswered: its outcome is being checked. */
-const outcomeUnknown = (record: HeldPaymentRecord): boolean => record.status === 'sending' && (Boolean(record.unconfirmedSince) || (record.attempts ?? []).some((item) => item.outcome === 'unknown' || item.outcome === 'refused'));
+export const outcomeUnknown = (record: HeldPaymentRecord): boolean => record.status === 'sending' && (Boolean(record.unconfirmedSince) || (record.attempts ?? []).some((item) => item.outcome === 'unknown' || item.outcome === 'refused'));
 /** Closed held payments stay in the payments list this long. */
 const SHOWN_MS = 30 * 24 * 60 * 60_000;
 

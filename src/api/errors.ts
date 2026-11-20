@@ -53,7 +53,8 @@ export type ProviderErrorReason =
   | 'payment_expired'
   | 'payee_changed'
   | 'not_awaiting_approval'
-  | 'creator_unavailable';
+  | 'creator_unavailable'
+  | 'too_many_alerts';
 
 const REASON_MESSAGES: Record<ProviderErrorReason, string> = {
   invalid_credentials: 'That email and password do not match an account. Check them and try again.',
@@ -63,6 +64,7 @@ const REASON_MESSAGES: Record<ProviderErrorReason, string> = {
   challenge_expired: 'That took too long. Start again.',
   activation_invalid: 'That activation code is not valid or has expired. Ask Global Connect for a new one.',
   reset_invalid: 'That reset link is not valid any more: it was used, replaced or has expired. Ask for a new one.',
+  too_many_alerts: 'You have the most rate alerts you can have. Delete one to add another.',
   weak_password: 'That password is not allowed. Use at least 12 characters and avoid common passwords.',
   step_up_required: 'This needs a code from your authenticator app. Try again.',
   step_up_invalid: 'The code check for this action has expired or does not match. Try again.',

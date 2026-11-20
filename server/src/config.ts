@@ -54,6 +54,14 @@ export interface Config {
   rateCacheMs: number;
   /** MOCK providers only: the sample rates move over time (MOCK_MOVING_RATES, default on). */
   mockMovingRates: boolean;
+  /** How often rate alerts are checked against each company's client rate (ALERT_CHECK_SECONDS, default 60). */
+  alertCheckMs: number;
+  /** Most rate alerts one person can have (ALERTS_PER_USER, default 20). */
+  alertsPerUser: number;
+  /** How long before a held payment expires its creator and approvers are told (PAYMENT_EXPIRY_WARNING_HOURS, default 6; 0 = never). */
+  paymentExpiryWarningMs: number;
+  /** Most notifications one person is sent in an hour (NOTIFICATIONS_PER_USER_PER_HOUR, default 60). */
+  notificationsPerUserPerHour: number;
   /** Only with APP_ENV=development. */
   development: boolean;
   /** Everything else. */
@@ -342,7 +350,17 @@ export function loadConfig(env: Env = process.env): Config {
   const rateCacheSeconds = Number(env.RATE_CACHE_SECONDS ?? 5);
   if (!(rateCacheSeconds >= 0 && rateCacheSeconds <= 300)) throw new Error('RATE_CACHE_SECONDS must be a number of seconds between 0 and 300 (default 5).');
 
+  const numberOf = (name: string, fallback: number, min: number, max: number, whole = true): number => {
+    const value = Number(env[name] ?? fallback);
+    if (!(value >= min && value <= max) || (whole && !Number.isInteger(value))) throw new Error(`${name} must be a ${whole ? 'whole ' : ''}number between ${min} and ${max} (default ${fallback}).`);
+    return value;
+  };
+
   return {
+    alertCheckMs: numberOf('ALERT_CHECK_SECONDS', 60, 5, 3600) * 1000,
+    alertsPerUser: numberOf('ALERTS_PER_USER', 20, 1, 200),
+    paymentExpiryWarningMs: Math.round(numberOf('PAYMENT_EXPIRY_WARNING_HOURS', 6, 0, 24 * 30, false) * 60 * 60_000),
+    notificationsPerUserPerHour: numberOf('NOTIFICATIONS_PER_USER_PER_HOUR', 60, 1, 1000),
     marginAppliedBy: { currencycloud: appliedBy('MARGIN_APPLIED_BY_CURRENCYCLOUD'), equals: appliedBy('MARGIN_APPLIED_BY_EQUALS') },
     defaultMarginBps,
     rateCacheMs: Math.round(rateCacheSeconds * 1000),

@@ -7,7 +7,7 @@ const config = loadConfig();
 const runtime = createRuntime(config);
 const { stores, registry, mailer } = runtime;
 if (stores.acceptedLogEnd) console.error('AUDIT_ACCEPT_LOG_END was used: the audit log was accepted as it stood and that is recorded in it. REMOVE THE SETTING NOW; the server will not start again while it is set.');
-const { app, admin, auth, opsAuth, held, mail, authenticatorResets } = await buildApp({ config, stores, registry, mailer });
+const { app, admin, auth, opsAuth, held, mail, authenticatorResets, notifier, paymentNotes, alerts } = await buildApp({ config, stores, registry, mailer });
 // The email outbox: attempts cut off by the last stop are due again, and what is due is sent now and every 15 seconds.
 await mail.recover();
 void mail.pump();
@@ -26,7 +26,13 @@ await settle(true);
 // they are shown on the Approvals page to be finished or closed. Said here too, so it is not missed.
 const interrupted = await stores.ops.approvals.count({ status: 'applying' });
 if (interrupted > 0) console.error(`${interrupted} approved ${interrupted === 1 ? 'request was' : 'requests were'} interrupted while being carried out. Open the ops console, Approvals, to finish or close ${interrupted === 1 ? 'it' : 'them'}.`);
-setInterval(() => void settle(false), 60_000).unref();
+// After each sweep: whoever is due a notification about a held payment (waiting, about to expire, expired, settled) gets it.
+// Each is made once however often this looks, so looking again after a restart sends nothing twice.
+setInterval(() => void settle(false).then(() => paymentNotes.scan()), 60_000).unref();
+void paymentNotes.scan();
+// Rate alerts are checked against each company's client rate; an alert fires once.
+setInterval(() => void alerts.check(), config.alertCheckMs).unref();
+setInterval(() => void notifier.sweep().catch(() => undefined), 60 * 60_000).unref();
 
 await app.listen({ port: config.port, host: config.host });
 // The operator commands are served on the loopback address ONLY, on their own port.
