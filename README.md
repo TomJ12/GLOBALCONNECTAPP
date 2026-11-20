@@ -504,6 +504,56 @@ the invitation still being the same one).
   search typed into the ops console is a query string: it reaches the server but not
   the log.)
 
+### Forgotten password, and your own security settings
+
+**Email alone is never enough.** A password can be reset by its owner, but only with
+**both** the emailed link **and** a second factor:
+
+1. "Forgot your password?" on the sign-in screen: enter an email address. The answer is
+   always the same, after the same work as a sign-in attempt, and it is given before
+   anything else is done, so it says nothing about whether the address has an account.
+2. If the account exists, is activated and is enabled, a link is emailed to it:
+   single-use, valid 30 minutes, with its code in the URL fragment (as for activation,
+   so it is in no request log). A new link kills the old one. At most 3 links an hour
+   per account; each source is limited like any sign-in route.
+3. The page the link opens asks for a **current code from the authenticator app, or an
+   unused recovery code**, and the new password (same policy as activation). Wrong
+   codes count toward the same lock as wrong sign-in codes, and five of them withdraw
+   the link.
+4. On success: **only the password changes**. The authenticator and the recovery codes
+   are never touched by a reset. Every session is ended, the owner is emailed a notice,
+   and it is audited (`client.password_reset`).
+
+**Lost the authenticator AND the recovery codes: there is no self-service path.** The
+app says so and tells the person to contact Global Connect (the wording of how is a
+placeholder, `disclosures.contactSupport`). Staff then use the two-person authenticator
+reset, which now waits out a delay (see "Resetting an authenticator").
+
+**Signed in**, under Settings, "Security": change the password (current password **and**
+a code; every other session is signed out), make new recovery codes (a code; the old
+ones stop working; shown once), and see and end your own sessions. A session is shown
+as a kind of device ("Chrome on Windows", worked out from what the browser or app said
+about itself when it signed in and stored only as that family) and times rounded to
+the quarter hour: no network address, no token, no exact time.
+
+**Staff** have the same password reset on the console's sign-in page (`/ops/forgot`):
+link plus authenticator or recovery code, only the password changes. A lost
+authenticator is not self-service for staff either.
+
+**Security notices by email.** Password changed or reset, recovery codes regenerated,
+a session ended from the security settings, a sign-in from a network the account has
+not been used from before, the account locked, the account disabled or re-enabled, an
+authenticator reset approved, cancelled or completed. A notice tells; it never asks:
+**no link, no code**. One person gets at most one notice of each kind per window (an
+hour for "locked" and "new network", which an attacker hammering sign-in could
+otherwise multiply; five minutes for the rest), on top of the outbox's own limit per
+address. They cannot be switched off. "New network" means a /24 (IPv4) or /64 (IPv6)
+the account has not completed a sign-in from before, out of the last eight remembered:
+it is only as good as the address.
+
+**In the in-app demo** (no server) none of this exists: there are no accounts to
+recover, and the screens say so.
+
 ### Step-up on money actions
 
 Creating a payment, approving, rejecting, cancelling and adding a payee need a fresh code. Booking a
@@ -970,12 +1020,35 @@ rejections, cancellations and adding a payee.
 
 A reset removes the person's authenticator, recovery codes **and password**, ends every
 session and emails a new activation link to the address on file. **Whoever controls
-that mailbox then controls the account.** Before asking for a reset, verify the person's
-identity by a route that does not depend on the request itself (call back on a number
-already on file, not one given in the email asking for the reset). The form will not
-submit without a description of how identity was verified; that text is shown to the
-approver and stored in the audit log with both staff members' names. The console cannot
-check that the verification really happened.
+that mailbox then controls the account.** It is the classic way to take an account
+over: by talking staff into it. Before asking for a reset, verify the person's identity
+by a route that does not depend on the request itself (call back on a number already on
+file, not one given in the email asking for the reset). The form will not submit without
+a description of how identity was verified; that text is shown to the approver and
+stored in the audit log with both staff members' names. The console cannot check that
+the verification really happened. So, for a **client**, an approved reset **waits**:
+
+1. The client is emailed a notice at once: a reset has been approved, when it will take
+   effect, and that signing in now cancels it.
+2. **Nothing changes** for `AUTHENTICATOR_RESET_DELAY_HOURS` (default 24; at least 1
+   outside development; the confirmation page tells staff how long). The client's
+   current password, authenticator and recovery codes go on working.
+3. If the client **signs in successfully** during the delay (password and code), the
+   reset is cancelled automatically and that is audited
+   (`system.client.reset_authenticator.cancelled`, by "signed in"): whoever has the
+   credentials evidently did not lose them. Wrong guesses cancel nothing.
+4. **Any ops admin can cancel it** during the delay (one is enough: cancelling is the
+   safe direction), from the Approvals page or the person's page; confirmed and audited.
+5. Only when the delay has passed are the credentials cleared and the activation link
+   emailed, with a second notice. A check runs every minute and at start-up; a restart
+   in the middle finishes the reset at the next run and does not lose or repeat it
+   (a link from before the restart is replaced by the new one).
+
+Limits: the delay protects a client who reads their email or signs in within it; it
+does nothing for one who does neither. Someone who controls the mailbox still gets the
+account after the delay if nobody notices. A member of **staff** who loses their
+authenticator is reset by a second ops admin's approval or break-glass, at once, as
+before.
 
 ### Audit log
 

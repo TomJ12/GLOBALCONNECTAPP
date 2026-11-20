@@ -48,6 +48,7 @@ export default function RootLayout() {
           <Stack.Screen name="(app)" />
           <Stack.Screen name="sign-in" options={{ contentStyle: { backgroundColor: colors.navy }, animation: 'fade' }} />
           <Stack.Screen name="activate" options={{ contentStyle: { backgroundColor: colors.navy } }} />
+          <Stack.Screen name="reset" options={{ contentStyle: { backgroundColor: colors.navy } }} />
         </Stack>
         <ConfirmDialogHost />
         <StepUpDialogHost />

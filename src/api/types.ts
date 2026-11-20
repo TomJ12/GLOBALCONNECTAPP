@@ -81,6 +81,16 @@ export interface TotpEnrolment {
   secret: string;
 }
 
+/** One of your own signed-in sessions, as your security settings show it: a device family and rough times, nothing that identifies a network. */
+export interface OwnSession {
+  /** A reference for ending it. Not the session itself. */
+  id: string;
+  current: boolean;
+  device: string;
+  signedInAt: string;
+  lastActiveAt: string;
+}
+
 export interface ActivationResult {
   /** Shown once. Each works one time in place of an authenticator code at sign-in. */
   recoveryCodes: string[];

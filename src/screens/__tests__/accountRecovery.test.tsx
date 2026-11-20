@@ -1,0 +1,173 @@
+import { fireEvent, screen, waitFor } from '@testing-library/react-native';
+
+import { getAuthClient } from '@/api';
+import type { SelfServiceClient } from '@/api/auth';
+import { ProviderError } from '@/api/errors';
+import { NO_SECOND_FACTOR, RESET_REQUESTED, ResetPasswordScreen } from '@/screens/ResetPasswordScreen';
+import { SecurityScreen } from '@/screens/SecurityScreen';
+import { SettingsScreen } from '@/screens/SettingsScreen';
+import { SignInScreen } from '@/screens/SignInScreen';
+import { useSession } from '@/state/session';
+import { installMockBackend, renderScreen, startTestSession } from '@/test/utils';
+
+const expoRouter = jest.requireMock<{ __setParams: (params: Record<string, string>) => void; router: { replace: jest.Mock; push: jest.Mock } }>('expo-router');
+
+/** What the Global Connect server offers; the in-app demo has none. */
+function selfService(overrides: Partial<SelfServiceClient> = {}): jest.Mocked<SelfServiceClient> {
+  const service: jest.Mocked<SelfServiceClient> = {
+    requestPasswordReset: jest.fn(async () => undefined),
+    beginPasswordReset: jest.fn(async () => ({ minLength: 12 })),
+    completePasswordReset: jest.fn(async () => undefined),
+    changePassword: jest.fn(async () => undefined),
+    regenerateRecoveryCodes: jest.fn(async () => ['AAAAA-BBBBB-CCCCC-DDDDD', 'EEEEE-FFFFF-GGGGG-HHHHH']),
+    listSessions: jest.fn(async () => [
+      { id: 'ref-this', current: true, device: 'Chrome on Windows', signedInAt: '2026-11-11T10:00:00.000Z', lastActiveAt: '2026-11-11T10:15:00.000Z' },
+      { id: 'ref-other', current: false, device: 'Global Connect app on Android', signedInAt: '2026-11-10T09:00:00.000Z', lastActiveAt: '2026-11-10T09:30:00.000Z' },
+    ]),
+    endSession: jest.fn(async () => undefined),
+    ...overrides,
+  } as jest.Mocked<SelfServiceClient>;
+  (getAuthClient() as { selfService: SelfServiceClient | null }).selfService = service;
+  return service;
+}
+
+beforeEach(() => {
+  installMockBackend();
+  useSession.setState({ session: null, signedOutReason: null });
+  expoRouter.__setParams({});
+  expoRouter.router.replace.mockClear();
+  expoRouter.router.push.mockClear();
+});
+
+describe('forgotten password', () => {
+  it('is offered on the sign-in screen only when the app talks to the server', async () => {
+    await renderScreen(<SignInScreen />);
+    expect(screen.queryByTestId('go-reset')).not.toBeOnTheScreen();
+    selfService();
+    await renderScreen(<SignInScreen />);
+    await fireEvent.press(screen.getByTestId('go-reset'));
+    expect(expoRouter.router.push).toHaveBeenCalledWith('/reset');
+  });
+
+  it('asking for a link says the same thing whatever the address, and says plainly that email alone is not enough', async () => {
+    const service = selfService();
+    await renderScreen(<ResetPasswordScreen />);
+    // Without the authenticator or a recovery code there is no way back online: the screen says so, with how to reach Global Connect as a placeholder.
+    expect(screen.getByTestId('reset-no-second-factor')).toHaveTextContent(NO_SECOND_FACTOR);
+    expect(NO_SECOND_FACTOR).toMatch(/an email alone must never be enough[^]*\[HOW TO CONTACT GLOBAL CONNECT\]$/);
+    await fireEvent.changeText(screen.getByTestId('reset-email'), 'not an address');
+    await fireEvent.press(screen.getByTestId('reset-request'));
+    expect(await screen.findByText(/Enter a valid email address/)).toBeOnTheScreen();
+    expect(service.requestPasswordReset).not.toHaveBeenCalled();
+    await fireEvent.changeText(screen.getByTestId('reset-email'), ' someone@company.com ');
+    await fireEvent.press(screen.getByTestId('reset-request'));
+    expect(await screen.findByText(RESET_REQUESTED)).toBeOnTheScreen();
+    expect(service.requestPasswordReset).toHaveBeenCalledWith('someone@company.com');
+    expect(RESET_REQUESTED).toMatch(/^If that address belongs to/);
+  });
+
+  it('the link is not enough: the new password needs a code from the authenticator, or a recovery code', async () => {
+    const service = selfService();
+    // Opened from the emailed link: the code arrives with the page.
+    expoRouter.__setParams({ code: 'ABCDE-FGHIJ-KLMNO-PQRST' });
+    await renderScreen(<ResetPasswordScreen />);
+    await fireEvent.press(screen.getByTestId('reset-open'));
+    await waitFor(() => expect(service.beginPasswordReset).toHaveBeenCalledWith('ABCDE-FGHIJ-KLMNO-PQRST'));
+    expect(await screen.findByTestId('reset-second-factor')).toBeOnTheScreen();
+    // No code: nothing is sent.
+    await fireEvent.changeText(screen.getByTestId('reset-password'), 'a long enough password');
+    await fireEvent.changeText(screen.getByTestId('reset-password-repeat'), 'a long enough password');
+    await fireEvent.press(screen.getByTestId('reset-finish'));
+    expect(await screen.findByText(/Enter the 6-digit code from your authenticator app/)).toBeOnTheScreen();
+    expect(service.completePasswordReset).not.toHaveBeenCalled();
+    // A weak or mismatched password: nothing is sent either.
+    await fireEvent.changeText(screen.getByTestId('reset-second-factor'), '123456');
+    await fireEvent.changeText(screen.getByTestId('reset-password-repeat'), 'a different password');
+    await fireEvent.press(screen.getByTestId('reset-finish'));
+    expect(await screen.findByText(/The two passwords do not match/)).toBeOnTheScreen();
+    expect(service.completePasswordReset).not.toHaveBeenCalled();
+    // The code and a good password: sent together, and the person is told what changed and what did not.
+    await fireEvent.changeText(screen.getByTestId('reset-password-repeat'), 'a long enough password');
+    await fireEvent.press(screen.getByTestId('reset-finish'));
+    await waitFor(() => expect(service.completePasswordReset).toHaveBeenCalledWith('123456', 'totp', 'a long enough password'));
+    expect(await screen.findByText(/Your password has been changed\. You have been signed out everywhere; your authenticator app and recovery codes are unchanged\./)).toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('reset-sign-in'));
+    expect(expoRouter.router.replace).toHaveBeenCalledWith('/sign-in');
+  });
+
+  it('a recovery code can be used instead, and a link that is no longer valid sends the person back to ask for a new one', async () => {
+    const service = selfService({ completePasswordReset: jest.fn(async () => Promise.reject(new ProviderError('validation', { reason: 'reset_invalid' }))) });
+    expoRouter.__setParams({ code: 'ABCDE-FGHIJ-KLMNO-PQRST' });
+    await renderScreen(<ResetPasswordScreen />);
+    await fireEvent.press(screen.getByTestId('reset-open'));
+    await fireEvent.press(await screen.findByTestId('reset-toggle-method'));
+    await fireEvent.changeText(screen.getByTestId('reset-second-factor'), 'AAAAA-BBBBB-CCCCC-DDDDD');
+    await fireEvent.changeText(screen.getByTestId('reset-password'), 'a long enough password');
+    await fireEvent.changeText(screen.getByTestId('reset-password-repeat'), 'a long enough password');
+    await fireEvent.press(screen.getByTestId('reset-finish'));
+    await waitFor(() => expect(service.completePasswordReset).toHaveBeenCalledWith('AAAAA-BBBBB-CCCCC-DDDDD', 'recovery', 'a long enough password'));
+    expect(await screen.findByText(/That reset link is not valid any more/)).toBeOnTheScreen();
+    expect(screen.getByTestId('reset-email')).toBeOnTheScreen();
+  });
+});
+
+describe('security settings', () => {
+  it('are reached from settings only when the app talks to the server', async () => {
+    await startTestSession();
+    await renderScreen(<SettingsScreen />);
+    expect(screen.queryByTestId('open-security')).not.toBeOnTheScreen();
+    selfService();
+    await renderScreen(<SettingsScreen />);
+    await fireEvent.press(screen.getByTestId('open-security'));
+    expect(expoRouter.router.push).toHaveBeenCalledWith('/security');
+  });
+
+  it('changing the password needs the current password and a code; new recovery codes need a code and are shown once', async () => {
+    await startTestSession();
+    const service = selfService();
+    await renderScreen(<SecurityScreen />);
+    // Everything but the current password: nothing is sent.
+    await fireEvent.changeText(screen.getByTestId('security-new-password'), 'a long enough password');
+    await fireEvent.changeText(screen.getByTestId('security-new-password-repeat'), 'a long enough password');
+    await fireEvent.changeText(screen.getByTestId('security-password-code'), '123456');
+    await fireEvent.press(screen.getByTestId('security-change-password'));
+    expect(await screen.findByText(/Enter your current password\./)).toBeOnTheScreen();
+    expect(service.changePassword).not.toHaveBeenCalled();
+    // Everything but the code: nothing is sent.
+    await fireEvent.changeText(screen.getByTestId('security-current-password'), 'my current password');
+    await fireEvent.changeText(screen.getByTestId('security-password-code'), '');
+    await fireEvent.press(screen.getByTestId('security-change-password'));
+    expect(await screen.findByText(/Enter the 6-digit code from your authenticator app/)).toBeOnTheScreen();
+    expect(service.changePassword).not.toHaveBeenCalled();
+    await fireEvent.changeText(screen.getByTestId('security-password-code'), '123 456');
+    await fireEvent.press(screen.getByTestId('security-change-password'));
+    await waitFor(() => expect(service.changePassword).toHaveBeenCalledWith('my current password', '123456', 'a long enough password'));
+    expect(await screen.findByText('Your password has been changed.')).toBeOnTheScreen();
+
+    await fireEvent.press(screen.getByTestId('security-regenerate'));
+    expect(service.regenerateRecoveryCodes).not.toHaveBeenCalled();
+    await fireEvent.changeText(screen.getByTestId('security-recovery-code'), '654321');
+    await fireEvent.press(screen.getByTestId('security-regenerate'));
+    expect(await screen.findByText('AAAAA-BBBBB-CCCCC-DDDDD')).toBeOnTheScreen();
+    expect(screen.getByText(/These are shown only now/)).toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('security-codes-saved'));
+    expect(screen.queryByText('AAAAA-BBBBB-CCCCC-DDDDD')).not.toBeOnTheScreen();
+  });
+
+  it('lists sessions by kind of device and rough time, ends another one, and ending this one signs out', async () => {
+    await startTestSession();
+    const service = selfService();
+    await renderScreen(<SecurityScreen />);
+    expect(await screen.findByText('Chrome on Windows (this one)')).toBeOnTheScreen();
+    expect(screen.getByText('Global Connect app on Android')).toBeOnTheScreen();
+    // Nothing that identifies a network is shown: only what the server sent, which has none.
+    expect(screen.queryByText(/\d+\.\d+\.\d+\.\d+/)).not.toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('end-session-other'));
+    await waitFor(() => expect(service.endSession).toHaveBeenCalledWith('ref-other'));
+    expect(useSession.getState().session).not.toBeNull();
+    await fireEvent.press(screen.getByTestId('end-session-current'));
+    await waitFor(() => expect(service.endSession).toHaveBeenCalledWith('ref-this'));
+    await waitFor(() => expect(useSession.getState().session).toBeNull());
+    expect(expoRouter.router.replace).toHaveBeenCalledWith('/sign-in');
+  });
+});

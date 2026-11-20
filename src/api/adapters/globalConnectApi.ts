@@ -7,7 +7,7 @@
  */
 import type { z } from 'zod';
 
-import type { AuthClient } from '../auth';
+import type { AuthClient, SelfServiceClient } from '../auth';
 import { canonicalJson } from '../canonical';
 import { isProviderErrorReason, ProviderError, type ProviderErrorKind } from '../errors';
 import type { ProviderClient } from '../provider';
@@ -188,6 +188,33 @@ export class GlobalConnectApi implements ProviderClient, AuthClient {
   }
 
   // --- Activation -------------------------------------------------------------
+
+  // --- Self-service: your own account ---------------------------------------------------------
+
+  private resetCode: string | null = null;
+  readonly selfService: SelfServiceClient = {
+    requestPasswordReset: async (email) => {
+      await this.call(schemas.ok, 'POST', '/auth/password-reset/request', { body: { email: email.trim() }, anonymous: true });
+    },
+    beginPasswordReset: async (resetCode) => {
+      const code = resetCode.trim();
+      const start = await this.call(schemas.passwordResetStart, 'POST', '/auth/password-reset/start', { body: { resetCode: code }, anonymous: true });
+      this.resetCode = code;
+      return start.passwordPolicy;
+    },
+    completePasswordReset: async (code, method, password) => {
+      await this.call(schemas.ok, 'POST', '/auth/password-reset/complete', { body: { resetCode: this.resetCode ?? '', code: code.trim(), method, password }, anonymous: true });
+      this.resetCode = null;
+    },
+    changePassword: async (currentPassword, code, newPassword) => {
+      await this.call(schemas.ok, 'POST', '/account/password', { body: { currentPassword, code: code.trim(), newPassword } });
+    },
+    regenerateRecoveryCodes: async (code) => (await this.call(schemas.recoveryCodes, 'POST', '/account/recovery-codes', { body: { code: code.trim() } })).recoveryCodes,
+    listSessions: async () => (await this.call(schemas.ownSessions, 'GET', '/account/sessions')).items,
+    endSession: async (id) => {
+      await this.call(schemas.ok, 'POST', `/account/sessions/${encodeURIComponent(id)}/revoke`, { body: {} });
+    },
+  };
 
   async beginActivation(activationCode: string) {
     const code = activationCode.trim();

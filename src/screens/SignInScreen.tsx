@@ -188,6 +188,7 @@ export function SignInScreen() {
               </AppText>
             </View>
           ) : null}
+          {getAuthClient().selfService ? <Button label="Forgot your password?" variant="onDark" onPress={() => router.push('/reset')} testID="go-reset" /> : null}
           <Button label="Activate a new account" variant="onDark" onPress={() => router.push('/activate')} testID="go-activate" />
         </View>
       ) : null}

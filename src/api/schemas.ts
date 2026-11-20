@@ -64,6 +64,12 @@ export const activationStart: z.ZodType<ActivationStart> = z.object({
   displayName: text,
   passwordPolicy: z.object({ minLength: z.number().int().positive() }),
 });
+export const ok = z.object({ ok: z.literal(true) });
+export const passwordResetStart = z.object({ passwordPolicy: z.object({ minLength: z.number() }) });
+export const recoveryCodes = z.object({ recoveryCodes: z.array(z.string()) });
+export const ownSessions = z.object({
+  items: z.array(z.object({ id: z.string(), current: z.boolean(), device: z.string(), signedInAt: z.string(), lastActiveAt: z.string() })),
+});
 export const totpEnrolment: z.ZodType<TotpEnrolment> = z.object({ otpauthUri: z.string().startsWith('otpauth://'), secret: z.string().min(16) });
 export const activationResult: z.ZodType<ActivationResult> = z.object({ recoveryCodes: z.array(z.string().min(8)).min(1) });
 export const stepUpGrant = z.object({ token: z.string().min(20), expiresInSeconds: z.number().positive() });
@@ -241,4 +247,3 @@ export const errorBody = z.object({
     retryAfterSeconds: z.number().optional(),
   }),
 });
-export const ok = z.object({ ok: z.literal(true) });
