@@ -14,6 +14,7 @@ import type {
   AttemptRecord,
   CompanyRecord,
   LoginChallengeRecord,
+  MailRecord,
   Membership,
   OpsSessionRecord,
   ProviderKeyRecord,
@@ -83,6 +84,7 @@ interface DbState {
   schema: number;
   dev: boolean;
 }
+const DEV_DATABASE = 'This database has been used in development mode (it holds sample accounts and readable activation codes for them). It cannot be used outside development: start with a new database.';
 const stateMac = (key: DataKey, state: DbState): string => macOf(key, 'gc-db-state', canonicalJson([state.schema, state.dev]));
 
 export function createSqliteStores(options: SqliteOptions): SqliteStores {
@@ -148,6 +150,8 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
     if (found) {
       if (found.schema !== version) throw new Error(`This database's version table says schema ${version}, but its signed record says ${found.schema}: the database has been altered, or partly replaced by an older copy. Refusing to open it. Restore the database from a backup.`);
       state = found;
+      // Refused BEFORE any migration runs: a development database is not even brought up to date outside development.
+      if (options.mode === 'strict' && found.dev) throw new Error(DEV_DATABASE);
       return;
     }
     if (version >= 5) throw new Error('This database has lost the signed record of its state (its schema version, and whether it has been used in development). Refusing to open it. Restore the database from a backup.');
@@ -210,7 +214,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const current = state as DbState | null;
   if (!current) return refuse('The database has no signed record of its state.');
   if (options.mode === 'strict' && current.dev) {
-    refuse('This database has been used in development mode (it holds sample accounts and readable activation codes for them). It cannot be used outside development: start with a new database.');
+    refuse(DEV_DATABASE);
   }
   if (options.mode === 'development' && !current.dev && !options.readOnly) writeState(db, { ...current, dev: true });
 
@@ -249,6 +253,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const approvals = new SqlTable<ApprovalRecord>(db, 'ops_approvals', { indexed: ['status'], audit });
   const confirmations = new SqlTable<{ expiresAt: number }>(db, 'ops_confirmations');
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
+  const mail = new SqlTable<MailRecord>(db, 'mail_outbox', { indexed: ['status'], secret: { field: 'body', keys } });
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
   if (options.seed && !db.get('SELECT 1 FROM users LIMIT 1') && !db.get('SELECT 1 FROM companies LIMIT 1')) {
     const { seed } = options;
@@ -262,6 +267,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const IDLE_COUNTER_MS = 2 * 60 * 60_000;
   return {
     db,
+    mail,
     payments: new SqlHeldPayments(db, directory, audit),
     directory,
     auth: { activations, challenges, sessions, stepUps, attempts },
@@ -278,7 +284,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
         audit.resignHead();
         if (state) writeState(db, state);
         // All or nothing: a row that cannot be decrypted throws, naming the row, and the whole rotation is rolled back.
-        changed += activations.rotateSecrets(keys.current.id) + opsActivations.rotateSecrets(keys.current.id);
+        changed += activations.rotateSecrets(keys.current.id) + opsActivations.rotateSecrets(keys.current.id) + mail.rotateSecrets(keys.current.id);
         return changed;
       });
     },

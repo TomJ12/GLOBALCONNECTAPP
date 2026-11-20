@@ -456,7 +456,30 @@ export interface HeldPaymentStore {
   update(id: string, userIds: string[] | ((current: HeldPaymentRecord) => string[]), change: (current: HeldPaymentRecord, people: HeldPaymentPeople) => HeldPaymentRecord | null, audit?: AuditWith<HeldPaymentRecord>): Promise<HeldPaymentRecord | null>;
 }
 
+/**
+ * One email in the outbox (see mail/queue.ts). `body` is the finished message, stored encrypted, and is erased
+ * once the message is sent, has failed for good or was suppressed.
+ */
+export interface MailRecord {
+  id: string;
+  /** The row's own key (a hash of the logical message key). */
+  key: string;
+  to: string;
+  category: string;
+  template: string;
+  body: string | null;
+  status: 'queued' | 'sending' | 'sent' | 'failed' | 'suppressed';
+  attempts: number;
+  nextAttemptAt: number;
+  attemptAt: number | null;
+  createdAt: number;
+  sentAt: number | null;
+  /** A short code only (an error code, a reply code, or which limit): never anything from the message. */
+  lastError: string | null;
+}
+
 export interface Stores {
+  mail: Table<MailRecord>;
   payments: HeldPaymentStore;
   directory: Directory;
   auth: AuthStore;

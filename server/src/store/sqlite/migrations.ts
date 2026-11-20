@@ -131,4 +131,9 @@ CREATE UNIQUE INDEX companies_name_key ON companies (name_key);
 ALTER TABLE audit_head ADD COLUMN archived_through INTEGER;
 CREATE TABLE direct_payments (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 `,
+  // 6: the email outbox. Every message is written here first and sent from here (mail/queue.ts).
+  `
+CREATE TABLE mail_outbox (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX mail_outbox_status ON mail_outbox (json_extract(data, '$.status'));
+`,
 ];

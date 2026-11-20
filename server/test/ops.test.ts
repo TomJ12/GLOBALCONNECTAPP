@@ -1543,3 +1543,50 @@ test('a change of a company\'s approval rule is written to the company as it is 
   const company = await h.stores.directory.getCompany('co_northfield');
   assert.deepEqual([company?.approvalsRequired, company?.deactivatedAt, company?.previousName], [2, 5, 'Old Name']);
 });
+
+// --- Email ------------------------------------------------------------------------------------------
+
+test('Mail page: staff see how many emails are waiting, sent, failed or held back, and which failed, without ever seeing a subject, a body, a link or a whole address', async () => {
+  h = await harness({ mailPerRecipientPerHour: 3 });
+  const { admin, second } = await pair();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  await h.activate(AMIRA);
+  const send = h.outbox.send.bind(h.outbox);
+  let failing = false;
+  h.outbox.send = async (message) => {
+    if (failing) throw Object.assign(new Error(`could not deliver ${message.text}`), { code: 'ETIMEDOUT' });
+    return send(message);
+  };
+  // One that goes, one that fails for good, and more to one address than the limit allows.
+  await fourEyes(admin, second, '/ops/users/usr_ben/activation-link');
+  failing = true;
+  await fourEyes(admin, second, '/ops/users/usr_dana/activation-link');
+  for (let n = 0; n < 8; n += 1) {
+    h.clock.advance(4 * 60 * 60_000);
+    await h.mail.pump();
+  }
+  failing = false;
+  for (const who of [admin, second, olu]) {
+    await signIn(who.browser, who.email, who.secret);
+    await who.browser.get('/ops/users');
+  }
+  for (let n = 0; n < 4; n += 1) await fourEyes(admin, second, '/ops/users/usr_ben/activation-link');
+  const page = await olu.browser.get('/ops/mail');
+  assert.equal(page.status, 200);
+  assert.match(page.body, /<dt>Waiting to be sent<\/dt><dd>0<\/dd>/);
+  assert.match(page.body, /<dt>Failed<\/dt><dd>1<\/dd>/);
+  assert.match(page.body, /<dt>Not sent: over a limit<\/dt><dd>1<\/dd>/);
+  assert.match(page.body, /<td>d…@adviser\.example<\/td><td>activation: activation\.client<\/td><td>failed<\/td><td>6<\/td><td>ETIMEDOUT<\/td>/);
+  assert.match(page.body, /<td>b…@castlebrook\.example<\/td><td>activation: activation\.client<\/td><td>suppressed<\/td><td>0<\/td><td>recipient limit<\/td>/);
+  assert.match(page.body, /No mail server is configured: in development mode every email is printed in the server console/);
+  // Nothing of any message: no link or code, no subject, no whole address, none of the transport's own error text.
+  assert.doesNotMatch(page.body, LINK_OR_CODE);
+  assert.doesNotMatch(page.body, /Activate your|Use this link|could not deliver|dana@adviser\.example|ben@castlebrook\.example/);
+  // It is a page for looking: there is nothing to post to.
+  assert.equal(h.opsRoutes.filter((route) => route.url.startsWith('/ops/mail')).map((route) => route.method).filter((method) => method !== 'HEAD').join(), 'GET');
+  assert.match(page.body, /<a href="\/ops\/mail">Mail<\/a>/);
+  // The failure is in the audit log by kind and code, without the address or the content.
+  const failed = (await audit('system.mail.failed'))[0];
+  assert.deepEqual([failed?.detail.template, failed?.detail.error, failed?.target], ['activation.client', 'ETIMEDOUT', null]);
+  assert.ok(!JSON.stringify(await audit()).includes('could not deliver'));
+});

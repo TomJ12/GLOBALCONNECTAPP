@@ -244,6 +244,25 @@ of the reasons this must stay a demo.
 
 ---
 
+## Sending real email (optional)
+
+The demo works without this: every "email" is printed in the log (`fly logs`), which is
+where step 7 gets its links. If you want the demo to send real email instead, you need
+an account with an email-sending service that gives you SMTP details (a host, a port,
+a username and a password) and a from-address on a domain that service lets you send
+from. Then:
+
+```bash
+fly secrets set SMTP_HOST=smtp.your-email-service.example SMTP_PORT=587 SMTP_USERNAME=your-username SMTP_PASSWORD=your-password MAIL_FROM=no-reply@your-domain.example
+```
+
+The server restarts and from then on sends through that service; nothing is printed in
+the log any more, so activation links arrive only by email. The **Mail** page in the ops
+console shows how many messages are waiting, sent or failed (never their content). To go
+back to the log: `fly secrets unset SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD MAIL_FROM`.
+Only use addresses you own: this is a demo with sample accounts, and the footer of every
+email is still a placeholder.
+
 ## One machine only
 
 The database is a single file on one machine's disk. A second machine would have its

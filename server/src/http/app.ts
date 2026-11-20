@@ -22,7 +22,9 @@ import { AuthService, partyOf, reasonOf, type SessionContext } from '../auth/ser
 import type { Config } from '../config';
 import { safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
-import { activationMessage, maskEmail, type Mailer } from '../mailer';
+import { ConsoleOutbox, maskEmail, type Mailer } from '../mailer';
+import { MailQueue } from '../mail/queue';
+import { activationMail } from '../mail/templates';
 import { assertAmount } from '../money';
 import { networkOf, sourceOf } from '../net';
 import { emailDomain, hasControlCharacters, isEmail } from '../validate';
@@ -34,6 +36,8 @@ import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
 import type { CompanyRecord, Stores } from '../store/types';
 
 export interface AppDeps {
+  /** How the outbox is emptied (see MailQueue). Defaults by the kind of mailer. */
+  mailDelivery?: 'inline' | 'background';
   /** TESTS ONLY: stands in for the demo gate's waiting. */
   gateDelay?: (ms: number) => Promise<void>;
   config: Config;
@@ -125,7 +129,7 @@ const SYSTEM = { type: 'system' as const, id: null, label: 'operator command' };
  * refuses and staff are invited from the console. The address must be at an
  * allowed staff domain. The link goes to the mailer, never back to the caller.
  */
-export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, mailer: Mailer, config: Pick<Config, 'staffEmailDomains'>, email: string, name: string, at: number, source: string) {
+export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService, mail: MailQueue, config: Pick<Config, 'staffEmailDomains'>, email: string, name: string, at: number, source: string) {
   if (!config.staffEmailDomains.includes(emailDomain(email))) return null;
   const staff = await stores.ops.users.list();
   if (staff.filter((user) => user.role === 'ops_admin' && isActiveStaff(user)).length >= 2) return null;
@@ -133,7 +137,7 @@ export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService,
   if (existing && (existing.role !== 'ops_admin' || existing.disabledAt !== null || existing.activatedAt !== null)) return null;
   const user = existing ?? (await opsAuth.createUser(email, name, 'ops_admin'));
   const invite = await opsAuth.createInvite(user.id);
-  await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
+  await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
   await stores.audit.append({ at, actor: SYSTEM, target: { type: 'ops', id: user.id, label: user.email }, action: existing ? 'ops.bootstrap_admin' : 'ops.staff.new', outcome: 'success', source, detail: { role: 'ops_admin', how: 'operator command (bootstrap)' } });
   return { sentTo: maskEmail(user.email), expiresAt: invite.expiresAt };
 }
@@ -143,8 +147,8 @@ export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService,
  * is a SEPARATE server that index.ts binds to the loopback address only; the
  * public listener has no /admin route at all. Still guarded by ADMIN_TOKEN.
  */
-export async function buildAdminApp(deps: { config: Config; stores: Stores; auth: AuthService; opsAuth: OpsAuthService; mailer: Mailer; now: () => number }) {
-  const { config, stores, auth, opsAuth, mailer, now } = deps;
+export async function buildAdminApp(deps: { config: Config; stores: Stores; auth: AuthService; opsAuth: OpsAuthService; mail: MailQueue; now: () => number }) {
+  const { config, stores, auth, opsAuth, mail, now } = deps;
   const admin = Fastify({ bodyLimit: 16 * 1024, logger: false });
   admin.setErrorHandler((error, _request, reply) => {
     const apiError = error instanceof ApiError ? error : new ApiError((error as { statusCode?: number }).statusCode === 400 ? 'validation' : 'server', { status: (error as { statusCode?: number }).statusCode === 400 ? 400 : 500 });
@@ -168,7 +172,7 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
       stores.audit.append({ at: now(), actor: SYSTEM, target: user ? partyOf(user) : { type: 'client', id: null, label: email.slice(0, 80) }, action: 'system.client.activation_link', outcome, source: request.ip, detail });
     try {
       const invite = await auth.createInvite(email);
-      await mailer.send(activationMessage(invite, email, user?.name ?? '', 'client'));
+      await mail.enqueue(activationMail(invite, email, user?.name ?? '', 'client'));
       await record('success', { expires: new Date(invite.expiresAt).toISOString() });
       return { sentTo: maskEmail(email), expiresAt: new Date(invite.expiresAt).toISOString() };
     } catch (error) {
@@ -182,7 +186,7 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
     const name = stringField(request.body, 'name');
     if (!isEmail(email)) throw new ApiError('validation', { fields: ['email'] });
     if (!name || name.length > 120 || hasControlCharacters(name)) throw new ApiError('validation', { fields: ['name'] });
-    const sent = await bootstrapOpsAdmin(stores, opsAuth, mailer, config, email, name, now(), request.ip);
+    const sent = await bootstrapOpsAdmin(stores, opsAuth, mail, config, email, name, now(), request.ip);
     if (!sent) {
       await stores.audit.append({ at: now(), actor: SYSTEM, target: { type: 'ops', id: null, label: email.slice(0, 80) }, action: 'ops.bootstrap_admin', outcome: 'failure', source: request.ip, detail: { reason: 'refused' } });
       throw new ApiError('forbidden');
@@ -229,7 +233,7 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
     }
     const sessions = await opsAuth.clearCredentials(user.id);
     const invite = await opsAuth.createInvite(user.id);
-    await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
+    await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
     await record('success', { sessionsEnded: String(sessions), sentTo: maskEmail(user.email) });
     return { done: 'reset', staff: maskEmail(user.email), expiresAt: new Date(invite.expiresAt).toISOString() };
   });
@@ -241,6 +245,21 @@ export async function buildApp(deps: AppDeps) {
   const now = deps.now ?? Date.now;
   const auth = new AuthService(deps.stores, config, now);
   const opsAuth = new OpsAuthService(deps.stores, config, now);
+  // Every email goes through the outbox (mail/queue.ts). The development console outbox is instant and in this
+  // process, so it is emptied inline; a real mail server is never waited for by a request.
+  const mailFrom = config.smtp?.from ?? '';
+  const mail = new MailQueue({
+    table: deps.stores.mail,
+    audit: deps.stores.audit,
+    transport: deps.mailer,
+    now,
+    links: [config.appUrl, config.opsUrl],
+    domain: mailFrom.includes('@') ? (mailFrom.split('@').pop() as string).replace(/[^A-Za-z0-9.-]/g, '') : 'globalconnect.invalid',
+    perRecipientPerHour: config.mailPerRecipientPerHour,
+    globalPerHour: config.mailGlobalPerHour,
+    delivery: deps.mailDelivery ?? (deps.mailer instanceof ConsoleOutbox ? 'inline' : 'background'),
+    onError: (message) => app.log.error({ message }, 'mail queue failed'),
+  });
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
 
   const app = Fastify({
@@ -722,9 +741,9 @@ export async function buildApp(deps: AppDeps) {
     { prefix: '/v1' },
   );
 
-  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mailer: deps.mailer, now, limitAttempts });
+  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, now, limitAttempts });
   // Null when no ADMIN_TOKEN is set: the operator commands are then off.
-  const admin = config.adminToken ? await buildAdminApp({ config, stores: deps.stores, auth, opsAuth, mailer: deps.mailer, now }) : null;
+  const admin = config.adminToken ? await buildAdminApp({ config, stores: deps.stores, auth, opsAuth, mail, now }) : null;
 
   app.get('/healthz', async () => ({ ok: true }));
 
@@ -742,5 +761,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, admin, auth, opsAuth, opsRoutes, held };
+  return { app, admin, auth, opsAuth, opsRoutes, held, mail };
 }

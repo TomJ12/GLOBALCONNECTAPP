@@ -18,6 +18,7 @@ import type { AuthService, Invitation } from './auth/service';
 import type { Config } from './config';
 import { normaliseCode, sha256 } from './crypto';
 import { ConsoleOutbox, type Mailer } from './mailer';
+import { SmtpMailer } from './mail/smtp';
 import type { OpsAuthService } from './ops/auth';
 import { ProviderRegistry } from './providers/adapter';
 import { currencycloudFactory } from './providers/currencycloud';
@@ -67,11 +68,12 @@ export function keysFor(config: Config): DataKeys {
 }
 
 export function createRuntime(config: Config, options: RuntimeOptions = {}): Runtime {
-  if (config.strict && !options.mailer) {
-    throw new Error('No mailer is configured. Activation links are delivered by email only; supply a Mailer (see src/mailer.ts) or, for a local demonstration, set APP_ENV=development.');
+  if (config.strict && !options.mailer && !config.smtp) {
+    throw new Error('No mailer is configured. Activation links are delivered by email only: set SMTP_HOST and MAIL_FROM (see .env.example) or, for a local demonstration, set APP_ENV=development.');
   }
   if (config.strict && !config.databasePath) throw new Error('DATABASE_PATH must be set.');
-  const mailer = options.mailer ?? new ConsoleOutbox();
+  // A real mail server when one is configured, in any mode; otherwise (development only) the console outbox.
+  const mailer = options.mailer ?? (config.smtp ? new SmtpMailer(config.smtp) : new ConsoleOutbox());
   // (Outside development the key comes from the environment only, so checking it writes nothing.)
   const strictKeys = config.strict ? keysFor(config) : null;
   // Refused before anything is opened or created: a strict start without live provider wires leaves no file behind.

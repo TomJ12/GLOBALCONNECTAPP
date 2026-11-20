@@ -56,6 +56,7 @@ export interface Harness {
   registry: ProviderRegistry;
   /** Every "email" the server sent. */
   outbox: ConsoleOutbox;
+  mail: Awaited<ReturnType<typeof buildApp>>['mail'];
   /** The activation code in the newest email to this address. */
   mailedCode: (email: string) => string;
   providerA: MockCurrencycloudPlatform;
@@ -108,7 +109,7 @@ function withLatency<T extends object>(target: T, hook?: (operation: string) => 
 }
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory(), options: HarnessOptions = {}): Promise<Harness> {
-  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, ...overrides };
+  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, mailPerRecipientPerHour: 100_000, mailGlobalPerHour: 100_000, ...overrides };
   const clock = options.clock ?? {
     now: Date.UTC(2026, 10, 11, 10, 0, 0),
     advance(ms: number) {
@@ -197,7 +198,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
+  return { mail: built.mail, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
     close: async () => {
       await app.close();
       await admin.close();

@@ -39,7 +39,9 @@ import { reasonOf, type AuthService } from '../auth/service';
 import type { Config } from '../config';
 import { randomToken, safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
-import { activationMessage, maskEmail, type Mailer } from '../mailer';
+import { maskEmail } from '../mailer';
+import { MAIL_MAX_ATTEMPTS, type MailQueue } from '../mail/queue';
+import { activationMail } from '../mail/templates';
 import type { ProviderRegistry } from '../providers/adapter';
 import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate';
 import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type ApprovalsRequired, type AuditInput, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
@@ -52,7 +54,7 @@ export interface OpsDeps {
   auth: AuthService;
   opsAuth: OpsAuthService;
   registry: ProviderRegistry;
-  mailer: Mailer;
+  mail: MailQueue;
   now: () => number;
   limitAttempts: (request: FastifyRequest) => Promise<void>;
 }
@@ -144,7 +146,7 @@ const asset = (relative: string): Buffer | null => {
 };
 
 export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<{ method: string; url: string }[]> {
-  const { config, stores, auth, opsAuth, registry, mailer, now, limitAttempts } = deps;
+  const { config, stores, auth, opsAuth, registry, mail, now, limitAttempts } = deps;
   const routes: { method: string; url: string }[] = [];
   // Outside development OPS_URL must be https (config.ts), so the cookie is always Secure there.
   const secure = config.opsUrl.startsWith('https://');
@@ -690,12 +692,12 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       /** Emails a new activation link to the address on file. The link itself never reaches the console. */
       const mailClientLink = async (user: UserRecord): Promise<Record<string, string>> => {
         const invite = await auth.createInvite(user.email);
-        await mailer.send(activationMessage(invite, user.email, user.name, 'client'));
+        await mail.enqueue(activationMail(invite, user.email, user.name, 'client'));
         return { sentTo: maskEmail(user.email), expires: when(invite.expiresAt) };
       };
       const mailStaffLink = async (user: OpsUserRecord): Promise<Record<string, string>> => {
         const invite = await opsAuth.createInvite(user.id);
-        await mailer.send(activationMessage(invite, user.email, user.name, 'staff'));
+        await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
         return { sentTo: maskEmail(user.email), expires: when(invite.expiresAt) };
       };
 
@@ -1491,6 +1493,25 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
       );
 
       // --- Audit log: read only. There is no route that changes or removes an entry. ---
+      // --- Mail --------------------------------------------------------------------
+      // The outbox, as numbers and as a list of what did not go: who it was for (masked), what kind of message, how
+      // often it was tried and a short error code. Never a subject, a body or a link.
+      page('/mail', {}, async (ctx, _request, reply) => {
+        const { counts, oldestQueuedAt, problems } = await mail.summary();
+        return send(
+          reply,
+          200,
+          layout(
+            chromeOf(ctx, 'Mail'),
+            h`<div class="card"><h2>Outbox</h2><dl><dt>Waiting to be sent</dt><dd>${String(counts.queued + counts.sending)}${oldestQueuedAt !== null ? h` (the oldest since ${when(oldestQueuedAt)})` : ''}</dd><dt>Sent</dt><dd>${String(counts.sent)}</dd><dt>Failed</dt><dd>${String(counts.failed)}</dd><dt>Not sent: over a limit</dt><dd>${String(counts.suppressed)}</dd></dl>
+<p class="muted">${config.smtp ? h`Email is sent through the mail server ${config.smtp.host}.` : 'No mail server is configured: in development mode every email is printed in the server console instead.'} A message that cannot be sent is tried again ${String(MAIL_MAX_ATTEMPTS - 1)} more times over about four and a half hours, then marked failed. At most ${String(config.mailPerRecipientPerHour)} messages an hour are queued for one address, and ${String(config.mailGlobalPerHour)} for everyone together. Sent messages are counted for 30 days.</p></div>
+<div class="card"><h2>Not delivered</h2><table><tr><th>Queued</th><th>To</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Error</th></tr>${problems.map(
+              (item) => h`<tr><td>${when(item.createdAt)}</td><td>${maskEmail(item.to)}</td><td>${item.category}: ${item.template}</td><td>${item.status === 'queued' ? 'waiting to be tried again' : item.status}</td><td>${String(item.attempts)}</td><td>${item.lastError ?? ''}</td></tr>`,
+            )}</table>${problems.length === 0 && h`<p class="muted">Nothing has failed or been held back.</p>`}<p class="muted">The content of a message is never shown here. An activation link that failed can be issued again from the person’s page.</p></div>`,
+          ),
+        );
+      });
+
       page('/audit', {}, async (ctx, request, reply) => {
         const [actor, target, act, from, to] = ['actor', 'target', 'action', 'from', 'to'].map((name) => queryOf(request, name)) as [string, string, string, string, string];
         const day = (value: string, end: boolean): number | undefined => {

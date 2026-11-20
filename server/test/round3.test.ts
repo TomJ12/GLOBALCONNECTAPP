@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 import { loadConfig, secretProblem } from '../src/config';
 import { hashPassword, passwordWork } from '../src/crypto';
-import { activationMessage } from '../src/mailer';
+import { render } from '../src/mail/templates';
 import { networkOf, sourceOf } from '../src/net';
 import { createRuntime, DEMO_STAFF, seedInvitations } from '../src/startup';
 import { createSqliteStores, type SqliteStores } from '../src/store/sqlite';
@@ -555,9 +555,9 @@ test('N9: names cannot carry control characters into a mail, and email addresses
   for (const good of ['a@b.co', 'first.last+tag@sub.example.com', 'x_y%z@example.org']) assert.equal(isEmail(good), true, good);
   for (const bad of ['x\'"<b>@evil.example', 'a b@example.com', 'a@b', 'a@@b.com', '<a@b.com>', 'a@b..com', 'a..b@c.com', '.a@b.com', 'a@-b.com', 'a@b.com\n', 'a@b.c', `${'a'.repeat(250)}@b.com`, '"quoted"@b.com', 'a@[127.0.0.1]']) assert.equal(isEmail(bad), false, bad);
   // Whatever reaches the mailer, a name is one line.
-  const message = activationMessage({ activationLink: 'https://app.example/activate#code=X', expiresAt: 0 }, 'a@b.co', 'Eve\r\nBcc: all@evil.example\n\nPay to: 00-00-00 now', 'client');
+  const message = render('activation.client', { name: 'Eve\r\nBcc: all@evil.example\n\nPay to: 00-00-00 now', link: 'https://app.example/activate#code=X', expiresAt: 0 }, ['https://app.example']);
   assert.equal(message.text.split('\n')[0], 'Hello Eve Bcc: all@evil.example Pay to: 00-00-00 now,');
-  assert.equal(message.text.split('\n').length, 7);
+  assert.equal(message.text.split('\n').length, 10, 'seven lines of message, a blank line and the two-line footer');
 
   h = await harness();
   const admin = await staff('admin@globalconnect.example', 'ops_admin');
@@ -599,45 +599,38 @@ test('N9: the adapter cache is keyed by the mapping, and a step-up permission is
   await assert.rejects(h.auth.consumeStepUp(current, granted.token, 'payment.approve', { paymentId: 'p' }), /step_up_invalid/);
 });
 
-test('N9: if the activation email cannot be sent after a reset cleared the credentials, the approval can simply be tried again', async () => {
+test('N9: if the activation email cannot be sent, the approval is not held up or lost: the message waits in the outbox and is sent once when the mail server is back', async () => {
   h = await harness();
-  const amira = await h.activate(AMIRA);
-  void amira;
+  await h.activate(AMIRA);
   const admin = await staff('admin@globalconnect.example', 'ops_admin');
   const boss = await staff('boss@globalconnect.example', 'ops_admin');
   const victim = await staff('victim@globalconnect.example', 'ops');
   const send = h.outbox.send.bind(h.outbox);
   let failing = true;
   h.outbox.send = async (message) => {
-    if (failing) throw new Error('smtp unavailable');
+    if (failing) throw Object.assign(new Error('smtp unavailable: secret detail'), { code: 'ECONNREFUSED' });
     return send(message);
   };
-  for (const [url, read] of [
-    ['/ops/users/usr_amira/reset-authenticator', async () => (await h.stores.directory.getUser('usr_amira'))?.activatedAt],
-    [`/ops/staff/${victim.id}/reset-authenticator`, async () => (await h.stores.ops.users.get(victim.id))?.activatedAt],
-  ] as const) {
-    failing = true;
-    const asked = await admin.act(url, { verification: 'Called back on the number on file' });
-    const id = idOf(asked.location);
-    const failed = await boss.act(`/ops/approvals/${id}/approve`);
-    assert.equal(failed.status, 500, url);
-    // Credentials are gone and nothing was sent. The request is neither "done" nor back to "never approved": it is
-    // marked as approved-but-interrupted, shown on the Approvals page, and cannot be approved a second time.
-    assert.equal(await read(), null);
-    assert.equal(h.outbox.sent.length, url.includes('staff') ? 1 : 0);
-    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
-    assert.match((await boss.browser.get('/ops/approvals')).body, /Approved, but not finished/);
-    assert.equal((await boss.act(`/ops/approvals/${id}/approve`)).status, 409);
-    // The requester cannot finish their own request; the approver can, and only what is missing is done.
-    assert.equal((await admin.act(`/ops/approvals/${id}/resume`)).status, 403);
-    assert.equal((await boss.act(`/ops/approvals/${id}/resume`)).status, 500, 'the mail still fails: still interrupted');
-    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'applying');
-    failing = false;
-    assert.equal((await boss.act(`/ops/approvals/${id}/resume`)).status, 303, `${url} finished`);
-    assert.equal((await h.stores.ops.approvals.get(id))?.status, 'approved');
-    assert.equal(h.outbox.sent.length, url.includes('staff') ? 2 : 1);
-  }
-  assert.deepEqual(h.outbox.sent.map((message) => message.to), [AMIRA, victim.email]);
+  const before = h.outbox.sent.length;
+  const asked = await admin.act(`/ops/staff/${victim.id}/reset-authenticator`, { verification: 'Called back on the number on file' });
+  const id = idOf(asked.location);
+  // The approval goes through: what it had to do (clear the credentials, make the link) is done, and the email is queued.
+  assert.equal((await boss.act(`/ops/approvals/${id}/approve`)).status, 303);
+  assert.equal((await h.stores.ops.approvals.get(id))?.status, 'approved');
+  assert.equal((await h.stores.ops.users.get(victim.id))?.activatedAt, null);
+  assert.equal(h.outbox.sent.length, before);
+  const queued = (await h.stores.mail.list()).filter((row) => row.to === victim.email && row.status !== 'sent');
+  assert.deepEqual(queued.map((row) => [row.status, row.attempts, row.lastError, row.template]), [['queued', 1, 'ECONNREFUSED', 'activation.staff']]);
+  // Not before its time, and not twice.
+  await h.mail.pump();
+  assert.equal(h.outbox.sent.length, before);
+  failing = false;
+  h.clock.advance(61_000);
+  await Promise.all([h.mail.pump(), h.mail.pump()]);
+  await h.mail.pump();
+  assert.deepEqual(h.outbox.sent.slice(before).map((message) => message.to), [victim.email]);
+  const row = (await h.stores.mail.list()).find((item) => item.id === queued[0]?.id);
+  assert.deepEqual([row?.status, row?.attempts, row?.body], ['sent', 2, null]);
 });
 
 test('config: sequences and keyboard runs are not secrets, and only a few proxy hops can be trusted', () => {

@@ -13,8 +13,9 @@ Global Connect staff under `/ops` (see "Ops console").
 Mock providers, sample data, printed activation codes, the console "outbox" that stands
 in for email, and a generated encryption key exist only with `APP_ENV=development`, which
 `npm run demo` and `npm run server` set. Without it the server refuses to start on
-mocks or without a real mailer, and this repository has neither a live provider
-transport nor a real mailer yet. `NODE_ENV` decides nothing. Fees,
+mocks or without a real mailer. It can now send real email (SMTP; see "Email"), but
+this repository still has no live provider transport, so it still cannot start outside
+development. `NODE_ENV` decides nothing. Fees,
 delivery times and regulatory wording are bracketed placeholders.
 
 - App: Expo SDK 58, React Native 0.88, TypeScript strict, expo-router; iOS, Android, web
@@ -1119,10 +1120,69 @@ entries there are and how many of them are archived. One signed-in client can wr
 most 60 entries a minute (see "Rate limits"). Retention and shipping off the machine are
 still to do.
 
+### Email
+
+**How it is sent.** Over SMTP, to any email service, through `nodemailer` (pure
+JavaScript; nothing to compile). Set in `server/.env`:
+
+| Setting | Meaning |
+|---|---|
+| `SMTP_HOST` | The mail server. Without it there is no mail server: in development every email is printed in the server console (the "outbox"), which is how the demo works; outside development the server will not start. |
+| `SMTP_PORT` | Default 587. |
+| `SMTP_TLS` | `starttls` (default: the connection must be upgraded before anything is said) or `tls` (TLS from the first byte; default on port 465). **TLS is required.** `off` is accepted only in development and only for a mail server on this machine (a local mail catcher, the tests). |
+| `SMTP_USERNAME`, `SMTP_PASSWORD` | If the service needs them. |
+| `MAIL_FROM` | The address email is sent from. A plain address. Required with `SMTP_HOST`. |
+| `MAIL_REPLY_TO` | Optional. |
+
+With `SMTP_HOST` set the server sends real email in development too. Outside
+development SMTP counts as the real mailer the server insists on; it then still refuses
+to start on mock providers, as before.
+
+**What is sent.** Every word of every email is in one file,
+`server/src/mail/templates.ts`, to be read and approved in one place. Each message is
+plain text plus the same lines as simple HTML: no images, no tracking, nothing loaded
+from anywhere, no read receipts. Subject lines carry the brand and nothing about the
+person, the money or the secret. A link can only point at this server's own `APP_URL`
+or `OPS_URL` (anything else is refused before sending), and only the activation and
+password-reset emails carry a link at all: a notice never contains a link that does
+something. The footer is a bracketed **placeholder** (`MAIL_FOOTER`) until compliance
+supplies the company details and regulatory wording an email must carry.
+
+**The outbox.** A request that causes an email only **writes** it to the database
+(table `mail_outbox`); it is sent from there, so a slow or broken mail server neither
+blocks nor fails the request. A message that cannot be sent is tried again after 1
+minute, 5, 15, 60 and 180 minutes (6 attempts), then marked failed, audited
+(`system.mail.failed`) and shown on the ops console's **Mail** page. One logical message
+has one key and is queued once however often the code that wants it sent runs. Each
+attempt is claimed in a transaction before it is made, so two passes never send the
+same message at once. The body, which may hold a single-use link, is stored encrypted
+and erased once the message is sent, has failed for good or was held back. Sent
+messages are kept as counts (no content) for 30 days.
+
+**Limits.** At most 20 messages an hour are queued for one address and 1,000 for
+everyone together, counted from the outbox itself (a restart does not reset them).
+Beyond that a message is recorded as held back (`system.mail.suppressed`), not sent.
+Nobody can use this server to flood an address.
+
+**What the Mail page shows.** How many are waiting, sent, failed or held back, and for
+each that did not go: when, the recipient **masked**, the kind of message, the number of
+attempts and a short error code. Never a subject, a body, a link or a whole address,
+and nothing is logged about a message either.
+
+**Limits of this, plainly.** SMTP cannot say "delivered exactly once". If the process
+dies, or the connection drops, between the mail server accepting a message and that
+being recorded, the message is sent again at the next attempt (with the same
+Message-ID, the same content): **a message can arrive twice in that one case; it is not
+lost.** "Sent" means the mail server accepted it, not that it reached the inbox: bounces
+are not read. A failed message is not retried by hand from the console; issue the link
+again. Not run against a real email service yet.
+
 ### Still not production-ready (ops console)
 
-- **Email delivery:** there is a `Mailer` interface and no implementation that sends
-  mail. The server will not start outside development without one.
+- **Email delivery:** see "Email". SMTP sending is built and tested against a fake mail
+  server in the tests; it has **not** been run against a real email service, and SPF,
+  DKIM and DMARC for the sending domain, bounce handling and unsubscribe rules are the
+  operator's to set up and are not built.
 - **The database is one SQLite file on the server's disk** (see "Database"): exactly
   one server process, no replication.
 - **A request that was approved but interrupted** (a crash, the mail or the provider
@@ -1165,9 +1225,10 @@ still to do.
 - **Provider B**: write an `EqualsTransport` (`server/src/providers/equals/raw.ts`) and
   pass it as `transports.equals` to `createRuntime`. Then go through `raw.ts` and
   replace every shape marked INVENTED with the documented one.
-- **A mailer**: implement `Mailer` (`server/src/mailer.ts`) and pass it to
-  `createRuntime(config, { mailer })`. Until both transports and a mailer are supplied
-  the server refuses to start outside development mode.
+- **A mailer**: set `SMTP_HOST` and `MAIL_FROM` (see "Email"), or implement `Mailer`
+  (`server/src/mailer.ts`) and pass it to `createRuntime(config, { mailer })`. Until both
+  transports and a mailer are supplied the server refuses to start outside development
+  mode.
 - **Another provider**: implement `ProviderAdapter`, add its key to `ProviderKey` and a
   factory to the registry in `server/src/index.ts`.
 

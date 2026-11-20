@@ -439,11 +439,13 @@ test('restart: sessions, locks, pending requests, invitations and the audit log 
 
 // --- Review of fe9d053 -----------------------------------------------------------------------------------
 
+/** Undoes what the migrations after 5 added (kept up to date with migrations.ts). */
+const AFTER_5 = 'DROP TABLE mail_outbox;';
 /** Turns a current database back into one as commit 2ac6785 left it (schema 4): the end of the log signed without the archive boundary, a plain development marker, no signed state. */
 function asSchema4(target: string): void {
   const db = new Db(target);
   const head = db.get<{ seq: number; hash: string; count: number }>('SELECT seq, hash, count FROM audit_head') as { seq: number; hash: string; count: number };
-  db.exec(`DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version = 5;
+  db.exec(`${AFTER_5} DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version >= 5;
     DELETE FROM meta WHERE key = 'state'; INSERT OR REPLACE INTO meta (key, value) VALUES ('used_in_development', '1');`);
   db.run('UPDATE audit_head SET mac = ?, key_id = ?', legacyHeadMac(keys.current, head.seq, head.hash, head.count), keys.current.id);
   db.close();
@@ -486,7 +488,7 @@ test('upgrade: a schema-4 database keeps the end of its log exactly as that vers
   asSchema4(file);
   assert.equal(versionOf(file, 4), 4);
   let stores = open5();
-  assert.equal(stores.db.schemaVersion(), 5);
+  assert.equal(stores.db.schemaVersion(), MIGRATIONS.length);
   assert.deepEqual(stores.verifyAudit(), { ok: true, entries, archived: 0, problem: null });
   assert.equal(stores.acceptedLogEnd, false);
   assert.equal((await stores.directory.getUser('usr_amira'))?.totpSecret, secret);
@@ -542,7 +544,7 @@ test('N5: nothing is signed on the word of the version table. A log cut short an
     db.close();
   };
   const CUT = `${DROP_TRIGGERS} DELETE FROM audit_log WHERE seq > ${entries - 3}; ${RECREATE_TRIGGERS}`;
-  const TO_4 = `DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version = 5;`;
+  const TO_4 = `${AFTER_5} DROP TABLE direct_payments; ALTER TABLE audit_head DROP COLUMN archived_through; DELETE FROM schema_version WHERE version >= 5;`;
   const TO_3 = `${TO_4} DROP INDEX companies_provider_account; DROP INDEX companies_name_key; ALTER TABLE companies DROP COLUMN name_key; ALTER TABLE audit_head DROP COLUMN count; ALTER TABLE audit_head DROP COLUMN mac; ALTER TABLE audit_head DROP COLUMN key_id; DELETE FROM schema_version WHERE version = 4;`;
   const NO_STATE = `DELETE FROM meta WHERE key = 'state';`;
   const cli = (...args: string[]) => spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY }, encoding: 'utf8' });
@@ -556,7 +558,7 @@ test('N5: nothing is signed on the word of the version table. A log cut short an
 
   // The audit's attack: cut the newest entries, remove what migrations 4 and 5 added, and let the next start "upgrade" it.
   attack(`${CUT} ${TO_3}`);
-  refusedWith(/version table says schema 3, but its signed record says 5: the database has been altered/, 'cut and downgraded to 3');
+  refusedWith(/version table says schema 3, but its signed record says \d+: the database has been altered/, 'cut and downgraded to 3');
   attack(`${CUT} ${TO_3} ${NO_STATE}`);
   refusedWith(/end of this database’s audit log is not signed[^]*The server will not sign the end of a log it cannot vouch for[^]*npm run audit:reseal/, 'cut, downgraded to 3, state removed');
   attack(`${CUT} ${TO_4} ${NO_STATE}`);
@@ -565,7 +567,7 @@ test('N5: nothing is signed on the word of the version table. A log cut short an
   refusedWith(/audit log is not signed/, 'the same with the record of the end edited to match');
   // Without cutting anything: the markers themselves.
   attack(TO_4);
-  refusedWith(/version table says schema 4, but its signed record says 5/, 'version row removed');
+  refusedWith(/version table says schema 4, but its signed record says \d+/, 'version row removed');
   attack(NO_STATE);
   refusedWith(/lost the signed record of its state/, 'state removed');
   attack(`UPDATE meta SET value = json_set(value, '$.dev', json(CASE WHEN json_extract(value, '$.dev') THEN 'false' ELSE 'true' END)) WHERE key = 'state'`);
@@ -575,7 +577,7 @@ test('N5: nothing is signed on the word of the version table. A log cut short an
   attack(`DELETE FROM meta WHERE key = 'key_check'`);
   refusedWith(/lost the marker that says which encryption key/, 'key marker removed');
   attack('DROP TABLE schema_version');
-  refusedWith(/version table says schema 0, but its signed record says 5/, 'version table removed');
+  refusedWith(/version table says schema 0, but its signed record says \d+/, 'version table removed');
   attack(`${NO_STATE} DELETE FROM schema_version; DELETE FROM meta WHERE key = 'key_check'`);
   refusedWith(/lost the marker/, 'every marker removed');
   // The end of the log on a current database: unsigned, removed, or pointing at a cut log.
@@ -776,7 +778,7 @@ test('L8: audit:verify, audit:checkpoint and db:backup open the database read-on
   for (const args of [['audit-verify'], ['backup', path.join(folder, 'old.sqlite')]]) {
     const run = spawnSync(tsx, ['src/cli/db.ts', ...args], { cwd: serverDir, env, encoding: 'utf8' });
     assert.equal(run.status, 2, args.join(' '));
-    assert.match(run.stderr, /schema version 3 and this version of the commands needs 5\. Start the server once/);
+    assert.match(run.stderr, /schema version 3 and this version of the commands needs \d+\. Start the server once/);
   }
   const old = new Db(file, MIGRATIONS.slice(0, 3));
   assert.equal(old.schemaVersion(), 3);
@@ -1063,4 +1065,34 @@ test('M5: any permission at all for group or others is refused, on the write-ahe
   chmodSync(shared, 0o700);
   chmodSync(real, 0o640);
   assert.throws(() => createSqliteStores({ path: linked, keys }), /can be read or changed by other users of this machine \(its permissions are 640/);
+});
+
+test('upgrade from a REAL schema-5 database (built by commit 50c4112, kept in test/support): every later migration applies, nothing is lost, the log still verifies', async () => {
+  // The fixture was made by running that commit's server in development mode with the test key and sending two activation links.
+  const fixture = path.join(serverDir, 'test', 'support', 'schema5-50c4112.sqlite');
+  writeFileSync(file, readFileSync(fixture), { mode: 0o600 });
+  assert.equal(versionOf(file), 5);
+  const before = new DatabaseSync(file, { readOnly: true });
+  const users = before.prepare('SELECT id, email FROM users ORDER BY id').all();
+  const logged = (before.prepare('SELECT COUNT(*) AS n FROM audit_log').get() as { n: number }).n;
+  before.close();
+  assert.equal(logged, 2);
+  // Not outside development: it is a development database, and says so in its signed state.
+  assert.throws(() => createSqliteStores({ path: file, keys, mode: 'strict' }), /has been used in development mode/);
+  assert.equal(versionOf(file), 5, 'a refused open runs no migration');
+  const stores = createSqliteStores({ path: file, keys, mode: 'development' });
+  assert.equal(stores.db.schemaVersion(), MIGRATIONS.length);
+  assert.ok(MIGRATIONS.length > 5);
+  assert.deepEqual(stores.verifyAudit(), { ok: true, entries: 2, archived: 0, problem: null });
+  assert.deepEqual(stores.db.all('SELECT id, email FROM users ORDER BY id'), users);
+  assert.equal((await stores.directory.listCompanies()).length, 2);
+  // What the later migrations added is there and empty.
+  assert.deepEqual(await stores.mail.list(), []);
+  await stores.audit.append(system('event.after'));
+  assert.equal(stores.verifyAudit().entries, 3);
+  stores.close();
+  // And it opens again as it is, with the commands too.
+  createSqliteStores({ path: file, keys, mode: 'development' }).close();
+  const verify = spawnSync(tsx, ['src/cli/db.ts', 'audit-verify'], { cwd: serverDir, env: { PATH: process.env.PATH ?? '', DATABASE_PATH: file, DATA_ENCRYPTION_KEY: TEST_DATA_KEY }, encoding: 'utf8' });
+  assert.equal(verify.status, 0, verify.stderr);
 });

@@ -8,6 +8,7 @@
  * APP_ENV=development is set explicitly. `npm run demo` sets it. Leaving
  * NODE_ENV unset does NOT make the server lenient.
  */
+import type { SmtpSettings } from './mail/smtp';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 
@@ -25,6 +26,11 @@ export interface Config {
   openOnNetwork: boolean;
   /** The key holder's one-off acceptance of an audit log whose end is not signed (AUDIT_ACCEPT_LOG_END): the label of that exact log end. */
   auditAcceptLogEnd: string | null;
+  /** The SMTP server emails are sent through, or null (development: the console outbox). */
+  smtp: SmtpSettings | null;
+  /** Emails queued for one address, and for everyone together, per hour. Beyond these a message is recorded as suppressed, not sent. */
+  mailPerRecipientPerHour: number;
+  mailGlobalPerHour: number;
   /**
    * How long a payment whose sending had an unknown outcome and was then refused is still looked for at the
    * provider (by its key) before it is called failed (PAYMENT_RECONCILE_HOURS, default 72).
@@ -104,6 +110,30 @@ export interface Config {
 }
 
 type Env = Partial<Record<string, string | undefined>>;
+
+/**
+ * SMTP_HOST, SMTP_PORT, SMTP_TLS, SMTP_USERNAME, SMTP_PASSWORD, MAIL_FROM, MAIL_REPLY_TO. Without SMTP_HOST there
+ * is no mail server (development: the console outbox; outside development the server will not start). TLS is
+ * required: `starttls` (the default; port 587) or `tls` (the default on port 465). `off` is accepted only in
+ * development and only for a mail server on this machine.
+ */
+function smtpSettings(env: Env, development: boolean): SmtpSettings | null {
+  const host = env.SMTP_HOST?.trim();
+  if (!host) return null;
+  const port = Number(env.SMTP_PORT ?? 587);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SMTP_PORT must be a port number.');
+  const tls = (env.SMTP_TLS ?? (port === 465 ? 'tls' : 'starttls')).toLowerCase();
+  if (tls !== 'tls' && tls !== 'starttls' && tls !== 'off') throw new Error('SMTP_TLS must be "starttls" (the default), "tls" (implicit TLS, usually port 465) or, for a mail server on this machine in development only, "off".');
+  if (tls === 'off' && !(development && (host === 'localhost' || host === '::1' || /^127\./.test(host)))) throw new Error('SMTP_TLS=off is refused: email is only ever sent over TLS, except to a mail server on this machine in development mode.');
+  const address = /^[^\s@<>,;"\r\n]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+  const from = env.MAIL_FROM?.trim() ?? '';
+  if (!address.test(from)) throw new Error('MAIL_FROM must be set to the address emails are sent from (a plain address such as no-reply@globalconnect.co.uk) when SMTP_HOST is set.');
+  const replyTo = env.MAIL_REPLY_TO?.trim() || null;
+  if (replyTo !== null && !address.test(replyTo)) throw new Error('MAIL_REPLY_TO must be a plain email address.');
+  const username = env.SMTP_USERNAME || null;
+  if (username && !env.SMTP_PASSWORD) throw new Error('SMTP_PASSWORD must be set when SMTP_USERNAME is.');
+  return { host, port, tls, username, password: env.SMTP_PASSWORD ?? null, from, replyTo };
+}
 
 const MINUTE = 60_000;
 
@@ -290,6 +320,9 @@ export function loadConfig(env: Env = process.env): Config {
     port,
     host,
     openOnNetwork,
+    smtp: smtpSettings(env, development),
+    mailPerRecipientPerHour: 20,
+    mailGlobalPerHour: 1000,
     auditAcceptLogEnd: env.AUDIT_ACCEPT_LOG_END?.trim() || null,
     development,
     strict,
