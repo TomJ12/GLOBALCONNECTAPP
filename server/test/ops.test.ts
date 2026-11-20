@@ -1868,6 +1868,11 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const high = await olu.act(url, form({ defaultBps: '450', allowHigh: 'yes' }));
   assert.equal(high.status, 303, high.body.slice(-300));
   assert.match((await h.stores.ops.approvals.get(idOf(high.location)))?.warnings.join(' ') ?? '', /This sets a margin of 450 basis points \(4\.5%\), above the usual limit of 300\. It was asked for explicitly\./);
+  // What is stored is checked again when the request is carried out: a request whose stored figures were altered is refused.
+  const tampered = await pat.act(url, form({ defaultBps: '60' }));
+  await h.stores.ops.approvals.mutate(idOf(tampered.location), (record) => (record ? { ...record, params: { ...record.params, config: JSON.stringify({ defaultBps: 1500, forwardBps: null, overrides: [], tiers: [] }) } } : record));
+  assert.match((await admin.act(`/ops/approvals/${idOf(tampered.location)}/approve`)).body, /is 1500 basis points/);
+  assert.equal((await stored())?.defaultBps, 80);
   // STALE: a second request made from the same starting point is refused once the first has been carried out.
   const other = await pat.act(url, form({ defaultBps: '70' }));
   assert.equal((await admin.act(`/ops/approvals/${idOf(high.location)}/approve`)).status, 303);

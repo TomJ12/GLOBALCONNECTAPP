@@ -65,6 +65,9 @@ test('amounts: the fixed side is exactly what was asked; the other side is round
       }
     }
   }
+  // Whatever the arithmetic says, never better than the provider's own figures (here the provider gave less than its rate implies).
+  assert.deepEqual(clientTermsOf({ ...sellGbp('100.00'), buyAmount: '124.00' }, 1), { direction: 'sell', rate: '1.249875', sellAmount: '100.00', buyAmount: '124.00', revenue: { amount: '0.00', currency: 'USD' } });
+  assert.deepEqual(clientTermsOf({ ...sellGbp('101.00'), fixedSide: 'buy', buyAmount: '125.00' }, 1), { direction: 'sell', rate: '1.249875', sellAmount: '101.00', buyAmount: '125.00', revenue: { amount: '0.00', currency: 'GBP' } });
   // Zero margin: the provider's terms, to the penny, and nothing kept.
   assert.deepEqual(clientTermsOf(sellGbp('1234.56'), 0), { direction: 'sell', rate: '1.250000', sellAmount: '1234.56', buyAmount: '1543.20', revenue: { amount: '0.00', currency: 'USD' } });
   // An amount so small that nothing would be received is refused rather than taken for nothing.

@@ -745,6 +745,133 @@ payees on provider A to see a held payment survive a restart and go through. Lis
 who can approve reads every membership; fine at this size. There is no notification to
 approvers (no email or push): they see the payment when they open the app.
 
+### Client rates and Global Connect's margin
+
+A client only ever sees **their own rate**: what they get after Global Connect's
+margin. The provider's rate, the mid-market rate and the margin itself never leave the
+server, in any API response or error message. The code is `server/src/rates/margin.ts`
+(the arithmetic) and `server/src/rates/service.ts` (everything a client is told about a
+rate, a quote or a conversion passes through it).
+
+**How the client's rate is worked out.** A rate is "how many units of the quote
+currency one unit of the base currency is worth". With a margin of *m* basis points
+(1 bp = 0.01%):
+
+| The client... | Client rate | So they... |
+| --- | --- | --- |
+| **sells** the base currency | provider rate x (1 - m) | receive fewer units of the quote currency |
+| **buys** the base currency | provider rate x (1 + m) | pay more units of the quote currency |
+
+The margin works against the client in both directions. All arithmetic is decimal
+(big.js), never floating point.
+
+**Rounding never favours the client by accident**, and it is the same for the
+indicative rate, the held quote and the booked conversion because all three come from
+the same two functions:
+
+- a client rate is kept to **6 decimal places**, rounded **down** when the client sells
+  the base currency and **up** when they buy it;
+- the amount on the side the client typed stays exactly what they typed; the other
+  amount is worked out at the client rate and rounded **down** to the currency's minor
+  unit if the client receives it, **up** if they pay it;
+- whatever the arithmetic says, the client's amounts are never better than the
+  provider's own quote (they are clamped to it);
+- an amount so small that the client would receive nothing is refused, not taken.
+
+A conversion is booked on exactly the amounts of the held quote; the server keeps its
+own record of those amounts and answers from that record, so what the client is shown
+for a conversion is the same when it is booked, when it is looked up again and in the
+list of forward contracts.
+
+**Which margin applies** to a trade, in this order: for a forward contract, the
+company's forward margin if one is set; otherwise an override for that currency pair
+and direction; otherwise the tier for the amount (larger amounts, smaller margin);
+otherwise the company's default. A company with no configuration of its own uses
+`DEFAULT_MARGIN_BPS`. An override is written for a pair and a direction (`GBPUSD
+sell 40`: 40 bp when the client sells GBP for USD) and also covers the same trade
+spelled the other way round (buying the first currency of `USDGBP`). Tier amounts are
+in the first currency of the pair as the provider quotes it. The indicative rate is for
+no particular amount, so no tier applies to it: a tier can only make a held quote
+better than the indicative rate, never worse. A forward with its own margin can be
+priced differently from the indicative (spot) rate.
+
+**What the app receives.** `GET /v1/rates/:base/:quote` returns `rate` (the client's
+rate when they sell the base currency), `buyRate` (when they buy it), `indicative:
+true` and `asOf`. The rate history is the client's sell rate at each point. A quote and
+a conversion carry the client's rate and amounts and the "held until" time. Nothing
+else. The Rates screen shows both directions for each pair ("Sell GBP" / "Buy GBP"),
+labelled "Your rate · Indicative"; each opens Convert set up for that trade, and
+Convert gets its held quote from the same code, so the two agree apart from market
+movement. The Home total is a valuation, not an offer: other currencies are valued at
+the rate the client would sell them at, and it says "estimated at your current sell
+rates". (A two-way price lets anyone estimate the midpoint between the two; that is
+true of any buy/sell price and is not hidden.)
+
+**Tests scan every client response.** The server test harness checks every reply the
+client API gives, in every test, for a field or wording that speaks of a mid rate, a
+margin, a markup, a spread, basis points, wholesale or partner figures, provider
+amounts or revenue (`forbiddenInClientResponse` in `server/test/helpers.ts`), and fails
+the test that caused it.
+
+**Where the margin is applied: a setting per provider.**
+
+| `MARGIN_APPLIED_BY_CURRENCYCLOUD` / `MARGIN_APPLIED_BY_EQUALS` | Meaning |
+| --- | --- |
+| `server` (default; what both mocks use) | This server works out the client's rate as above and sends the client's side of the trade to the provider when it books. |
+| `provider` | The provider already returns the client's rate, with Global Connect's markup configured on the provider's side. The server adds **nothing** on top (that would charge the client twice), passes the provider's figures through, and does not know the revenue. A company's margin configuration is stored but not used. |
+
+These names are server configuration; no client sees them.
+
+**Changing a company's margin (ops console).** Any staff member can see a company's
+margin on its page. Changing it is a request that a **second staff member who is an ops
+admin** approves, typing their password again; the confirmation and the request show a
+**worked example** at the provider's rate at that moment ("selling GBP 10,000 for USD:
+the client rate changes from 1.293500 to 1.294800, so they receive USD 12948.00 instead
+of USD 12935.00", the same for buying, for the largest tier, for a forward and for up
+to three overridden pairs). A negative margin is never accepted; one above 300 bp (3%)
+only when the request ticks "allow a margin this high", and the approver is warned;
+above 2000 bp never. The change is written to the audit log with the old and the new
+configuration and both people. It applies to quotes given from then on; a quote a
+client is already holding keeps its rate.
+
+**Revenue (ops admins only).** When a conversion is booked the server records, before
+it asks the provider, the provider's rate and amounts, the client's rate and amounts,
+the margin applied and the resulting revenue: the difference between the two, in the
+currency it arises in (the side the client did not fix). It is not converted into one
+currency. `/ops/revenue` lists conversions with these figures, with totals by company
+and month, filters for company and dates, and a CSV download (cells a spreadsheet
+would run as a formula are written as text; each download is in the audit log). Only
+ops admins can open it; no client API serves any of it. A booking whose answer from the
+provider was lost stays on the list as "not confirmed by the provider" until the
+conversion is found again by its key.
+
+**What is not settled, and must be before real use:**
+
+- *How the margin is collected from a real provider is not verified.* With `server`,
+  provider A's adapter sends the client's side of the trade as `client_buy_amount` and
+  `client_sell_amount` when it books. We believe those parameters exist but have not
+  confirmed them, or how the difference reaches Global Connect, against the provider.
+  Provider B's public API has no such thing: the adapter sends an **invented**
+  `clientAmounts` field that only the mock understands. Either may turn out to need
+  `provider` instead.
+- If a provider books a conversion **without** the client's terms it was sent, the
+  client is still shown only their own terms (from the server's record), the revenue
+  row is marked "CHECK" and an error is logged; but the provider's own statement and
+  balance for that client would then show the provider's figures. Nothing reconciles
+  that automatically.
+- Held quotes are in the server's memory: a restart forgets them and the client is
+  asked to get a new rate (the revenue record of a booking already sent is in the
+  database and survives).
+- The default margin in development (50 bp) is a **sample**, not Global Connect's
+  pricing. Outside development `DEFAULT_MARGIN_BPS` has no default and the server will
+  not start without it.
+- **The mock rates move.** In `npm run demo` both mock providers move their sample
+  rates as a deterministic random walk, seeded per pair: every 20 seconds a rate moves
+  by one basis point or stays, wandering around the sample rate (never more than
+  1.28% from it). It is the same on every machine and after a restart, and it is not
+  market data. `MOCK_MOVING_RATES=0` turns it off. The in-app demo (no server) keeps
+  fixed sample rates and has no margin: it shows one rate for both directions.
+
 ### Provider routing and isolation
 
 - The session holds a company id. Every data route resolves the adapter from **that**

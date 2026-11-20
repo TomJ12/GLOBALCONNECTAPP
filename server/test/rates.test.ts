@@ -11,6 +11,7 @@ import Big from 'big.js';
 import { walkedRate, walkOffset, WALK_STEP_MS } from '@/api/adapters/mockRateWalk';
 import * as schemas from '@/api/schemas';
 
+import { loadConfig } from '../src/config';
 import type { MarginConfig } from '../src/rates/margin';
 import { AMIRA, BEN, forbiddenInClientResponse, harness, type Harness } from './helpers';
 
@@ -108,6 +109,10 @@ test('the indicative rate, the held quote and the booked conversion agree, on bo
   assert.deepEqual(again.json, booked.json);
   assert.deepEqual((await get(amira.token, '/v1/conversions/by-key/rates-key-0001')), booked.json);
   assert.equal(await balance(amira.token, 'USD'), new Big(usd).plus('1297.40').toFixed(2));
+  // The same key with a DIFFERENT quote: still the first conversion, on its terms; the record of it is not rewritten.
+  const otherQuote = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '500.00' });
+  assert.deepEqual((await book(amira.token, otherQuote.id, 'rates-key-0001')).json, booked.json);
+  assert.deepEqual((await revenue()).map((item) => [item.clientSellAmount, item.quoteId, item.status]), [['1000.00', sell.id, 'booked']]);
 
   // What the server keeps on record (never sent to a client): both sides, the margin, the revenue.
   const [record] = await revenue();
@@ -226,6 +231,12 @@ test('a provider that books without the client’s terms: the client still sees 
   assert.deepEqual((await get(amira.token, '/v1/conversions/by-key/rates-key-m-0001')), booked.json);
   assert.equal((await revenue())[0]?.mismatch, true);
   assert.ok(h.logs.some((line) => /without the client terms/.test(line)));
+  // The same for a forward, and for the list of forwards read back from the provider afterwards.
+  const forward = await quoteFor(amira.token, { kind: 'forward', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00', settlementDate: '2027-03-01' });
+  const forwardBooked = await book(amira.token, forward.id, 'rates-key-m-0009');
+  assert.equal(forwardBooked.status, 200);
+  const listed = (await get(amira.token, '/v1/forwards')).items.find((item: { id: string }) => item.id === forwardBooked.json.id);
+  assert.deepEqual([listed.rate, listed.sellAmount, listed.buyAmount], ['1.293500', '1000.00', '1293.50']);
 
   // The answer to a booking never arrives; the record stays open, and is closed when the conversion is found by its key.
   h.providerA.request = async (request) => {
@@ -255,7 +266,39 @@ test('a provider that books without the client’s terms: the client still sees 
   assert.equal(forbiddenInClientResponse(JSON.stringify(tiny.json)), null);
 });
 
-test('the scan that guards every client response does catch the forbidden fields', () => {
+test('the mock providers take the client’s side of a trade only when it is no better than the quote; configuration is checked', async () => {
+  h = await harness();
+  for (const [companyId, pair] of [['co_northfield', ['GBP', 'USD']], ['co_castlebrook', ['GBP', 'EUR']]] as const) {
+    const company = (await h.stores.directory.getCompany(companyId)) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getCompany>>>;
+    const adapter = await h.registry.forCompany(company);
+    const quote = await adapter.createQuote({ kind: 'spot', sellCurrency: pair[0], buyCurrency: pair[1], fixedSide: 'sell', amount: '100.00' });
+    const more = new Big(quote.buyAmount).plus('0.01').toFixed(2);
+    await assert.rejects(adapter.bookConversion({ quote, idempotencyKey: `better-${companyId}-1`, clientTerms: { sellAmount: quote.sellAmount, buyAmount: more } }), companyId);
+    await assert.rejects(adapter.bookConversion({ quote, idempotencyKey: `better-${companyId}-2`, clientTerms: { sellAmount: '99.99', buyAmount: quote.buyAmount } }), companyId);
+    const worse = new Big(quote.buyAmount).minus('1.00').toFixed(2);
+    const booked = await adapter.bookConversion({ quote, idempotencyKey: `better-${companyId}-3`, clientTerms: { sellAmount: quote.sellAmount, buyAmount: worse } });
+    assert.deepEqual([booked.sellAmount, booked.buyAmount], [quote.sellAmount, worse]);
+  }
+  const dev = (env: Record<string, string>) => loadConfig({ APP_ENV: 'development', ...env });
+  assert.deepEqual([dev({}).marginAppliedBy, dev({}).defaultMarginBps, dev({}).rateCacheMs, dev({}).mockMovingRates], [{ currencycloud: 'server', equals: 'server' }, 50, 5000, true]);
+  assert.deepEqual(dev({ MARGIN_APPLIED_BY_CURRENCYCLOUD: 'provider', DEFAULT_MARGIN_BPS: '0', MOCK_MOVING_RATES: '0' }).marginAppliedBy, { currencycloud: 'provider', equals: 'server' });
+  assert.throws(() => dev({ MARGIN_APPLIED_BY_EQUALS: 'both' }), /MARGIN_APPLIED_BY_EQUALS must be "server"/);
+  for (const DEFAULT_MARGIN_BPS of ['-1', '301', '12.5', 'some']) assert.throws(() => dev({ DEFAULT_MARGIN_BPS }), /DEFAULT_MARGIN_BPS must be a whole number/);
+  assert.throws(() => dev({ RATE_CACHE_SECONDS: '-1' }), /RATE_CACHE_SECONDS/);
+  // Outside development there is no default margin: it has to be said.
+  const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/gc/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
+  assert.throws(() => loadConfig(LIVE), /DEFAULT_MARGIN_BPS must be set/);
+  assert.equal(loadConfig({ ...LIVE, DEFAULT_MARGIN_BPS: '0' }).defaultMarginBps, 0);
+});
+
+test('the scan that guards every client response does catch the forbidden fields', async () => {
+  // It is applied to what the API really sends: a reply that carries a forbidden word fails the call that got it.
+  h = await harness();
+  const amira = await signedIn(AMIRA);
+  assert.equal((await h.call('GET', '/v1/company', { token: amira.token })).status, 200);
+  await h.stores.directory.updateCompany('co_northfield', (company) => ({ ...company, name: 'Wholesale Margin Traders Ltd' }));
+  await assert.rejects(h.call('GET', '/v1/company', { token: amira.token }), /sent a client something it must never see/);
+
   for (const leak of ['{"midRate":"1.3"}', '{"mid":"1.3"}', '{"mid_market_rate":"1.3"}', '{"quote":{"marginBps":50}}', '{"margin":{"defaultBps":50}}', '{"providerRate":"1.3"}', '{"provider_rate":"1.3"}', '{"partner_rate":"1.3"}', '{"core_rate":"1.3"}', '{"revenueAmount":"2.60"}', '{"markup":"0.5"}', '{"spread":"0.5"}', '{"bps":50}', '{"wholesaleRate":"1"}', '{"appliedBy":"server"}', '{"error":{"message":"margin could not be worked out"}}', '{"note":"mid-market rate"}', '{"note":"50 basis points"}']) {
     assert.notEqual(forbiddenInClientResponse(leak), null, leak);
   }
