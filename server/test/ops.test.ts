@@ -1785,3 +1785,132 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   await ask(second.email);
   assert.equal(h.outbox.sent.length, count);
 });
+
+test('ops: a company’s FX margin is changed by request with a worked example, approved only by an ops admin with their password, bounded, audited with old and new values; revenue is for ops admins only', async () => {
+  h = await harness();
+  const admin = await staff();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  const pat = await staff('pat@globalconnect.example', 'ops');
+  const { secret } = await h.activate(AMIRA);
+  const amira = (await h.login(AMIRA, secret)).json.token as string;
+  const clientRate = async () => (await h.call('GET', '/v1/rates/GBP/USD', { token: amira })).json;
+  const stored = () => h.stores.margins.get('co_northfield');
+  const url = '/ops/companies/co_northfield/margin';
+  const form = (extra: Record<string, string> = {}) => ({ defaultBps: '80', forwardBps: '', overrides: '', tiers: '', ...extra });
+
+  // Anyone on staff can see the configuration (here: the server default), and what it means.
+  const page = await olu.browser.get('/ops/companies/co_northfield');
+  assert.match(page.body, /<h2>FX margin<\/h2><p>Now: <strong>default 50 bp; forwards as spot<\/strong> \(the server default: this company has no configuration of its own\)/);
+  assert.match(page.body, /A client only ever sees their own rate: never the provider’s rate and never this margin/);
+  assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.293500', '1.306500']);
+
+  // BOUNDS. Negative: never. Above 300 bp: only when the request says so. Above 2000: never. Nothing is requested.
+  const refused = async (fields: Record<string, string>, message: RegExp) => {
+    const reply = await olu.act(url, form(fields));
+    assert.equal(reply.status, 400, `${JSON.stringify(fields)} -> ${reply.status}`);
+    assert.match(reply.body, message, JSON.stringify(fields));
+  };
+  await refused({ defaultBps: '-5' }, /A negative margin is never accepted/);
+  await refused({ overrides: 'GBPUSD sell -10' }, /A negative margin is never accepted/);
+  await refused({ tiers: '50000 -1' }, /A negative margin is never accepted/);
+  await refused({ defaultBps: '301' }, /is 301 basis points \(3\.01%\), which is more than 300/);
+  await refused({ forwardBps: '450' }, /more than 300/);
+  await refused({ defaultBps: '2001', allowHigh: 'yes' }, /cannot be more than 2000/);
+  await refused({ defaultBps: 'lots' }, /whole number of basis points/);
+  await refused({ overrides: 'GBPUSD sideways 10' }, /is not an override/);
+  await refused({ overrides: 'GBPGBP sell 10' }, /is not a currency pair/);
+  await refused({ tiers: '50000 90' }, /HIGHER margin/);
+  assert.equal(await stored(), null);
+  assert.equal((await h.stores.ops.approvals.list()).filter((item) => item.action === 'company.margin').length, 0);
+
+  // The confirmation page (before anything is requested) is marked high-impact and shows the worked example.
+  const confirmation = await olu.browser.post(url, form({ overrides: 'GBPUSD sell 40\nEURUSD both 35', tiers: '50000 60' }));
+  assert.equal(confirmation.status, 200);
+  assert.match(confirmation.body, /selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800, so they receive USD 12948\.00 instead of USD 12935\.00/);
+
+  // An ops user asks. Nothing changes yet. The request says old and new and what it does to a real trade.
+  const asked = await olu.act(url, form({ overrides: 'GBPUSD sell 40\nEURUSD both 35', tiers: '50000 60', forwardBps: '120' }));
+  assert.equal(asked.status, 303, asked.body.slice(-400));
+  const id = idOf(asked.location);
+  assert.equal(await stored(), null);
+  assert.equal((await clientRate()).rate, '1.293500');
+  const request = await h.stores.ops.approvals.get(id);
+  assert.match(request?.summary ?? '', /Change the FX margin for company “Northfield Trading Ltd” \(co_northfield\) FROM default 50 bp; forwards as spot \(the server default\) TO default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from 50000: 60 bp\./);
+  assert.match(request?.summary ?? '', /Worked example at the provider’s rate when this was requested: selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800, so they receive USD 12948\.00 instead of USD 12935\.00; buying GBP 10,000 with USD: the client rate changes from 1\.306500 to 1\.310400, so they pay USD 13104\.00 instead of USD 13065\.00; selling GBP 50,000 for USD: [^;]+; a forward selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.284400[^;]+; selling EUR 10,000 for USD: /);
+  const approvalPage = await admin.browser.get(`/ops/approvals/${id}`);
+  assert.match(approvalPage.body, /selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800/);
+  assert.match(approvalPage.body, /Every conversion this company’s people book from the moment this is approved is priced with the new margin/);
+  // Another ops USER cannot approve it, nor can the requester; an ops admin can, and only with their password.
+  assert.equal((await pat.act(`/ops/approvals/${id}/approve`)).status, 403);
+  assert.equal((await olu.act(`/ops/approvals/${id}/approve`)).status, 403);
+  const approve = `/ops/approvals/${id}/approve`;
+  const needsPassword = await admin.browser.post(approve, {});
+  assert.match(needsPassword.body, /name="password"/);
+  const wrong = await confirmed((to, fields) => admin.browser.post(to, fields), approve, {}, 'not the password');
+  assert.notEqual(wrong.status, 303);
+  assert.equal(await stored(), null);
+  assert.equal((await clientRate()).rate, '1.293500');
+  assert.equal((await admin.act(approve)).status, 303);
+
+  // Done: stored, the client's rate moved (override: 40 bp selling GBP; default 80 bp buying), audited with old and new values and both people.
+  const now = await stored();
+  assert.deepEqual([now?.defaultBps, now?.forwardBps, now?.overrides, now?.tiers, now?.updatedBy, now?.approvedBy], [80, 120, [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }, { pair: 'EURUSD', direction: 'both', bps: 35 }], [{ fromAmount: '50000', bps: 60 }], olu.email, admin.email]);
+  assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.294800', '1.310400']);
+  const entry = (await audit('ops.company.margin')).find((item) => item.outcome === 'success');
+  assert.deepEqual([entry?.target?.id, entry?.detail.from, entry?.detail.to, entry?.detail.approvedBy, entry?.actor.label], ['co_northfield', 'default 50 bp; forwards as spot', 'default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from 50000: 60 bp', admin.email, olu.email]);
+  assert.equal((await audit('ops.approval.approve')).find((item) => item.detail.request === id)?.detail.passwordChecked, 'yes');
+  assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, new RegExp(`Now: <strong>default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from 50000: 60 bp</strong> \\(set [^)]* by ${olu.email}, approved by ${admin.email}\\)`));
+  // The other company is untouched.
+  assert.equal(await h.stores.margins.get('co_castlebrook'), null);
+
+  // Asking for what is already there is refused; a high margin is accepted only with the flag, and the approver is warned.
+  assert.match((await olu.act(url, form({ overrides: 'GBPUSD sell 40\nEURUSD both 35', tiers: '50000 60', forwardBps: '120' }))).body, /That is already this company’s margin/);
+  const high = await olu.act(url, form({ defaultBps: '450', allowHigh: 'yes' }));
+  assert.equal(high.status, 303, high.body.slice(-300));
+  assert.match((await h.stores.ops.approvals.get(idOf(high.location)))?.warnings.join(' ') ?? '', /This sets a margin of 450 basis points \(4\.5%\), above the usual limit of 300\. It was asked for explicitly\./);
+  // STALE: a second request made from the same starting point is refused once the first has been carried out.
+  const other = await pat.act(url, form({ defaultBps: '70' }));
+  assert.equal((await admin.act(`/ops/approvals/${idOf(high.location)}/approve`)).status, 303);
+  assert.equal((await stored())?.defaultBps, 450);
+  const stale = await admin.act(`/ops/approvals/${idOf(other.location)}/approve`);
+  assert.match(stale.body, /margin changed since this was requested/);
+  assert.equal((await stored())?.defaultBps, 450);
+
+  // REVENUE: a booked conversion appears, with both rates, the margin and the revenue; totals by company and month; CSV. Ops admins only.
+  await h.stores.margins.mutate('co_northfield', (current) => (current ? { ...current, defaultBps: 80, overrides: [], tiers: [], forwardBps: null } : current));
+  const quote = (await h.call('POST', '/v1/quotes', { token: amira, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' } })).json;
+  const booked = await h.call('POST', '/v1/conversions', { token: amira, body: { quoteId: quote.id }, headers: { 'idempotency-key': 'ops-revenue-0001' } });
+  assert.equal(booked.status, 200, JSON.stringify(booked.json));
+  for (const path of ['/ops/revenue', '/ops/revenue.csv']) {
+    for (const person of [olu, pat]) {
+      const denied = await person.browser.get(path);
+      assert.equal(denied.status, 403, path);
+      assert.doesNotMatch(denied.body, /1\.3000|10\.40/);
+    }
+  }
+  assert.doesNotMatch((await olu.browser.get('/ops')).body, /href="\/ops\/revenue"/);
+  const revenue = await admin.browser.get('/ops/revenue');
+  assert.equal(revenue.status, 200);
+  assert.match(revenue.body, /<td>Northfield Trading Ltd<\/td><td>2026-11<\/td><td>1<\/td><td>USD 10\.40<\/td>/);
+  assert.match(revenue.body, /sold GBP 1000\.00, bought USD 1289\.60<\/td><td>1\.3000<\/td><td>1\.289600<\/td><td>80 bp<\/td><td>USD 10\.40<\/td><td>Booked<\/td>/);
+  assert.match((await admin.browser.get('/ops/revenue?company=co_castlebrook')).body, /No conversions in this period/);
+  assert.match((await admin.browser.get('/ops/revenue?from=2026-11-11&to=2026-11-11')).body, /USD 10\.40/);
+  assert.match((await admin.browser.get('/ops/revenue?from=2026-11-12')).body, /No conversions in this period/);
+  assert.equal((await admin.browser.get('/ops/revenue?from=yesterday')).status, 400);
+  const exports = (await audit('ops.revenue.export')).length;
+  const csv = await admin.browser.get('/ops/revenue.csv?company=co_northfield');
+  assert.equal(csv.status, 200);
+  assert.match(String(csv.headers['content-type']), /^text\/csv/);
+  const lines = csv.body.trim().split('\r\n');
+  assert.equal(lines[0], 'booked_at,company_id,company,conversion_id,status,kind,pair,direction,sell_currency,buy_currency,provider_rate,client_rate,provider_sell_amount,provider_buy_amount,client_sell_amount,client_buy_amount,margin_bps,margin_applied_by,revenue_amount,revenue_currency,needs_checking');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1], `2026-11-11T${new Date(h.clock.now).toISOString().slice(11)},co_northfield,Northfield Trading Ltd,${booked.json.id},booked,spot,GBPUSD,sell,GBP,USD,1.3000,1.289600,1000.00,1300.00,1000.00,1289.60,80,server,10.40,USD,no`);
+  const exported = (await audit('ops.revenue.export'))[0];
+  assert.equal((await audit('ops.revenue.export')).length, exports + 1);
+  assert.deepEqual([exported?.actor.label, exported?.detail.rows, exported?.detail.company], [admin.email, '1', 'co_northfield']);
+  // A company name that a spreadsheet would run as a formula is written as text.
+  await h.stores.directory.updateCompany('co_northfield', (company) => ({ ...company, name: '=HYPERLINK("http://x.example","Northfield, Ltd")' }));
+  assert.match((await admin.browser.get('/ops/revenue.csv')).body, /,co_northfield,"'=HYPERLINK\(""http:\/\/x\.example"",""Northfield, Ltd""\)",/);
+  // Nothing the client was sent in all of this carries any of it (every reply was scanned as it came; and by value:)
+  for (const body of h.bodies) assert.ok(!/1\.3000|"1\.3"|10\.40/.test(body), body.slice(0, 200));
+});
