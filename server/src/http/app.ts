@@ -264,6 +264,7 @@ export async function buildApp(deps: AppDeps) {
   });
   const notices = new SecurityNotices(mail, now, (message) => app.log.error({ message }, 'security notice failed'));
   auth.attach(mail, notices);
+  opsAuth.attach(mail, notices);
   const authenticatorResets = new AuthenticatorResets(deps.stores, auth, mail, notices, config.authenticatorResetDelayMs, now);
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
 

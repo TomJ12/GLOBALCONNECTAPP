@@ -92,6 +92,7 @@ const MESSAGES: Record<string, string> = {
   locked: 'Too many wrong attempts. Try again later.',
   invalid_credentials: 'The email or password is not right.',
   challenge_expired: 'That sign-in attempt has expired. Start again.',
+  reset_invalid: 'That reset link is not valid any more: it was used, replaced or has expired. Ask for a new one.',
   activation_invalid: 'That activation code is not valid. It may have expired, been used or been replaced.',
   weak_password: 'Choose a password of at least 12 characters that is not a common one.',
 };
@@ -604,7 +605,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           reply,
           anchor,
           'Staff sign-in',
-          h`${alert(message)}<form method="post" action="/ops/login">${hidden(anchor)}<label>Email <input type="email" name="email" required autocomplete="username"></label><label>Password <input type="password" name="password" required autocomplete="current-password"></label><button>Continue</button></form><p class="muted">Global Connect staff only. Clients sign in through the app.</p>`,
+          h`${alert(message)}<form method="post" action="/ops/login">${hidden(anchor)}<label>Email <input type="email" name="email" required autocomplete="username"></label><label>Password <input type="password" name="password" required autocomplete="current-password"></label><button>Continue</button></form><p><a href="/ops/forgot">Forgot your password?</a></p><p class="muted">Global Connect staff only. Clients sign in through the app.</p>`,
           reply.statusCode,
         );
       const codeForm = (reply: FastifyReply, anchor: string, challengeId: string, message: string | null = null) =>
@@ -615,7 +616,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           h`${alert(message)}<form method="post" action="/ops/login/verify">${hidden(anchor, { challengeId })}<label>Code from your authenticator app, or a recovery code <input name="code" required autocomplete="one-time-code"></label><label>Type <select name="method"><option value="totp">Authenticator code</option><option value="recovery">Recovery code</option></select></label><button>Sign in</button></form>`,
           reply.statusCode,
         );
-      ops.get('/login', { preHandler: limitAttempts }, async (request, reply) => loginForm(reply, preAnchor(request, reply)));
+      ops.get('/login', { preHandler: limitAttempts }, async (request, reply) =>
+        loginForm(reply, preAnchor(request, reply), queryOf(request, 'done') === 'password_reset' ? 'Your password has been changed and every session signed out. Sign in with the new password.' : null),
+      );
       publicPost(
         '/login',
         async (form, anchor, request, reply) => codeForm(reply, anchor, (await opsAuth.login(text(form, 'email'), typeof form.password === 'string' ? form.password : '', request.ip)).challengeId),
@@ -628,6 +631,55 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           return reply.header('Set-Cookie', [cookie(SESSION_COOKIE, token), cookie(PRE_COOKIE, '', true)]).redirect('/ops', 303);
         },
         (form, anchor, message, reply) => (message === MESSAGES.challenge_expired ? loginForm(reply, anchor, message) : codeForm(reply, anchor, text(form, 'challengeId'), message)),
+      );
+      // --- Forgotten password: the emailed link AND a code from the authenticator or a recovery code ---
+      const SAME_ANSWER = 'If that address belongs to an active staff account, an email with a link has been sent to it. The link works for 30 minutes and you will also need a code from your authenticator app, or a recovery code.';
+      const forgotForm = (reply: FastifyReply, anchor: string, message: string | null = null, sent = false) =>
+        publicPage(
+          reply,
+          anchor,
+          'Reset your password',
+          sent
+            ? h`<p class="flash">${SAME_ANSWER}</p><p class="muted">Lost your authenticator and your recovery codes as well? That cannot be done here: ask an ops admin, who needs a second ops admin’s approval.</p><p><a href="/ops/login">Back to sign-in</a></p>`
+            : h`${alert(message)}<form method="post" action="/ops/forgot">${hidden(anchor)}<label>Email <input type="email" name="email" required autocomplete="username"></label><button>Email me a reset link</button></form><p class="muted">The link alone changes nothing: you will also need a code from your authenticator app, or a recovery code.</p><p><a href="/ops/login">Back to sign-in</a></p>`,
+          reply.statusCode,
+        );
+      const resetForm = (reply: FastifyReply, anchor: string, resetCode: string, message: string | null = null) =>
+        publicPage(
+          reply,
+          anchor,
+          'Choose a new password',
+          resetCode
+            ? h`${alert(message)}<form method="post" action="/ops/reset/complete">${hidden(anchor, { resetCode })}<label>Code from your authenticator app, or a recovery code <input name="code" required autocomplete="one-time-code"></label><label><input type="checkbox" name="method" value="recovery"> This is a recovery code</label><label>New password (at least 12 characters, not a common one) <input type="password" name="password" required minlength="12" autocomplete="new-password"></label><button>Set password</button></form><p class="muted">Your authenticator and recovery codes are not changed. Every signed-in session of yours is signed out.</p>`
+            : h`${alert(message)}<form method="post" action="/ops/reset">${hidden(anchor)}<label>Reset code <input name="resetCode" required autocomplete="off" data-from-fragment></label><button>Continue</button></form>`,
+          reply.statusCode,
+        );
+      ops.get('/forgot', { preHandler: limitAttempts }, async (request, reply) => forgotForm(reply, preAnchor(request, reply)));
+      publicPost(
+        '/forgot',
+        async (form, anchor, request, reply) => {
+          // The same page whoever the address belongs to, or nobody.
+          await opsAuth.requestPasswordReset(text(form, 'email'), request.ip);
+          return forgotForm(reply, anchor, null, true);
+        },
+        (_form, anchor, message, reply) => forgotForm(reply, anchor, message),
+      );
+      ops.get('/reset', { preHandler: limitAttempts }, async (request, reply) => resetForm(reply, preAnchor(request, reply), ''));
+      publicPost(
+        '/reset',
+        async (form, anchor, _request, reply) => {
+          await opsAuth.passwordResetStart(text(form, 'resetCode'));
+          return resetForm(reply, anchor, text(form, 'resetCode'));
+        },
+        (_form, anchor, message, reply) => resetForm(reply, anchor, '', message),
+      );
+      publicPost(
+        '/reset/complete',
+        async (form, _anchor, request, reply) => {
+          await opsAuth.passwordResetComplete(text(form, 'resetCode'), text(form, 'code'), form.method === 'recovery' ? 'recovery' : 'totp', typeof form.password === 'string' ? form.password : '', request.ip);
+          return reply.redirect('/ops/login?done=password_reset', 303);
+        },
+        (form, anchor, message, reply) => resetForm(reply, anchor, message === MESSAGES.reset_invalid ? '' : text(form, 'resetCode'), message),
       );
       ops.post('/logout', async (request, reply) => {
         const token = cookiesOf(request)[SESSION_COOKIE];

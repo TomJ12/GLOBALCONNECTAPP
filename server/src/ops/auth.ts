@@ -12,7 +12,10 @@
  * store's atomic operations.
  */
 import type { Config } from '../config';
-import { reasonOf, secondsToNextCode, SEEN_WRITE_MS, type Invitation } from '../auth/service';
+import { PASSWORD_RESET_TTL_MS, reasonOf, RESET_REQUESTS_PER_HOUR, secondsToNextCode, SEEN_WRITE_MS, type Invitation } from '../auth/service';
+import type { MailQueue } from '../mail/queue';
+import { mailOf, type SecurityNotice } from '../mail/templates';
+import type { SecurityNotices } from '../notify/security';
 import { isKnownSource, Lockout, withKnownSource } from '../auth/lockout';
 import {
   checkTotp,
@@ -293,6 +296,88 @@ export class OpsAuthService {
     await this.ops.sessions.deleteWhere({ userId });
     await this.ops.challenges.deleteWhere({ userId });
     return total;
+  }
+
+  // --- Forgotten password (staff): the same rules as for clients ------------------------------
+  // The emailed link AND a code from the authenticator (or a recovery code). A lost authenticator is NOT
+  // self-service: that stays with a second ops admin's approval, or break-glass.
+
+  private mail: MailQueue | null = null;
+  private notices: SecurityNotices | null = null;
+  attach(mail: MailQueue, notices: SecurityNotices): void {
+    this.mail = mail;
+    this.notices = notices;
+  }
+  private notice(user: OpsUserRecord, kind: SecurityNotice): Promise<void> {
+    return this.notices?.send({ id: user.id, email: user.email, name: user.name }, 'staff', kind) ?? Promise.resolve();
+  }
+  private readonly background = new Set<Promise<unknown>>();
+  async settle(): Promise<void> {
+    while (this.background.size > 0) await Promise.all([...this.background]);
+  }
+
+  /** Always the same answer after the same work; what follows happens after the answer has gone. */
+  async requestPasswordReset(email: string, source: string): Promise<void> {
+    const address = email.trim().toLowerCase();
+    const work = this.issuePasswordReset(address, source)
+      .catch(() => {})
+      .finally(() => this.background.delete(work));
+    this.background.add(work);
+    await decoyVerify(address);
+  }
+  private async issuePasswordReset(address: string, source: string): Promise<void> {
+    const user = await this.ops.users.findByEmail(address);
+    if (!user || !isActiveStaff(user) || user.passwordHash === null) {
+      await this.log('ops.password_reset.request', 'failure', { type: 'ops', id: null, label: address }, source, { reason: 'no_usable_account' });
+      return;
+    }
+    const since = this.now() - 60 * 60_000;
+    const recent = await this.stores.mail.count({}, (row) => row.to === user.email && row.template === 'reset.staff' && row.createdAt > since);
+    if (recent >= RESET_REQUESTS_PER_HOUR) {
+      await this.log('ops.password_reset.request', 'failure', opsParty(user), source, { reason: 'rate_limited' });
+      return;
+    }
+    await this.ops.passwordResets.deleteWhere({ userId: user.id });
+    const resetCode = randomCode(4);
+    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
+    await this.ops.passwordResets.put(sha256(normaliseCode(resetCode)), { userId: user.id, expiresAt, attempts: 0 });
+    await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.staff', data: { name: user.name, link: `${this.config.opsUrl}/ops/reset#code=${resetCode}`, expiresAt }, key: `reset:staff:${sha256(resetCode)}`, category: 'security' }));
+    await this.log('ops.password_reset.request', 'success', opsParty(user), source, { expires: new Date(expiresAt).toISOString() });
+  }
+
+  private async passwordReset(resetCode: string) {
+    const key = sha256(normaliseCode(resetCode));
+    const record = await this.ops.passwordResets.get(key);
+    const user = record && record.expiresAt > this.now() ? await this.ops.users.get(record.userId) : null;
+    if (!record || !user || !isActiveStaff(user)) throw new ApiError('validation', { reason: 'reset_invalid' });
+    return { key, user };
+  }
+  async passwordResetStart(resetCode: string): Promise<void> {
+    await this.passwordReset(resetCode);
+  }
+  async passwordResetComplete(resetCode: string, code: string, method: 'totp' | 'recovery', password: string, source: string): Promise<void> {
+    const { key, user } = await this.passwordReset(resetCode);
+    if (passwordProblem(password) !== null) throw new ApiError('validation', { reason: 'weak_password', fields: ['password'] });
+    let verified: OpsUserRecord;
+    try {
+      verified = method === 'totp' ? await this.verifyTotp(user, code, 'code', source) : await this.verifyRecoveryCode(user, code, source);
+    } catch (error) {
+      if (reasonOf(error) !== 'code_reused') {
+        await this.ops.passwordResets.mutate(key, (current) => (current === null ? undefined : current.attempts + 1 >= MAX_CHALLENGE_ATTEMPTS ? null : { ...current, attempts: current.attempts + 1 }));
+      }
+      await this.log('ops.password_reset', 'failure', opsParty(user), source, { stage: 'code', method, reason: reasonOf(error) });
+      throw error;
+    }
+    const passwordHash = await hashPassword(password, 'staff');
+    const taken = await this.ops.passwordResets.take(key);
+    if (!taken || taken.userId !== user.id || taken.expiresAt <= this.now()) throw new ApiError('validation', { reason: 'reset_invalid' });
+    // ONLY the password: the authenticator key and recovery codes are not touched.
+    const saved = await this.ops.users.update(user.id, (current) => (isActiveStaff(current) && current.totpSecret === verified.totpSecret ? { ...current, passwordHash } : null));
+    if (!saved) throw new ApiError('validation', { reason: 'reset_invalid' });
+    const sessions = await this.revokeAllSessions(user.id);
+    await this.lockout.unlock([`email:${user.email}`]);
+    await this.log('ops.password_reset', 'success', opsParty(user), source, { method, sessionsEnded: String(sessions) });
+    await this.notice(saved, 'password_reset');
   }
 
   /** Removes password, authenticator key and recovery codes and ends every session. */

@@ -3,7 +3,8 @@ import { afterEach, test } from 'node:test';
 
 import { assertStaffRemovalAllowed, CONFIRM_TTL_MS, OpsError } from '../src/ops/console';
 import { StoreConflict, type OpsRole } from '../src/store/types';
-import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
+import { loadConfig } from '../src/config';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, TEST_DATA_KEY, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
 
 let h: Harness;
 afterEach(async () => h?.close());
@@ -1589,4 +1590,194 @@ test('Mail page: staff see how many emails are waiting, sent, failed or held bac
   const failed = (await audit('system.mail.failed'))[0];
   assert.deepEqual([failed?.detail.template, failed?.detail.error, failed?.target], ['activation.client', 'ETIMEDOUT', null]);
   assert.ok(!JSON.stringify(await audit()).includes('could not deliver'));
+});
+
+// --- Account recovery --------------------------------------------------------------------------------
+
+const HOUR_MS = 60 * 60_000;
+const linksTo = (email: string) => h.outbox.sent.filter((message) => message.to === email && /\/activate#code=/.test(message.text));
+const noticesTo = (email: string) => h.outbox.sent.filter((message) => message.to === email && /^Security notice/.test(message.subject)).map((message) => message.text);
+
+test('authenticator reset: once approved NOTHING changes for 24 hours; the client is told at once; signing in cancels it; so can any ops admin; only then are the credentials cleared and the link sent', async () => {
+  h = await harness({ authenticatorResetDelayMs: 24 * HOUR_MS });
+  const { admin, second } = await pair();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  const again = async () => {
+    for (const who of [admin, second, olu]) {
+      await signIn(who.browser, who.email, who.secret);
+      await who.browser.get('/ops/users');
+    }
+  };
+  const amira = await h.activate(AMIRA);
+  const dana = await h.activate(DANA);
+  const ask = async (userId: string) => fourEyes(admin, second, `/ops/users/${userId}/reset-authenticator`, { verification: 'Called back on the number on file' });
+
+  // The request and its confirmation say there is a delay, and how long.
+  const page = await admin.browser.post('/ops/users/usr_amira/reset-authenticator', { verification: 'Called back on the number on file' });
+  assert.match(page.body, /Once approved, NOTHING changes for 24 hours: the client is emailed a notice at once, their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it/);
+
+  // --- 1. Approved: the client is told, nothing else happens.
+  const first = await ask('usr_amira');
+  assert.equal(first.record?.status, 'approved');
+  const before = await h.stores.directory.getUser('usr_amira');
+  assert.ok(before?.activatedAt && before.totpSecret === amira.secret, 'credentials untouched');
+  assert.equal(linksTo(AMIRA).length, 0, 'no activation link yet');
+  const due = new Date(h.clock.now + 24 * HOUR_MS).toISOString().slice(0, 16).replace('T', ' ');
+  assert.equal(noticesTo(AMIRA).length, 1);
+  assert.match(noticesTo(AMIRA)[0] ?? '', new RegExp(`It has NOT happened yet\\. On ${due} UTC your current password, authenticator and recovery codes will stop working`));
+  assert.match(noticesTo(AMIRA)[0] ?? '', /sign in now with your current password and authenticator code \(that cancels the reset\)/);
+  assert.doesNotMatch(noticesTo(AMIRA)[0] ?? '', /https?:/);
+  // Staff see it waiting, with when it takes effect; an ops admin is offered Cancel, an ops user is not.
+  assert.match((await second.browser.get('/ops/approvals')).body, /Authenticator resets waiting out their delay[^]*Amira Shah[^]*Cancel reset/);
+  assert.match((await olu.browser.get('/ops/users/usr_amira')).body, /Authenticator reset waiting[^]*Nothing has changed yet/);
+  assert.doesNotMatch((await olu.browser.get('/ops/users/usr_amira')).body, /authenticator-resets\/ar_/);
+  // Wrong guesses do not cancel it...
+  await h.call('POST', '/v1/auth/login', { body: { email: AMIRA, password: 'not the password' } });
+  assert.equal((await h.authenticatorResets.waiting()).length, 1);
+  // ...the real owner signing in does: automatically, on record, and she is told.
+  h.clock.advance(HOUR_MS);
+  assert.equal((await h.login(AMIRA, amira.secret)).status, 200);
+  assert.equal((await h.authenticatorResets.waiting()).length, 0);
+  const cancelled = (await audit('system.client.reset_authenticator.cancelled'))[0];
+  assert.deepEqual([cancelled?.target?.label, cancelled?.detail.by, cancelled?.detail.request], [AMIRA, 'signed in', first.id]);
+  assert.match(noticesTo(AMIRA).at(-1) ?? '', /reset of the authenticator on your account was cancelled\. Nothing was changed/);
+  // The delay passes: nothing happens. She keeps her account.
+  h.clock.advance(30 * HOUR_MS);
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.equal(linksTo(AMIRA).length, 0);
+  assert.equal((await h.stores.directory.getUser('usr_amira'))?.totpSecret, amira.secret);
+
+  // --- 2. Cancelled by an ops admin: one is enough, an ops user cannot, and it is confirmed and audited.
+  await again();
+  const secondAsk = await ask('usr_dana');
+  const reset = (await h.authenticatorResets.waiting())[0];
+  assert.equal(reset?.requestId, secondAsk.id);
+  assert.equal((await olu.act(`/ops/authenticator-resets/${reset?.id}/cancel`)).status, 403);
+  const confirmPage = await admin.browser.post(`/ops/authenticator-resets/${reset?.id}/cancel`);
+  assert.match(confirmPage.body, /Cancel the authenticator reset of client Dana Reid[^]*The reset will not happen\. Nothing about the account is changed/);
+  assert.equal((await h.authenticatorResets.waiting()).length, 1, 'showing the confirmation cancels nothing');
+  const done = await admin.act(`/ops/authenticator-resets/${reset?.id}/cancel`);
+  assert.match(done.location, /done=reset_cancelled/);
+  assert.equal((await h.authenticatorResets.waiting()).length, 0);
+  assert.equal((await admin.act(`/ops/authenticator-resets/${reset?.id}/cancel`)).status, 409);
+  assert.ok((await audit('ops.authenticator_reset.cancel')).some((entry) => entry.outcome === 'success' && entry.actor.label === admin.email && entry.target?.label === DANA));
+  h.clock.advance(30 * HOUR_MS);
+  await h.authenticatorResets.runDue();
+  assert.equal((await h.stores.directory.getUser('usr_dana'))?.totpSecret, dana.secret);
+  assert.equal(linksTo(DANA).length, 0);
+
+  // --- 3. Nobody signs in, nobody cancels: after the delay, and not a minute before, it happens. Once.
+  await again();
+  await ask('usr_dana');
+  h.clock.advance(24 * HOUR_MS - 60_000);
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.equal((await h.stores.directory.getUser('usr_dana'))?.totpSecret, dana.secret);
+  h.clock.advance(60_000);
+  assert.deepEqual(await Promise.all([h.authenticatorResets.runDue(), h.authenticatorResets.runDue()]), [1, 1], 'two runs at once are one run');
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  const cleared = await h.stores.directory.getUser('usr_dana');
+  assert.deepEqual([cleared?.activatedAt, cleared?.passwordHash, cleared?.totpSecret, cleared?.recoveryCodeHashes], [null, null, null, []]);
+  assert.equal(linksTo(DANA).length, 1);
+  assert.match(noticesTo(DANA).at(-1) ?? '', /The authenticator on your account has been reset/);
+  assert.ok((await audit('system.client.reset_authenticator.completed')).some((entry) => entry.target?.label === DANA));
+  // The old credentials are dead; the emailed link activates the account afresh.
+  assert.equal((await h.call('POST', '/v1/auth/login', { body: { email: DANA, password: PASSWORD } })).status, 400);
+  await activateClient(DANA, 'a brand new long password');
+
+  // A restart in the middle (the credentials cleared, the reset not yet marked done) finishes it at the next run and loses nothing.
+  await again();
+  await ask('usr_amira');
+  h.clock.advance(25 * HOUR_MS);
+  const realMutate = h.stores.auth.authenticatorResets.mutate.bind(h.stores.auth.authenticatorResets);
+  let crash = true;
+  h.stores.auth.authenticatorResets.mutate = (async (key: string, change: any, auditOf: any) => {
+    if (crash) throw new Error('the process stopped here');
+    return realMutate(key, change, auditOf);
+  }) as typeof realMutate;
+  await assert.rejects(h.authenticatorResets.runDue());
+  crash = false;
+  assert.equal((await h.authenticatorResets.waiting()).length, 1);
+  assert.equal(await h.authenticatorResets.runDue(), 1);
+  assert.equal((await h.stores.directory.getUser('usr_amira'))?.activatedAt, null);
+  // The first link (from before the crash) was replaced by the second: one link works.
+  assert.equal(linksTo(AMIRA).length, 2);
+  await activateClient(AMIRA, 'yet another long password');
+
+  // Outside development the delay cannot be switched off.
+  assert.equal(loadConfig({ APP_ENV: 'development' }).authenticatorResetDelayMs, 24 * HOUR_MS);
+  assert.equal(loadConfig({ APP_ENV: 'development', AUTHENTICATOR_RESET_DELAY_HOURS: '0' }).authenticatorResetDelayMs, 0);
+  const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/x.sqlite', DATA_ENCRYPTION_KEY: TEST_DATA_KEY };
+  assert.throws(() => loadConfig({ ...LIVE, AUTHENTICATOR_RESET_DELAY_HOURS: '0' }), /AUTHENTICATOR_RESET_DELAY_HOURS must be at least 1 outside development/);
+});
+
+test('staff password reset: the same page whoever asks; the emailed link AND a code from the authenticator or a recovery code; only the password changes; a lost authenticator is not self-service', async () => {
+  h = await harness();
+  const { admin, second } = await pair();
+  const fresh = () => new Browser();
+  const resetLink = (email: string) => {
+    const message = [...h.outbox.sent].reverse().find((item) => item.to === email && /\/ops\/reset#code=/.test(item.text));
+    return /\/ops\/reset#code=([A-Z2-7-]+)/.exec(message?.text ?? '')?.[1] ?? '';
+  };
+  const ask = async (email: string) => {
+    const browser = fresh();
+    await browser.get('/ops/forgot');
+    const reply = await browser.post('/ops/forgot', { email });
+    await h.opsAuth.settle();
+    return reply;
+  };
+  // The sign-in page offers it; the answer is the same page for a real address, an unknown one, and a client's.
+  assert.match((await fresh().get('/ops/login')).body, /<a href="\/ops\/forgot">Forgot your password\?<\/a>/);
+  const pages = [await ask(admin.email), await ask('nobody@globalconnect.example'), await ask(AMIRA)];
+  const strip = (body: string) => body.replace(/name="_csrf" value="[^"]+"/g, '');
+  assert.equal(new Set(pages.map((reply) => `${reply.status} ${strip(reply.body)}`)).size, 1);
+  assert.match(pages[0]?.body ?? '', /If that address belongs to an active staff account, an email with a link has been sent/);
+  assert.match(pages[0]?.body ?? '', /Lost your authenticator and your recovery codes as well\? That cannot be done here/);
+  assert.deepEqual([...new Set(h.outbox.sent.filter((message) => /ops\/reset#code=/.test(message.text)).map((message) => message.to))], [admin.email]);
+  assert.match(h.outbox.sent.find((message) => /ops\/reset#code=/.test(message.text))?.subject ?? '', /^Reset the password of your Global Connect staff account$/);
+  const link = resetLink(admin.email);
+  assert.ok(link);
+  // No page ever shows the link or the code.
+  for (const reply of pages) assert.doesNotMatch(reply.body, LINK_OR_CODE);
+
+  const before = await h.stores.ops.users.get(admin.id);
+  const browser = fresh();
+  await browser.get('/ops/reset');
+  assert.match((await browser.post('/ops/reset', { resetCode: 'AAAAA-BBBBB-CCCCC-DDDDD' })).body, /That reset link is not valid any more/);
+  assert.match((await browser.post('/ops/reset', { resetCode: link })).body, /Choose a new password[^]*Code from your authenticator app, or a recovery code/);
+  // The link without the second factor: refused, nothing changed, nobody signed out.
+  for (const code of ['', '000000', OPS_PASSWORD]) {
+    const refused = await browser.post('/ops/reset/complete', { resetCode: link, code, password: 'a completely new staff password' });
+    assert.ok(refused.status >= 400, code);
+  }
+  assert.equal((await h.stores.ops.users.get(admin.id))?.passwordHash, before?.passwordHash);
+  assert.equal((await admin.browser.get('/ops/users')).status, 200);
+  assert.match((await browser.post('/ops/reset/complete', { resetCode: link, code: h.freshCode(admin.secret), password: 'password1234' })).body, /password/i);
+  // With a code: the password changes, only the password; every session of theirs ends; the new password signs in.
+  const done = await browser.post('/ops/reset/complete', { resetCode: link, code: h.freshCode(admin.secret), password: 'a completely new staff password' });
+  assert.deepEqual([done.status, done.location], [303, '/ops/login?done=password_reset']);
+  const after = await h.stores.ops.users.get(admin.id);
+  assert.notEqual(after?.passwordHash, before?.passwordHash);
+  assert.deepEqual([after?.totpSecret, after?.recoveryCodeHashes, after?.role], [before?.totpSecret, before?.recoveryCodeHashes, before?.role]);
+  assert.equal((await admin.browser.get('/ops/users')).status, 303, 'signed out');
+  assert.notEqual((await signIn(fresh(), admin.email, admin.secret)).status, 303);
+  assert.equal((await signIn(fresh(), admin.email, admin.secret, 'a completely new staff password')).status, 303);
+  assert.match(h.outbox.sent.at(-1)?.subject ?? '', /^Security notice for your Global Connect staff account$/);
+  // Once only; and a recovery code does as well as the authenticator.
+  assert.match((await browser.post('/ops/reset/complete', { resetCode: link, code: h.freshCode(admin.secret), password: 'one more long staff password' })).body, /not valid any more/);
+  await ask(second.email);
+  const other = fresh();
+  await other.get('/ops/reset');
+  const recovered = await other.post('/ops/reset/complete', { resetCode: resetLink(second.email), code: second.recoveryCodes[0] as string, method: 'recovery', password: 'a completely new staff password 2' });
+  assert.equal(recovered.status, 303);
+  assert.equal((await h.stores.ops.users.get(second.id))?.recoveryCodeHashes.length, 9);
+  // On record, without the code, the link or the password.
+  const entries = (await audit('ops.password_reset')).filter((entry) => entry.action === 'ops.password_reset' && entry.outcome === 'success');
+  assert.deepEqual(entries.map((entry) => [entry.actor.label, entry.detail.method]).reverse(), [[admin.email, 'totp'], [second.email, 'recovery']]);
+  const everything = JSON.stringify(await audit());
+  assert.ok(!everything.includes(link) && !everything.includes('a completely new staff password'));
+  // A disabled member of staff gets no link.
+  await h.stores.ops.users.update(second.id, (current) => ({ ...current, disabledAt: 1 }));
+  const count = h.outbox.sent.length;
+  await ask(second.email);
+  assert.equal(h.outbox.sent.length, count);
 });
