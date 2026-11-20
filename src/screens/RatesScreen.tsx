@@ -116,7 +116,8 @@ function AlertRow({ alert }: { alert: RateAlert }) {
   const remove = useRemoveAlert();
   const [error, setError] = useState<string | null>(null);
   const pair = `${alert.base} / ${alert.quote}`;
-  const condition = `${alert.direction === 'above' ? 'reaches' : 'drops to'} ${formatRate(alert.targetRate)}`;
+  // Selling the first currency: at the target or higher. Buying it: at the target or lower. Either way, "or better".
+  const condition = `${alert.direction === 'above' ? `sell ${alert.base}` : `buy ${alert.base}`} at ${formatRate(alert.targetRate)} or better`;
   const busy = setEnabled.isPending || remove.isPending;
 
   const toggle = (enabled: boolean) => {
@@ -142,7 +143,7 @@ function AlertRow({ alert }: { alert: RateAlert }) {
         <View style={styles.grow}>
           <AppText variant="bodyStrong">{`${pair} ${condition}`}</AppText>
           <AppText variant="caption" tone="muted">
-            {alert.enabled ? 'On' : 'Paused'}
+            {alert.triggered ? `Reached ${formatRate(alert.triggered.rate)} on ${formatDate(alert.triggered.at)}. Turn on to be told again.` : alert.enabled ? 'On' : 'Paused'}
           </AppText>
         </View>
         <Switch

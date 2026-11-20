@@ -81,6 +81,8 @@ export function createDemoBackend(options: DemoBackendOptions): DemoBackend {
   const auth: AuthClient = {
     sampleCode: DEMO_CODE,
     selfService: null,
+    notifications: null,
+    alerts: null,
 
     async signIn(email: string, password: string): Promise<LoginChallenge> {
       const address = email.trim().toLowerCase();

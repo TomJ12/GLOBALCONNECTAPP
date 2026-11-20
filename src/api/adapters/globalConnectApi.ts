@@ -7,7 +7,9 @@
  */
 import type { z } from 'zod';
 
-import type { AuthClient, SelfServiceClient } from '../auth';
+import type { AlertsStore, RateAlert } from '@/alerts/AlertsStore';
+
+import type { AuthClient, NotificationsClient, SelfServiceClient } from '../auth';
 import { canonicalJson } from '../canonical';
 import { isProviderErrorReason, ProviderError, type ProviderErrorKind } from '../errors';
 import type { ProviderClient } from '../provider';
@@ -189,6 +191,37 @@ export class GlobalConnectApi implements ProviderClient, AuthClient {
 
   // --- Activation -------------------------------------------------------------
 
+  // --- Notifications and rate alerts (kept by the server) ---------------------------------------
+
+  readonly notifications: NotificationsClient = {
+    list: () => this.call(schemas.notificationList, 'GET', '/notifications'),
+    markRead: async (id) => (await this.call(schemas.notificationRead, 'POST', '/notifications/read', { body: id ? { id } : {} })).unread,
+    emailChoices: async () => (await this.call(schemas.notificationChoices, 'GET', '/notifications/preferences')).email,
+    setEmailChoices: async (email) => (await this.call(schemas.notificationChoices, 'POST', '/notifications/preferences', { body: { email } })).email,
+  };
+
+  /** A server alert as the app's own `RateAlert`: selling is "at or above", buying "at or below". */
+  private static alertOf(raw: z.infer<typeof schemas.serverAlert>): RateAlert {
+    return {
+      id: raw.id,
+      base: raw.base,
+      quote: raw.quote,
+      direction: raw.side === 'sell' ? 'above' : 'below',
+      targetRate: raw.targetRate,
+      enabled: raw.status === 'active',
+      createdAt: raw.createdAt,
+      triggered: raw.status === 'triggered' && raw.triggeredAt && raw.triggeredRate ? { at: raw.triggeredAt, rate: raw.triggeredRate } : null,
+    };
+  }
+  readonly alerts: AlertsStore = {
+    list: async () => (await this.call(schemas.serverAlerts, 'GET', '/alerts')).items.map(GlobalConnectApi.alertOf),
+    create: async (input) => GlobalConnectApi.alertOf(await this.call(schemas.serverAlert, 'POST', '/alerts', { body: { base: input.base, quote: input.quote, side: input.direction === 'above' ? 'sell' : 'buy', targetRate: input.targetRate } })),
+    setEnabled: async (id, enabled) => GlobalConnectApi.alertOf(await this.call(schemas.serverAlert, 'POST', `/alerts/${encodeURIComponent(id)}`, { body: { enabled } })),
+    remove: async (id) => {
+      await this.call(schemas.ok, 'POST', `/alerts/${encodeURIComponent(id)}/delete`, { body: {} });
+    },
+  };
+
   // --- Self-service: your own account ---------------------------------------------------------
 
   private resetCode: string | null = null;
@@ -318,9 +351,11 @@ export class GlobalConnectApi implements ProviderClient, AuthClient {
       headers: this.stepUpHeader('payment.cancel', { paymentId }),
     });
   }
-  async rejectPayment(paymentId: string): Promise<void> {
+  async rejectPayment(paymentId: string, reason?: string): Promise<void> {
+    const given = reason?.trim();
     await this.call(schemas.ok, 'POST', `/payments/${encodeURIComponent(paymentId)}/reject`, {
       headers: this.stepUpHeader('payment.reject', { paymentId }),
+      ...(given ? { body: { reason: given } } : {}),
     });
   }
 }

@@ -90,10 +90,18 @@ export function TransactionRow({ transaction }: { transaction: Transaction }) {
   );
 }
 
+/** Who rejected a payment and the reason they typed. It is a colleague's own words: shown as text, exactly as typed. */
+export function rejectionLine(payment: Pick<Payment, 'held'>): string | null {
+  const rejection = payment.held?.rejection;
+  if (!rejection) return null;
+  return rejection.reason ? `Rejected by ${rejection.by}: “${rejection.reason}”` : `Rejected by ${rejection.by}. No reason given.`;
+}
+
 export function PaymentRow({ payment, onPress }: { payment: Payment; onPress?: () => void }) {
   const amount = formatMoney(payment.amount, payment.currency);
   const payee = payment.beneficiaryName ?? 'Unknown payee';
   const when = formatRelativeDay(payment.createdAt);
+  const rejection = rejectionLine(payment);
   return (
     <ListRow
       leading={
@@ -102,10 +110,10 @@ export function PaymentRow({ payment, onPress }: { payment: Payment; onPress?: (
         </IconCircle>
       }
       title={payee}
-      subtitle={`${when} · ${payment.reference}`}
+      subtitle={`${when} · ${payment.reference}${rejection ? ` · ${rejection}` : ''}`}
       onPress={onPress}
       showChevron={onPress !== undefined}
-      accessibilityLabel={`${amount} to ${payee}. ${paymentStatusLabel(payment)}. ${when}. Reference ${payment.reference}`}
+      accessibilityLabel={`${amount} to ${payee}. ${paymentStatusLabel(payment)}. ${when}. Reference ${payment.reference}${rejection ? `. ${rejection}` : ''}`}
       accessibilityHint={onPress ? 'Opens the payment for review' : undefined}
       trailing={
         <View style={{ alignItems: 'flex-end', gap: 4 }}>

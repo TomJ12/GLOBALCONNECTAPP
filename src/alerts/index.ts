@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import { getAuthClient } from '@/api';
 import { storageLabel } from '@/lib/hash';
 
 import type { AlertsStore } from './AlertsStore';
@@ -20,6 +21,9 @@ export function alertsStorageKey(userKey: string): string {
  */
 export function getAlertsStore(userKey: string): AlertsStore {
   if (override) return override;
+  // Against the Global Connect server, alerts are kept and checked there.
+  const remote = getAuthClient().alerts;
+  if (remote) return remote;
   let store = stores.get(userKey);
   if (!store) {
     store = new LocalAlertsStore(AsyncStorage, alertsStorageKey(userKey));

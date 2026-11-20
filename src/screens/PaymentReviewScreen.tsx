@@ -12,6 +12,7 @@ import { Card, Divider } from '@/components/Card';
 import { Header } from '@/components/Header';
 import { QueryState } from '@/components/QueryState';
 import { Screen } from '@/components/Screen';
+import { TextField } from '@/components/TextField';
 import { SkeletonCard, SkeletonList } from '@/components/Skeleton';
 import { EmptyState, InlineMessage } from '@/components/StateViews';
 import { outcomeCheckTiming } from '@/config/app';
@@ -35,6 +36,8 @@ export type ReviewOutcome =
   | { kind: 'no_longer_pending'; attempted: Decision; amount: string; payee: string };
 
 type Decision = 'approve' | 'reject' | 'cancel';
+/** The server's own limit. */
+const REJECT_REASON_MAX = 200;
 
 /** Everything an approver is agreeing to. If any of it changes, the approval must be looked at again. */
 export function approvalSignature(approval: PendingApproval): string {
@@ -120,6 +123,8 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
   const mayDecide = hold ? hold.canApprove : true;
   const online = useIsOnline();
   const [error, setError] = useState<string | null>(null);
+  /** Optional, in the approver's own words. The person who created the payment is shown it. */
+  const [rejectReason, setRejectReason] = useState('');
   /** Set after an action whose outcome we could not establish. Nothing more is allowed until it is resolved. */
   const [unresolved, setUnresolved] = useState<{ kind: Decision; startedAt: number } | null>(null);
   const windowSeconds = Math.round(outcomeCheckTiming.windowMs / 1000);
@@ -226,7 +231,7 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
         await cancel.mutateAsync(payment.id);
         onOutcome({ kind: 'cancelled', amount, payee });
       } else {
-        await reject.mutateAsync(payment.id);
+        await reject.mutateAsync({ paymentId: payment.id, reason: hold ? rejectReason.trim() || undefined : undefined });
         onOutcome({ kind: 'rejected', amount, payee });
       }
     } catch (caught) {
@@ -387,6 +392,18 @@ function Review({ approval, onOutcome }: { approval: PendingApproval; onOutcome:
                 disabled={!canApprove}
                 testID="approve-button"
               />
+              {hold ? (
+                <TextField
+                  label="Reason for rejecting (optional)"
+                  hint={`${hold.createdBy} will be shown this if you reject the payment.`}
+                  value={rejectReason}
+                  // No line breaks or other control characters: the server refuses them.
+                  onChangeText={(text) => setRejectReason(text.replace(/[\u0000-\u001f\u007f]/g, ' '))}
+                  maxLength={REJECT_REASON_MAX}
+                  editable={!action.busy}
+                  testID="reject-reason"
+                />
+              ) : null}
               <Button label="Reject payment" variant="danger" onPress={() => action.run('reject')} disabled={action.busy || !online} testID="reject-button" />
             </>
           ) : null}

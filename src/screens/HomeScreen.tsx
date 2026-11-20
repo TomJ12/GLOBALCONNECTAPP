@@ -22,6 +22,7 @@ import {
 } from '@/hooks/queries';
 import { formatTimeOfDay } from '@/lib/dates';
 import { currencyName, currencyPrefix, formatMoney, totalInBaseCurrency } from '@/lib/money';
+import { NotificationBell } from '@/screens/NotificationsScreen';
 import { useCapabilities } from '@/state/session';
 import { colors, radii, sizes, spacing } from '@/theme';
 
@@ -174,6 +175,7 @@ export function HomeScreen() {
           )}
         </View>
         {isMockBackend() ? <SampleDataPill /> : null}
+        <NotificationBell />
       </View>
 
       <QueryState query={balances} skeleton={<SkeletonCard label="Loading total balance" />}>

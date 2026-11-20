@@ -344,6 +344,23 @@ export interface PaymentHold {
   rejection?: { by: string; reason: string | null };
 }
 
+/** One entry in the person's notification list. `title` and `body` are plain text written by the server. */
+export interface AppNotification {
+  id: string;
+  category: 'rates' | 'approvals' | 'payments';
+  title: string;
+  body: string;
+  createdAt: IsoDateTime;
+  read: boolean;
+}
+
+/** Which kinds of notification are also sent by email. Security notices are always sent and are not here. */
+export interface NotificationEmailChoices {
+  rates: boolean;
+  approvals: boolean;
+  payments: boolean;
+}
+
 export interface NewPayment {
   beneficiaryId: string;
   amount: DecimalString;

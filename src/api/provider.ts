@@ -65,7 +65,8 @@ export interface ProviderClient {
    * waiting for approval is rejected with a `validation` error, never paid twice.
    */
   approvePayment(paymentId: string): Promise<ApprovalResult>;
-  rejectPayment(paymentId: string): Promise<void>;
+  /** `reason`: optional, in the approver's own words, shown to the person who created the payment. */
+  rejectPayment(paymentId: string, reason?: string): Promise<void>;
   /**
    * The text to digest for "has this payee's destination changed?": the
    * provider's whole raw record of the payee, normalised (see digest.ts).

@@ -6,8 +6,12 @@
  *
  * Every method rejects with a ProviderError and nothing else.
  */
+import type { AlertsStore } from '@/alerts/AlertsStore';
+
 import type {
   ActivationResult,
+  AppNotification,
+  NotificationEmailChoices,
   ActivationStart,
   CodeMethod,
   LoginChallenge,
@@ -39,9 +43,22 @@ export interface SelfServiceClient {
   endSession(id: string): Promise<void>;
 }
 
+/** The person's notification list, kept by the Global Connect server. */
+export interface NotificationsClient {
+  list(): Promise<{ items: AppNotification[]; unread: number }>;
+  /** Marks one notification as read, or all of them. Returns how many are still unread. */
+  markRead(id?: string): Promise<number>;
+  emailChoices(): Promise<NotificationEmailChoices>;
+  setEmailChoices(choices: NotificationEmailChoices): Promise<NotificationEmailChoices>;
+}
+
 export interface AuthClient {
   /** Null where there is nothing to recover (the in-app demo). */
   readonly selfService: SelfServiceClient | null;
+  /** Null in the in-app demo: nothing there sends notifications. */
+  readonly notifications: NotificationsClient | null;
+  /** Rate alerts kept and checked by the server. Null in the in-app demo, which keeps them on the device and checks nothing. */
+  readonly alerts: AlertsStore | null;
   /**
    * Set only by the in-app demo, so screens can show the sample code to type.
    * Always null against a server.

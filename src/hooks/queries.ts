@@ -15,7 +15,7 @@ import {
 import { getAlertsStore, type NewRateAlert } from '@/alerts';
 import { getAuthClient, getProviderClient } from '@/api';
 import { ProviderError } from '@/api/errors';
-import type { BookConversionRequest, CodeMethod, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
+import type { BookConversionRequest, CodeMethod, CurrencyCode, DecimalString, NewBeneficiary, NewPayment, NotificationEmailChoices } from '@/api/types';
 import { useCapabilities, useSession } from '@/state/session';
 
 export const queryKeys = {
@@ -248,7 +248,7 @@ export function useApprovePayment() {
 export function useRejectPayment() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (paymentId: string) => getProviderClient().rejectPayment(paymentId),
+    mutationFn: (input: { paymentId: string; reason?: string }) => getProviderClient().rejectPayment(input.paymentId, input.reason),
     onSettled: () => {
       // Not awaited: the screen shows its result at once and the lists refresh behind it.
       void invalidateMoney(client);
@@ -319,5 +319,40 @@ export function useRemoveAlert() {
   return useMutation({
     mutationFn: (id: string) => getAlertsStore(userKey).remove(id),
     onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts(userKey) }),
+  });
+}
+
+// --- Notifications (kept by the Global Connect server; nothing in the in-app demo) ---------------
+
+const NOTIFICATIONS_KEY = ['notifications'] as const;
+
+/** The person's notification list and unread count, refreshed every minute while the app is open. Disabled where there is no server. */
+export function useNotifications() {
+  const available = getAuthClient().notifications !== null;
+  return useQuery({
+    queryKey: NOTIFICATIONS_KEY,
+    queryFn: () => getAuthClient().notifications?.list() ?? Promise.resolve({ items: [], unread: 0 }),
+    enabled: available,
+    refetchInterval: available ? 60_000 : false,
+  });
+}
+
+export function useMarkNotificationsRead() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (id?: string) => getAuthClient().notifications?.markRead(id) ?? Promise.resolve(0),
+    onSettled: () => client.invalidateQueries({ queryKey: NOTIFICATIONS_KEY }),
+  });
+}
+
+export function useNotificationEmailChoices() {
+  return useQuery({ queryKey: ['notificationChoices'], queryFn: () => getAuthClient().notifications?.emailChoices() ?? Promise.resolve({ rates: true, approvals: true, payments: true }), enabled: getAuthClient().notifications !== null });
+}
+
+export function useSetNotificationEmailChoices() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (choices: NotificationEmailChoices) => getAuthClient().notifications?.setEmailChoices(choices) ?? Promise.resolve(choices),
+    onSuccess: (saved) => client.setQueryData(['notificationChoices'], saved),
   });
 }

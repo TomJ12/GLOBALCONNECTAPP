@@ -222,6 +222,24 @@ export const payment: z.ZodType<Payment> = z.object({
     })
     .optional(),
 });
+export const notificationList = z.object({
+  items: z.array(z.object({ id: text, category: z.enum(['rates', 'approvals', 'payments']), title: text, body: z.string(), createdAt: text, read: z.boolean() })),
+  unread: z.number().int().min(0),
+});
+export const notificationRead = z.object({ ok: z.literal(true), unread: z.number().int().min(0) });
+export const notificationChoices = z.object({ email: z.object({ rates: z.boolean(), approvals: z.boolean(), payments: z.boolean() }) });
+export const serverAlert = z.object({
+  id: text,
+  base: currency,
+  quote: currency,
+  side: z.enum(['sell', 'buy']),
+  targetRate: decimal,
+  status: z.enum(['active', 'paused', 'triggered']),
+  createdAt: text,
+  triggeredAt: text.nullable(),
+  triggeredRate: decimal.nullable(),
+});
+export const serverAlerts = z.object({ items: z.array(serverAlert) });
 /** A payment request body. The idempotency key travels in the Idempotency-Key header. */
 export const newPaymentBody = z.object({
   beneficiaryId: z.string().min(1).max(120),
