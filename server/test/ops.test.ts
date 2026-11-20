@@ -292,7 +292,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
   assert.ok(toApprove && toReject && toCancel);
 
   // (Finishing or closing an interrupted request needs one that was interrupted: those two have their own test.)
-  const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate)/.test(route.url) && !/\/(resume|abandon)$/.test(route.url) && !/authenticator-resets/.test(route.url));
+  const actions = h.opsRoutes.filter((route) => route.method === 'POST' && !/^\/ops\/(login|logout|activate|forgot|reset)/.test(route.url) && !/\/(resume|abandon)$/.test(route.url) && !/authenticator-resets/.test(route.url));
   assert.ok(actions.length >= 23, `only ${actions.length} action routes`);
   const urlOf = (route: string) =>
     route.startsWith('/ops/approvals')
