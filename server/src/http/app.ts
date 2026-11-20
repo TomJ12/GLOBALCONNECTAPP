@@ -791,9 +791,12 @@ export async function buildApp(deps: AppDeps) {
       });
       /** After a payment action: whoever is now due a notification about this company's held payments gets it. Never fails the action. */
       const thenNotify = async <T>(context: CompanyContext, action: Promise<T>): Promise<T> => {
-        const result = await action;
-        await paymentNotes.scan(context.company.id);
-        return result;
+        try {
+          return await action;
+        } finally {
+          // Also when the action was refused: a refusal can itself close a payment (its payee changed, it expired).
+          await paymentNotes.scan(context.company.id);
+        }
       };
       api.post('/payments', async (request) => {
         const context = await companyOf(request);

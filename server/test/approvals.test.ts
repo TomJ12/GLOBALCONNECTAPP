@@ -1342,4 +1342,11 @@ test('provider A: notifications when a send goes unanswered (outcome being check
   assert.match(checking?.body ?? '', /we do not yet know whether it was made\. We are checking\.\nDo NOT create it again\./);
   assert.equal(await h.paymentNotes.scan(), 0);
   assert.equal((await notesOf(creator)).items.length, 2);
+
+  // A refusal that itself closes the payment (the payee was changed since it was created): its creator is told at once.
+  const second = (await create(company, creator, payee)).id;
+  providerPayee(company, payee).id = 'gone';
+  assert.equal(reasonOf(await act(approver, second, 'approve')), 'payee_changed');
+  assert.equal((await titlesOf(creator))[0], 'Your payment was stopped');
+  assert.match((await notesOf(creator)).items[0]?.body ?? '', /was stopped because the payee’s details changed after you created it\. It was not sent\./);
 });
