@@ -159,7 +159,7 @@ export class HeldPayments {
     };
     return {
       one: async (record: HeldPaymentRecord): Promise<Payment> => {
-        for (const userId of [record.createdBy, ...record.approvals.map((item) => item.userId)]) await nameOf(userId);
+        for (const userId of [record.createdBy, ...record.approvals.map((item) => item.userId), ...(record.status === 'rejected' && record.closedBy ? [record.closedBy] : [])]) await nameOf(userId);
         return this.view(record, viewer, members, names);
       },
     };

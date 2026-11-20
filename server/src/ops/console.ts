@@ -53,6 +53,8 @@ import { h, Html, layout, qrSvg, when } from './html';
 import { currencyDecimals } from '@/lib/money';
 import { checkMarginConfig, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
 import { marginConfigOf, type ClientRates } from '../rates/service';
+import type { Notifier } from '../notify/notifier';
+import type { RateAlerts } from '../alerts/service';
 
 export interface OpsDeps {
   config: Config;
@@ -64,6 +66,8 @@ export interface OpsDeps {
   notices: SecurityNotices;
   authenticatorResets: AuthenticatorResets;
   rates: ClientRates;
+  notifier: Notifier;
+  alerts: RateAlerts;
   now: () => number;
   limitAttempts: (request: FastifyRequest) => Promise<void>;
 }
@@ -156,7 +160,7 @@ const asset = (relative: string): Buffer | null => {
 };
 
 export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<{ method: string; url: string }[]> {
-  const { config, stores, auth, opsAuth, registry, mail, notices, authenticatorResets, rates, now, limitAttempts } = deps;
+  const { config, stores, auth, opsAuth, registry, mail, notices, authenticatorResets, rates, notifier, alerts, now, limitAttempts } = deps;
   const routes: { method: string; url: string }[] = [];
   // Outside development OPS_URL must be https (config.ts), so the cookie is always Secure there.
   const secure = config.opsUrl.startsWith('https://');
@@ -1566,6 +1570,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const memberships = await stores.directory.membershipsOf(user.id);
         const locked = await auth.isLocked(user);
         const sessions = await auth.activeSessionCount(user.id);
+        const notes = await notifier.stateOf(user.id);
+        const alertCounts = await alerts.countsOf(user.id);
         const nameOf = (companyId: string) => companies.find((company) => company.id === companyId)?.name ?? companyId;
         const free = companies.filter((company) => !company.deactivatedAt && !memberships.some((item) => item.companyId === company.id));
         const pendingReset = (await stores.auth.authenticatorResets.list({ userId: user.id, status: 'waiting' }))[0];
@@ -1589,6 +1595,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             }
 ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the failed-attempt count so the person can try again now.</p>${form(ctx, `${base}/unlock`, h``, 'Unlock account')}</div>`}
 <div class="card"><h2>Sessions</h2>${form(ctx, `${base}/revoke-sessions`, h``, 'Revoke all sessions')}</div>
+<div class="card"><h2>Notifications</h2><dl><dt>In the app</dt><dd>${String(notes.total)} kept, ${String(notes.unread)} unread${notes.latestAt !== null ? h` (the latest ${when(notes.latestAt)})` : ''}</dd><dt>Also by email</dt><dd>Rate alerts: ${notes.email.rates ? 'on' : 'off'}. Payments to approve: ${notes.email.approvals ? 'on' : 'off'}. Their own payments: ${notes.email.payments ? 'on' : 'off'}. Security notices: always on.</dd><dt>Rate alerts</dt><dd>${String(alertCounts.active)} on, ${String(alertCounts.triggered)} fired, ${String(alertCounts.paused)} paused</dd></dl><p class="muted">What a notification or an alert says is never shown to staff. Only the person can change these choices, in the app.</p></div>
 <div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2><p class="muted">A disabled person cannot sign in. Disabling ends every session at once. Re-enabling gives back the old password and authenticator, so it needs a second staff member.</p>${
               user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable user', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable user', { danger: true })
             }</div></div></div>`,

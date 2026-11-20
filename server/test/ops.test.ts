@@ -1919,3 +1919,19 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   // Nothing the client was sent in all of this carries any of it (every reply was scanned as it came; and by value:)
   for (const body of h.bodies) assert.ok(!/1\.3000|"1\.3"|10\.40/.test(body), body.slice(0, 200));
 });
+
+test('ops: staff see a person’s notification state (counts and choices), never what any notification or alert says', async () => {
+  h = await harness();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  const { secret } = await h.activate(AMIRA);
+  const amira = (await h.login(AMIRA, secret)).json.token as string;
+  await h.stores.margins.put('co_northfield', { defaultBps: 20, forwardBps: null, overrides: [], tiers: [], companyId: 'co_northfield', updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
+  for (const targetRate of ['1.2950', '1.4444']) assert.equal((await h.call('POST', '/v1/alerts', { token: amira, body: { base: 'GBP', quote: 'USD', side: 'sell', targetRate } })).status, 200);
+  assert.equal(await h.alerts.check(), 1);
+  await h.call('POST', '/v1/notifications/preferences', { token: amira, body: { email: { rates: false, approvals: true, payments: true } } });
+  const page = (await olu.browser.get('/ops/users/usr_amira')).body;
+  assert.match(page, /<h2>Notifications<\/h2><dl><dt>In the app<\/dt><dd>1 kept, 1 unread \(the latest [^)]+\)<\/dd><dt>Also by email<\/dt><dd>Rate alerts: off\. Payments to approve: on\. Their own payments: on\. Security notices: always on\.<\/dd><dt>Rate alerts<\/dt><dd>1 on, 1 fired, 0 paused<\/dd>/);
+  assert.doesNotMatch(page, /1\.2974|1\.4444|1\.295|reached|indicative|Rate alert: GBP/);
+  // There is no console action that reads, sends or changes a person's notifications or alerts.
+  assert.equal(h.opsRoutes.filter((route) => /notif|alert/i.test(route.url)).length, 0);
+});

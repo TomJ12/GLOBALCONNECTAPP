@@ -1179,3 +1179,161 @@ test('a company whose only approver is the creator: the creator is told nobody e
   assert.equal(loadConfig({ APP_ENV: 'development', PAYMENT_APPROVAL_HOURS: '12' }).paymentApprovalMs, 12 * HOUR);
   for (const bad of ['0', '-1', 'soon', '100000']) assert.throws(() => loadConfig({ APP_ENV: 'development', PAYMENT_APPROVAL_HOURS: bad }), /PAYMENT_APPROVAL_HOURS/);
 });
+
+// --- Notifications about held payments ---------------------------------------------------------------------------
+const notesOf = async (who: Person) => (await h.call('GET', '/v1/notifications', { token: who.token })).json as { unread: number; items: { id: string; title: string; body: string; category: string; read: boolean }[] };
+const titlesOf = async (who: Person) => (await notesOf(who)).items.map((item) => item.title);
+const mailsTo = (who: Person, subject: RegExp) => h.outbox.sent.filter((message) => message.to === who.email && subject.test(message.subject));
+const BANK_DETAILS = /FR14|2004|SMPL|IBAN|iban|sort code|account number|\d{8,}/;
+
+for (const company of COMPANIES) {
+  const on = (name: string) => `${company.label}: ${name}`;
+  const sum = `${company.currency} ${company.amount}`;
+
+  test(on('notifications: every eligible approver is told of a waiting payment (never its creator); the creator is told of approval, and of rejection with the reason; each once, with no bank details'), async () => {
+    const { admin, creator, approver, payee } = await team(company);
+    const payeeName = (await record((await create(company, creator, payee)).id)).payee.name;
+    // A viewer cannot approve, so is not told.
+    const viewer = await person('Vera', company.id, 'creator'); // can create, cannot approve: not told
+
+    // WAITING: the approver and the administrator, in the app and by email. Not the creator, not the viewer.
+    for (const who of [approver, admin]) {
+      const notes = await notesOf(who);
+      assert.deepEqual([notes.unread, notes.items.length, notes.items[0]?.category, notes.items[0]?.title], [1, 1, 'approvals', 'A payment is waiting for your approval'], who.name);
+      assert.match(notes.items[0]?.body ?? '', new RegExp(`^Cara created a payment of ${sum.replace('.', '\\.')} to ${payeeName}\\. It has not been sent\\.\\nIt needs approval before 2026-11-13 \\d\\d:\\d\\d UTC; after that it expires and is not sent\\.`));
+      assert.doesNotMatch(notes.items[0]?.body ?? '', BANK_DETAILS);
+      const mails = mailsTo(who, /^A payment is waiting for your approval in Global Connect$/);
+      assert.equal(mails.length, 1, who.name);
+      assert.match(mails[0]?.text ?? '', new RegExp(`Cara created a payment of ${sum.replace('.', '\\.')} to ${payeeName}`));
+      assert.doesNotMatch(`${mails[0]?.text}${mails[0]?.html}`, BANK_DETAILS);
+      assert.doesNotMatch(`${mails[0]?.text}`, /https?:/);
+    }
+    assert.deepEqual([(await notesOf(creator)).items.length, (await notesOf(viewer)).items.length], [0, 0]);
+    assert.equal(h.outbox.sent.filter((message) => message.to === creator.email && /payment/i.test(message.subject)).length, 0);
+
+    // ONCE: looked at again and again, by the schedule or after a "restart" (a new look at the same database), nothing more is sent.
+    const sent = h.outbox.sent.length;
+    for (let index = 0; index < 3; index += 1) assert.equal(await h.paymentNotes.scan(), 0);
+    const { PaymentNotifications } = await import('../src/notify/payments');
+    const { Notifier } = await import('../src/notify/notifier');
+    const restarted = new PaymentNotifications(h.stores, new Notifier(h.stores, h.mail, { now: () => h.clock.now, perUserPerHour: 60 }), { now: () => h.clock.now, expiryWarningMs: 6 * HOUR });
+    assert.equal(await restarted.scan(), 0);
+    assert.equal(await restarted.scan(company.id), 0);
+    assert.equal(h.outbox.sent.length, sent);
+    assert.equal((await notesOf(approver)).items.length, 1);
+
+    // REJECTED with a reason: the creator is told who and why. What the rejecter typed stays text: no link, no markup, one line.
+    const first = (await awaiting(approver))[0]?.payment.id as string;
+    assert.equal((await act(approver, first, 'reject', { reason: 'bad\u0007reason' })).status, 400, 'control characters are refused');
+    assert.equal((await act(approver, first, 'reject', { reason: 'x'.repeat(201) })).status, 400, 'bounded length');
+    assert.equal((await notesOf(creator)).items.length, 0);
+    const reason = 'Wrong <b>invoice</b> see https://evil.example/pay & "ask" Abel';
+    assert.equal((await act(approver, first, 'reject', { reason })).status, 200);
+    const told = await notesOf(creator);
+    assert.deepEqual([told.unread, told.items[0]?.category, told.items[0]?.title], [1, 'payments', 'Your payment was rejected']);
+    assert.equal(told.items[0]?.body, `Your payment of ${sum} to ${payeeName} was rejected by Abel. It was not sent.\nReason given: “Wrong <b>invoice</b> see evil.example/pay & "ask" Abel”`);
+    const rejection = mailsTo(creator, /^An update on a payment you created in Global Connect$/);
+    assert.equal(rejection.length, 1);
+    assert.doesNotMatch(rejection[0]?.text ?? '', /https?:/);
+    assert.match(rejection[0]?.html ?? '', /Wrong &lt;b&gt;invoice&lt;\/b&gt; see evil\.example\/pay &amp; &quot;ask&quot; Abel/);
+    assert.doesNotMatch(rejection[0]?.html ?? '', /<b>/);
+    // The creator also sees it on the payment itself, as data (the app shows it as text).
+    assert.deepEqual((await heldOf(creator, first)).held.rejection, { by: 'Abel', reason });
+    assert.equal((await heldOf(creator, first)).held.state, 'rejected');
+    // No reason is fine too.
+    const second = (await create(company, creator, payee)).id;
+    assert.equal((await act(admin, second, 'reject')).status, 200);
+    assert.match((await notesOf(creator)).items[0]?.body ?? '', /was rejected by .+\. It was not sent\.\nNo reason was given\.$/);
+    assert.deepEqual((await heldOf(creator, second)).held.rejection.reason, null);
+
+    // APPROVED and sent: the creator is told, once. The approver who acted is told nothing more.
+    const third = (await create(company, creator, payee)).id;
+    assert.equal((await act(approver, third, 'approve')).status, 200);
+    assert.deepEqual((await titlesOf(creator)).slice(0, 1), ['Your payment was sent for processing']);
+    assert.equal((await notesOf(creator)).items[0]?.body, `Your payment of ${sum} to ${payeeName} was approved and has been sent for processing.`);
+    assert.equal(await h.paymentNotes.scan(), 0);
+    assert.equal((await titlesOf(creator)).filter((title) => title === 'Your payment was sent for processing').length, 1);
+    assert.equal(mailsTo(creator, /^An update on a payment you created/).length, 3);
+
+    // CANCELLED by an administrator: the creator is told. Cancelled by the creator themselves: nobody needs telling.
+    const fourth = (await create(company, creator, payee)).id;
+    assert.equal((await act(admin, fourth, 'cancel')).status, 200);
+    assert.equal((await titlesOf(creator))[0], 'Your payment was cancelled');
+    const fifth = (await create(company, creator, payee)).id;
+    const count = (await notesOf(creator)).items.length;
+    assert.equal((await act(creator, fifth, 'cancel')).status, 200);
+    assert.equal((await notesOf(creator)).items.length, count);
+
+    // The audit log has who was told and which kind; nothing a notification said.
+    const entries = await audit('notification');
+    assert.ok(entries.length >= 9);
+    assert.ok(entries.every((entry) => entry.action !== 'notification' || (Object.keys(entry.detail).sort().join() === 'category,email,kind' && !JSON.stringify(entry).includes(payeeName) && !JSON.stringify(entry).includes('evil.example'))));
+  });
+
+  test(on('notifications: about to expire and expired; email can be turned off per category but not for security; rate-limited'), async () => {
+    const { admin, creator, approver, payee } = await team(company, {}, { notificationsPerUserPerHour: 4 });
+    // PREFERENCES: everything on to begin with; security is always on and cannot be switched.
+    assert.deepEqual((await h.call('GET', '/v1/notifications/preferences', { token: creator.token })).json, { email: { rates: true, approvals: true, payments: true }, alwaysOn: ['security'] });
+    for (const body of [{ email: { rates: true, approvals: true, payments: true, security: false } }, { email: { rates: true } }, { email: { rates: 'no', approvals: true, payments: true } }, {}]) {
+      assert.equal((await h.call('POST', '/v1/notifications/preferences', { token: creator.token, body })).status, 400, JSON.stringify(body));
+    }
+    assert.deepEqual((await h.call('POST', '/v1/notifications/preferences', { token: creator.token, body: { email: { rates: true, approvals: true, payments: false } } })).json.email, { rates: true, approvals: true, payments: false });
+    const changed = (await audit('client.notification_preferences'))[0];
+    assert.deepEqual([changed?.actor.label, changed?.detail], [creator.email, { rates: 'on', approvals: 'on', payments: 'off' }]);
+
+    const id = (await create(company, creator, payee)).id;
+    assert.deepEqual(await titlesOf(approver), ['A payment is waiting for your approval']);
+    // Six hours before it runs out (it lasts 48): the creator and those who could still approve are told, once.
+    h.clock.advance(41 * HOUR);
+    assert.equal(await h.paymentNotes.scan(), 0, 'not yet');
+    h.clock.advance(HOUR + 60_000);
+    assert.equal(await h.paymentNotes.scan(), 3);
+    assert.equal(await h.paymentNotes.scan(), 0);
+    const note = async (userId: string) => (await h.notifier.list(userId)).items;
+    for (const who of [approver, admin]) assert.deepEqual((await note(who.id)).map((item) => item.title), ['A payment waiting for approval is about to expire', 'A payment is waiting for your approval'], who.name);
+    assert.deepEqual((await note(creator.id)).map((item) => [item.title, item.category]), [['A payment waiting for approval is about to expire', 'payments']]);
+    assert.match((await note(creator.id))[0]?.body ?? '', /is still waiting for approval\. It has not been sent\.\nIt expires 2026-11-13 \d\d:\d\d UTC\. If it is not approved by then it will not be sent/);
+    // The creator turned payment emails off: in the app, yes; by email, no. The approver's emails still go.
+    assert.equal(mailsTo(creator, /payment/i).length, 0);
+    assert.equal(mailsTo(approver, /^A payment is waiting for your approval in Global Connect$/).length, 2);
+    assert.equal((await audit('notification')).find((entry) => entry.target?.id === creator.id)?.detail.email, 'off');
+    // A SECURITY notice still reaches the creator by email whatever they chose.
+    await h.notices.send({ id: creator.id, email: creator.email, name: creator.name }, 'client', 'password_changed');
+    assert.equal(h.outbox.sent.filter((message) => message.to === creator.email && /^Security notice/.test(message.subject)).length >= 1, true);
+
+    // EXPIRED: the creator is told, once.
+    h.clock.advance(6 * HOUR);
+    assert.deepEqual(await h.held.sweep(), { expired: 1, settled: 0 });
+    assert.equal(await h.paymentNotes.scan(), 1);
+    assert.equal(await h.paymentNotes.scan(), 0);
+    assert.equal((await note(creator.id))[0]?.title, 'Your payment expired');
+    assert.equal((await record(id)).status, 'expired');
+
+    // RATE LIMIT (4 an hour here): the fifth and later are held back, on record once, and nothing is emailed for them.
+    const before = (await note(approver.id)).length;
+    const emails = mailsTo(approver, /payment/i).length;
+    for (let index = 0; index < 6; index += 1) await h.notifier.notify({ userId: approver.id, companyId: company.id, category: 'approvals', kind: 'payment_awaiting', note: { amount: '1.00', currency: 'GBP', payee: 'P', createdBy: 'C', expiresAt: 0 }, dedupe: `flood:${index}` });
+    for (let index = 0; index < 6; index += 1) await h.notifier.notify({ userId: approver.id, companyId: company.id, category: 'approvals', kind: 'payment_awaiting', note: { amount: '1.00', currency: 'GBP', payee: 'P', createdBy: 'C', expiresAt: 0 }, dedupe: `flood:${index}` });
+    assert.equal((await note(approver.id)).length, before + 4);
+    assert.equal(mailsTo(approver, /payment/i).length, emails + 4);
+    const suppressed = (await audit('notification')).filter((entry) => entry.outcome === 'failure');
+    assert.deepEqual([suppressed.length, suppressed[0]?.detail.reason], [2, 'rate_limited']);
+    // A disabled person is told nothing.
+    await h.stores.directory.saveUser({ ...((await h.stores.directory.getUser(admin.id)) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getUser>>>), disabledAt: h.clock.now });
+    assert.equal(await h.notifier.notify({ userId: admin.id, companyId: company.id, category: 'payments', kind: 'payment_sent', note: { amount: '1.00', currency: 'GBP', payee: 'P' }, dedupe: 'disabled:1' }), 'skipped');
+  });
+}
+
+test('provider A: notifications when a send goes unanswered (outcome being checked), is not as approved, or fails; nothing twice', async () => {
+  const company = COMPANIES[0] as Company;
+  const { creator, approver, payee } = await team(company);
+  // No answer from the provider when the payment is sent: its outcome is being checked.
+  const first = (await create(company, creator, payee)).id;
+  h.providerA.paymentFault = 'no_answer';
+  await act(approver, first, 'approve');
+  assert.deepEqual((await titlesOf(creator)).sort(), ['Your payment needs attention: its outcome is being checked', 'Your payment was approved']);
+  const checking = (await notesOf(creator)).items.find((item) => /being checked/.test(item.title));
+  assert.match(checking?.body ?? '', /we do not yet know whether it was made\. We are checking\.\nDo NOT create it again\./);
+  assert.equal(await h.paymentNotes.scan(), 0);
+  assert.equal((await notesOf(creator)).items.length, 2);
+});

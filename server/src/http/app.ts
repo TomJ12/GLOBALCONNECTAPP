@@ -881,7 +881,7 @@ export async function buildApp(deps: AppDeps) {
     { prefix: '/v1' },
   );
 
-  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, notices, authenticatorResets, rates, now, limitAttempts });
+  const opsRoutes = await registerOps(app, { config, stores: deps.stores, auth, opsAuth, registry, mail, notices, authenticatorResets, rates, notifier, alerts, now, limitAttempts });
   // Null when no ADMIN_TOKEN is set: the operator commands are then off.
   const admin = config.adminToken ? await buildAdminApp({ config, stores: deps.stores, auth, opsAuth, mail, now }) : null;
 
