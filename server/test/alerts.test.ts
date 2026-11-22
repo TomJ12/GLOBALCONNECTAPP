@@ -17,11 +17,19 @@ afterEach(async () => {
 
 async function signedIn(email: string, companyId?: string): Promise<{ token: string; id: string; email: string }> {
   const { secret } = await h.activate(email);
+  secrets.set(email, secret);
   const reply = await h.login(email, secret);
   assert.equal(reply.status, 200);
   const token = reply.json.token as string;
   if (companyId) assert.equal((await h.call('POST', '/v1/session/company', { token, body: { companyId } })).status, 200);
   return { token, id: (await h.stores.directory.findUserByEmail(email))?.id as string, email };
+}
+/** Signs an already activated person in again (after the clock has moved past the session's idle time). */
+const secrets = new Map<string, string>();
+async function signedIn2(email: string): Promise<string> {
+  const reply = await h.login(email, secrets.get(email) as string);
+  assert.equal(reply.status, 200);
+  return reply.json.token as string;
 }
 const setMargin = (companyId: string, defaultBps: number) => h.stores.margins.put(companyId, { defaultBps, forwardBps: null, overrides: [], tiers: [], companyId, updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
 const newAlert = (token: string, body: Record<string, unknown>) => h.call('POST', '/v1/alerts', { token, body: { base: 'GBP', quote: 'USD', side: 'sell', targetRate: '1.2950', ...body } });
@@ -226,4 +234,26 @@ test('alerts belong to one person in one company: a cap per person, validation, 
   assert.equal(dev({ ALERT_CHECK_SECONDS: '15', PAYMENT_EXPIRY_WARNING_HOURS: '1.5' }).alertCheckMs, 15_000);
   for (const [name, value] of [['ALERT_CHECK_SECONDS', '1'], ['ALERTS_PER_USER', '0'], ['PAYMENT_EXPIRY_WARNING_HOURS', '-1'], ['NOTIFICATIONS_PER_USER_PER_HOUR', 'lots']] as const) assert.throws(() => dev({ [name]: value }), new RegExp(name));
   assert.ok(isProviderError);
+});
+
+test('an alert whose notification was held back is NOT marked as fired: it is tried again at the next check', async () => {
+  h = await harness({ notificationsPerUserPerHour: 1 });
+  const amira = await signedIn(AMIRA);
+  await setMargin('co_northfield', 20);
+  // Two alerts, both reached at once; one notification an hour is all this person may be sent.
+  assert.equal((await newAlert(amira.token, {})).status, 200);
+  assert.equal((await newAlert(amira.token, { targetRate: '1.2960' })).status, 200);
+  assert.equal(await h.alerts.check(), 1);
+  assert.deepEqual((await alertsOf(amira.token)).map((item) => item.status), ['triggered', 'active']);
+  assert.equal((await notesOf(amira.token)).items.length, 1);
+  // Still held back: still on, however often it is checked.
+  assert.equal(await h.alerts.check(), 0);
+  assert.equal((await alertsOf(amira.token))[1]?.status, 'active');
+  // When the hour has passed, it fires: nothing was lost.
+  h.clock.advance(60 * 60_000 + 1);
+  const again = await signedIn2(AMIRA);
+  assert.equal(await h.alerts.check(), 1);
+  assert.deepEqual((await alertsOf(again)).map((item) => item.status), ['triggered', 'triggered']);
+  assert.equal((await notesOf(again)).items.length, 2);
+  assert.equal(alertMails(AMIRA).length, 2);
 });

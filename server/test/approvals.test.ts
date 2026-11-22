@@ -1361,3 +1361,54 @@ test('provider A: notifications when a send goes unanswered (outcome being check
   assert.equal((await titlesOf(creator))[0], 'Your payment was stopped');
   assert.match((await notesOf(creator)).items[0]?.body ?? '', /was stopped because the payee’s details changed after you created it\. It was not sent\./);
 });
+
+test('notifications follow CURRENT membership: someone removed from a company, disabled, moved to a role that cannot approve, or in a deactivated company is told nothing, and no longer sees what they were told', async () => {
+  const company = COMPANIES[0] as Company;
+  const { admin, creator, approver, payee } = await team(company);
+  const listOf = async (who: Person) => h.notifier.list(who.id);
+  const first = (await create(company, creator, payee)).id;
+  assert.deepEqual([(await listOf(approver)).items.length, (await listOf(admin)).items.length], [1, 1]);
+
+  // The creator is REMOVED from the company. The payment is then rejected with a reason: she is not told, in the app or by email.
+  await h.stores.directory.removeMembership(creator.id, company.id);
+  const mails = h.outbox.sent.filter((message) => message.to === creator.email).length;
+  assert.equal((await act(approver, first, 'reject', { reason: 'Not for her eyes any more' })).status, 200);
+  assert.equal(await h.paymentNotes.scan(), 0);
+  assert.equal((await h.stores.notifications.list({ userId: creator.id })).length, 0);
+  assert.equal(h.outbox.sent.filter((message) => message.to === creator.email).length, mails);
+  assert.ok(!JSON.stringify(h.outbox.sent.filter((message) => message.to === creator.email)).includes('Not for her eyes'));
+  await h.stores.directory.setMembership({ userId: creator.id, companyId: company.id, role: 'creator' });
+
+  // The approver is removed: what he was told about this company is no longer shown to him or counted; back in, it is.
+  await h.stores.directory.removeMembership(approver.id, company.id);
+  assert.deepEqual([(await listOf(approver)).items.length, (await listOf(approver)).unread], [0, 0]);
+  assert.equal(await h.notifier.markRead(approver.id, null), 0);
+  const second = (await create(company, creator, payee)).id;
+  assert.equal((await h.stores.notifications.list({ userId: approver.id })).length, 1, 'nothing new for someone who is not a member');
+  await h.stores.directory.setMembership({ userId: approver.id, companyId: company.id, role: 'approver' });
+  assert.deepEqual([(await listOf(approver)).items.length, (await listOf(approver)).unread], [1, 1]);
+
+  // An administrator moved to a role that cannot approve is no longer asked to.
+  const adminBefore = (await h.stores.notifications.list({ userId: admin.id })).length;
+  await h.stores.directory.setMembership({ userId: admin.id, companyId: company.id, role: 'creator' });
+  const third = (await create(company, creator, payee)).id;
+  assert.equal((await h.stores.notifications.list({ userId: admin.id })).length, adminBefore, 'not told of the third payment');
+  // Even asked for directly, the notifier refuses: the check is made at the moment of telling.
+  assert.equal(await h.notifier.notify({ userId: admin.id, companyId: company.id, category: 'approvals', kind: 'payment_awaiting', note: { amount: '1.00', currency: 'GBP', payee: 'P', createdBy: 'C', expiresAt: 0 }, dedupe: 'role:1' }), 'skipped');
+  assert.equal(await h.notifier.notify({ userId: admin.id, companyId: company.id, category: 'payments', kind: 'payment_sent', note: { amount: '1.00', currency: 'GBP', payee: 'P' }, dedupe: 'role:2' }), 'created', 'news of a payment is for any member');
+
+  // A disabled approver hears nothing.
+  await h.stores.directory.saveUser({ ...((await h.stores.directory.getUser(approver.id)) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getUser>>>), disabledAt: h.clock.now });
+  const approverRows = (await h.stores.notifications.list({ userId: approver.id })).length;
+  await create(company, creator, payee);
+  assert.equal((await h.stores.notifications.list({ userId: approver.id })).length, approverRows);
+
+  // A DEACTIVATED company: nobody is told anything about it.
+  const everyone = (await h.stores.notifications.list()).length;
+  await h.stores.directory.updateCompany(company.id, (current) => ({ ...current, deactivatedAt: h.clock.now }));
+  assert.equal(await h.notifier.notify({ userId: creator.id, companyId: company.id, category: 'payments', kind: 'payment_sent', note: { amount: '1.00', currency: 'GBP', payee: 'P' }, dedupe: 'closed:1' }), 'skipped');
+  await h.held.sweep();
+  assert.equal(await h.paymentNotes.scan(), 0);
+  assert.equal((await h.stores.notifications.list()).length, everyone);
+  assert.ok(second && third);
+});
