@@ -1757,8 +1757,23 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.match(pages[0]?.body ?? '', /Lost your authenticator and your recovery codes as well\? That cannot be done here/);
   assert.deepEqual([...new Set(h.outbox.sent.filter((message) => /ops\/reset#code=/.test(message.text)).map((message) => message.to))], [admin.email]);
   assert.match(h.outbox.sent.find((message) => /ops\/reset#code=/.test(message.text))?.subject ?? '', /^Reset the password of your Global Connect staff account$/);
+  const opened = async (url: string, form: Record<string, string>) => {
+    const browser = fresh();
+    await browser.get(url);
+    return browser.post(url, form);
+  };
+  // A second request for the same person: the NEW link is the one live link; the earlier one is dead. At most three an hour.
+  const firstLink = resetLink(admin.email);
+  await ask(admin.email);
   const link = resetLink(admin.email);
-  assert.ok(link);
+  assert.ok(link && firstLink && link !== firstLink);
+  assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /That reset link is not valid any more/);
+  await ask(admin.email);
+  await ask(admin.email);
+  assert.equal(h.outbox.sent.filter((message) => message.to === admin.email && /ops\/reset#code=/.test(message.text)).length, 3, 'the fourth request in the hour made no link');
+  const live = resetLink(admin.email);
+  assert.match((await opened('/ops/reset', { resetCode: link })).body, /That reset link is not valid any more/, 'the second link died when the third was made');
+  assert.equal((await audit('ops.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').length, 1);
   // No page ever shows the link or the code.
   for (const reply of pages) assert.doesNotMatch(reply.body, LINK_OR_CODE);
 
@@ -1766,17 +1781,17 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   const browser = fresh();
   await browser.get('/ops/reset');
   assert.match((await browser.post('/ops/reset', { resetCode: 'AAAAA-BBBBB-CCCCC-DDDDD' })).body, /That reset link is not valid any more/);
-  assert.match((await browser.post('/ops/reset', { resetCode: link })).body, /Choose a new password[^]*Code from your authenticator app, or a recovery code/);
+  assert.match((await browser.post('/ops/reset', { resetCode: live })).body, /Choose a new password[^]*Code from your authenticator app, or a recovery code/);
   // The link without the second factor: refused, nothing changed, nobody signed out.
   for (const code of ['', '000000', OPS_PASSWORD]) {
-    const refused = await browser.post('/ops/reset/complete', { resetCode: link, code, password: 'a completely new staff password' });
+    const refused = await browser.post('/ops/reset/complete', { resetCode: live, code, password: 'a completely new staff password' });
     assert.ok(refused.status >= 400, code);
   }
   assert.equal((await h.stores.ops.users.get(admin.id))?.passwordHash, before?.passwordHash);
   assert.equal((await admin.browser.get('/ops/users')).status, 200);
-  assert.match((await browser.post('/ops/reset/complete', { resetCode: link, code: h.freshCode(admin.secret), password: 'password1234' })).body, /password/i);
+  assert.match((await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'password1234' })).body, /password/i);
   // With a code: the password changes, only the password; every session of theirs ends; the new password signs in.
-  const done = await browser.post('/ops/reset/complete', { resetCode: link, code: h.freshCode(admin.secret), password: 'a completely new staff password' });
+  const done = await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'a completely new staff password' });
   assert.deepEqual([done.status, done.location], [303, '/ops/login?done=password_reset']);
   const after = await h.stores.ops.users.get(admin.id);
   assert.notEqual(after?.passwordHash, before?.passwordHash);
@@ -1786,7 +1801,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.equal((await signIn(fresh(), admin.email, admin.secret, 'a completely new staff password')).status, 303);
   assert.match(h.outbox.sent.at(-1)?.subject ?? '', /^Security notice for your Global Connect staff account$/);
   // Once only; and a recovery code does as well as the authenticator.
-  assert.match((await browser.post('/ops/reset/complete', { resetCode: link, code: h.freshCode(admin.secret), password: 'one more long staff password' })).body, /not valid any more/);
+  assert.match((await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'one more long staff password' })).body, /not valid any more/);
   await ask(second.email);
   const other = fresh();
   await other.get('/ops/reset');
@@ -1797,7 +1812,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   const entries = (await audit('ops.password_reset')).filter((entry) => entry.action === 'ops.password_reset' && entry.outcome === 'success');
   assert.deepEqual(entries.map((entry) => [entry.actor.label, entry.detail.method]).reverse(), [[admin.email, 'totp'], [second.email, 'recovery']]);
   const everything = JSON.stringify(await audit());
-  assert.ok(!everything.includes(link) && !everything.includes('a completely new staff password'));
+  assert.ok(!everything.includes(live) && !everything.includes('a completely new staff password'));
   // A disabled member of staff gets no link.
   await h.stores.ops.users.update(second.id, (current) => ({ ...current, disabledAt: 1 }));
   const count = h.outbox.sent.length;
