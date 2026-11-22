@@ -1968,3 +1968,30 @@ test('ops: staff see a person’s notification state (counts and choices), never
   // There is no console action that reads, sends or changes a person's notifications or alerts.
   assert.equal(h.opsRoutes.filter((route) => /notif|alert/i.test(route.url)).length, 0);
 });
+
+test('ops: the console says honestly whether the WARNING before an authenticator reset has been delivered, and that the delay has not started until it has', async () => {
+  h = await harness({ authenticatorResetDelayMs: 24 * HOUR_MS });
+  const { admin, second } = await pair();
+  await h.activate(AMIRA);
+  const send = h.outbox.send.bind(h.outbox);
+  h.outbox.send = async (message) => {
+    if (message.to === AMIRA) throw Object.assign(new Error('mail server down'), { code: 'ETIMEDOUT' });
+    return send(message);
+  };
+  const asked = await admin.act('/ops/users/usr_amira/reset-authenticator', { verification: 'Called back on the number on file' });
+  const approved = await second.act(`/ops/approvals/${idOf(asked.location)}/approve`);
+  assert.equal(approved.status, 303);
+  // Not "the client has been told": the warning is still in the outbox.
+  const entry = (await audit('ops.client.reset_authenticator')).find((item) => item.outcome === 'success');
+  assert.deepEqual([entry?.detail.warningQueuedFor, entry?.detail.warningSentTo, entry?.detail.noticeTo, entry?.detail.takesEffect], ['a…@northfield.example', undefined, undefined, 'not before the warning has been delivered']);
+  const page = (await second.browser.get('/ops/users/usr_amira')).body;
+  assert.match(page, /<strong>The warning to the client has NOT been delivered yet \(queued: it is in the outbox and will be sent shortly\)\.<\/strong> The delay does not start until it has been/);
+  assert.match((await second.browser.get('/ops/approvals')).body, /<strong>not yet: the warning has not been delivered \(queued\)<\/strong>/);
+  // Delivered: now it says when it takes effect, a day after the delivery.
+  h.outbox.send = send;
+  h.clock.advance(2 * 60_000);
+  await h.mail.pump();
+  await h.authenticatorResets.runDue();
+  const due = new Date(h.clock.now + 24 * HOUR_MS).toISOString().slice(0, 19).replace('T', ' ');
+  assert.match((await second.browser.get('/ops/users/usr_amira')).body, new RegExp(`The warning reached the mail server on [^;]+; it takes effect on ${due} UTC`));
+});

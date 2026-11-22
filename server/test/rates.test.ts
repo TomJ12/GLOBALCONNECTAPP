@@ -18,7 +18,7 @@ import { neutralFields } from '../src/http/app';
 import { ClientRates } from '../src/rates/service';
 import { MockCurrencycloudPlatform } from '../src/providers/currencycloudMock';
 import { MockEqualsServer } from '../src/providers/equals/mockServer';
-import { AMIRA, BEN, DANA, forbiddenInClientResponse, harness, type Harness } from './helpers';
+import { AMIRA, BEN, DANA, forbiddenInClientResponse, harness, marginReadableFrom, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => {
@@ -452,7 +452,16 @@ test('the scan that guards every client response does catch the forbidden fields
   for (const leak of ['{"midRate":"1.3"}', '{"mid":"1.3"}', '{"mid_market_rate":"1.3"}', '{"quote":{"marginBps":50}}', '{"margin":{"defaultBps":50}}', '{"providerRate":"1.3"}', '{"provider_rate":"1.3"}', '{"partner_rate":"1.3"}', '{"core_rate":"1.3"}', '{"revenueAmount":"2.60"}', '{"markup":"0.5"}', '{"spread":"0.5"}', '{"bps":50}', '{"wholesaleRate":"1"}', '{"appliedBy":"server"}', '{"error":{"message":"margin could not be worked out"}}', '{"note":"mid-market rate"}', '{"note":"50 basis points"}']) {
     assert.notEqual(forbiddenInClientResponse(leak), null, leak);
   }
-  for (const fine of ['{"rate":"1.2935","buyRate":"1.3065","indicative":true}', '{"paymentId":"p1","itemId":"x"}', '{"kind":"server"}']) assert.equal(forbiddenInClientResponse(fine), null, fine);
+  // TWO NUMBERS THAT GIVE THE MARGIN AWAY: a sell and a buy rate whose spread is exactly a margin in force (here the 50 bp default) fail too...
+  assert.match((await marginReadableFrom('{"base":"GBP","quote":"USD","rate":"1.2935","buyRate":"1.3065","indicative":true}', h.stores, h.config)) ?? '', /is exactly 50 bp/);
+  // ...what the server really sends for that rate does not; nor does a figure that only happens to be near another margin.
+  assert.equal(await marginReadableFrom('{"base":"GBP","quote":"USD","rate":"1.2934","buyRate":"1.3065","indicative":true}', h.stores, h.config), null);
+  assert.equal(await marginReadableFrom('{"rate":"1.2896","buyRate":"1.3104"}', h.stores, h.config), null, '80 bp is not in force anywhere');
+  await h.stores.margins.put('co_castlebrook', { defaultBps: 80, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP', companyId: 'co_castlebrook', updatedAt: 1, updatedBy: 't', approvedBy: null });
+  assert.match((await marginReadableFrom('{"rate":"1.2896","buyRate":"1.3104"}', h.stores, h.config)) ?? '', /is exactly 80 bp/);
+  // And it is applied to what the API really sends: every rate reply in every test went through it (this call would have thrown).
+  assert.equal((await h.call('GET', '/v1/rates/GBP/USD', { token: (await signedIn(BEN)).token })).status, 200);
+  for (const fine of ['{"rate":"1.2934","buyRate":"1.3065","indicative":true}', '{"paymentId":"p1","itemId":"x"}', '{"kind":"server"}']) assert.equal(forbiddenInClientResponse(fine), null, fine);
 });
 
 test('MOCK: the sample rates move as a deterministic walk in small steps, the same for everyone; a held quote does not move', async () => {
