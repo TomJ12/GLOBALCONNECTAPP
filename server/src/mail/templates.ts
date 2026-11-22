@@ -15,7 +15,7 @@
  *    like every other regulatory wording in this project (src/config/disclosures.ts).
  */
 import { sha256 } from '../crypto';
-import { singleLine } from '../validate';
+import { plainText, singleLine } from '../validate';
 
 /** PLACEHOLDER. The company details and regulatory wording an email must carry: to be supplied and approved by Global Connect compliance. */
 export const MAIL_FOOTER = '[EMAIL FOOTER — company details and regulatory wording]';
@@ -59,12 +59,13 @@ export type SecurityNotice = keyof typeof SECURITY_NOTICES;
 /**
  * NOTIFICATIONS: what each in-app notification and its email say. The same words are used for both.
  *
- * Free text that a person typed (a payee's name, a colleague's name, the reason a payment was rejected) is put on
- * one line, cut to a length and has any web address scheme removed, so it can neither start a new line nor become
- * a link. The HTML part of the email escapes it; the app shows it as plain text. NO bank details are ever here.
+ * Free text that a person typed (a payee's name, a colleague's name, the reason a payment was rejected) goes through
+ * `plainText` (validate.ts): one line, cut to a length, and anything that a mail client or an app would turn into
+ * a link (a scheme, a host name, www., an email address) is visibly broken, however it was nested. The HTML part of
+ * the email escapes it; the app shows it as plain text with no link detection. NO bank details are ever here.
  * Nothing promises a rate, a time or an outcome.
  */
-const typed = (value: string | null | undefined, max = 200): string => singleLine(value ?? '').replace(/[a-z][a-z0-9+.-]*:\/\//gi, '').slice(0, max);
+const typed = (value: string | null | undefined, max = 200): string => plainText(value, max);
 const sum = (data: { amount: string; currency: string }): string => `${typed(data.currency, 3)} ${typed(data.amount, 24)}`;
 export interface PaymentNote {
   amount: string;

@@ -27,6 +27,7 @@ import { payeeDigestFields } from '@/api/payeeDigest';
 import type { ApprovalResult, ApprovalStep, Beneficiary, Payment, PaymentHoldState, PaymentStatus, PendingApproval, UserRole } from '@/api/types';
 
 import type { Config } from '../config';
+import { plainText } from '../validate';
 import { randomToken, sha256 } from '../crypto';
 import { ApiError } from '../errors';
 import type { ProviderAdapter } from '../providers/adapter';
@@ -145,8 +146,8 @@ export class HeldPayments {
         canApprove: awaiting && CAN_APPROVE.includes(viewer.role) && viewer.user.id !== record.createdBy && !approved.has(viewer.user.id),
         canCancel: awaiting && (viewer.user.id === record.createdBy || viewer.role === 'admin'),
         approvers: awaiting ? approvers.map((member) => member.name) : [],
-        // Who rejected it and the reason they gave (their own words: shown as plain text, never as markup).
-        ...(record.status === 'rejected' ? { rejection: { by: (record.closedBy && names.get(record.closedBy)) || 'Someone no longer on this account', reason: record.note } } : {}),
+        // Who rejected it and the reason they gave: their own words, with anything that could become a link visibly broken (validate.ts).
+        ...(record.status === 'rejected' ? { rejection: { by: (record.closedBy && names.get(record.closedBy)) || 'Someone no longer on this account', reason: record.note === null ? null : plainText(record.note) } } : {}),
       },
     };
   }

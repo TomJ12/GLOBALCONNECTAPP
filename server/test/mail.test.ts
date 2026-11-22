@@ -8,6 +8,7 @@ import { LINKS_PER_RECIPIENT, MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue, SEC
 import { SmtpMailer, failureCode } from '../src/mail/smtp';
 import { activationMail, mailOf, MAIL_FOOTER, NOTIFICATIONS, notificationText, render, SECURITY_NOTICES, TEMPLATES, type NotificationKind, type TemplateName } from '../src/mail/templates';
 import { createRuntime } from '../src/startup';
+import { plainText } from '../src/validate';
 import { harness, type Harness } from './helpers';
 import { FakeSmtp } from './support/smtp';
 
@@ -88,7 +89,25 @@ test('templates: every message has a harmless subject, the same lines as text an
 
   // NOTIFICATIONS. What a colleague typed (a reason, a payee's name) cannot start a line, become a link or become markup; no bank details; no promise.
   const rejected = render('notification', { name: 'Amira Shah', kind: 'payment_rejected', note: { ...PAYMENT_NOTE, payee: 'Harbour <b>Freight</b>\r\nBcc: x@evil.example', reason: 'see https://evil.example/pay now\nand <script>alert(1)</script>' } }, [APP, OPS]);
-  assert.match(rejected.text, /Your payment of GBP 125\.00 to Harbour <b>Freight<\/b> Bcc: x@evil\.example was rejected by Dana Okafor\. It was not sent\.\nReason given: “see evil\.example\/pay now and <script>alert\(1\)<\/script>”/);
+  assert.ok(rejected.text.includes('Your payment of GBP 125.00 to Harbour <b>Freight</b> Bcc: x[@]evil[.]example was rejected by Dana Okafor. It was not sent.\nReason given: “see https[:]//evil[.]example/pay now and <script>alert(1)</script>”'), rejected.text);
+  // NOTHING a mail client or the app would turn into a link survives, however it is dressed up or nested: every
+  // one of these renders (an email that failed to render would be lost) and comes out visibly broken.
+  for (const hostile of ['https:/a:///gc-payments.example/login', 'hthttps://tps://gc-payments.example', 'www.gc-payments.example/verify', 'gc-payments.example', 'pay to someone@gc-payments.example', 'mailto:someone@gc-payments.example', 'tel:+441234567890', 'http:\\\\gc-payments.example', 'JaVaScRiPt:alert(1)', '//gc-payments.example/x', 'ftp://gc-payments.example']) {
+    for (const note of [{ ...PAYMENT_NOTE, reason: hostile }, { ...PAYMENT_NOTE, payee: hostile }, { ...PAYMENT_NOTE, by: hostile, createdBy: hostile }]) {
+      for (const kind of ['payment_rejected', 'payment_awaiting', 'payment_cancelled'] as const) {
+        const mail = render('notification', { name: 'Amira Shah', kind, note }, [APP, OPS]);
+        const words = `${mail.text}\n${notificationText(kind, note).lines.join('\n')}`.replace(MAIL_FOOTER, '');
+        assert.doesNotMatch(words, /[a-z][a-z0-9+.-]*:[/\\]|\b(mailto|tel|javascript|https?|ftp):/i, `${kind}: ${hostile}`);
+        assert.doesNotMatch(words, /[\p{L}\p{N}-]\.\p{L}/u, `${kind}: a host name survived: ${hostile}`);
+        assert.doesNotMatch(words, /@[\p{L}\p{N}]/u, `${kind}: an address survived: ${hostile}`);
+        assert.doesNotMatch(mail.html, /<a /, hostile);
+      }
+    }
+  }
+  // What it does to ordinary writing: nothing.
+  assert.equal(plainText('Wrong invoice: GBP 125.00, not 152.00. Ask Abel (ext. 4) on 12/11.'), 'Wrong invoice: GBP 125.00, not 152.00. Ask Abel (ext. 4) on 12/11.');
+  assert.equal(plainText('https:/a:///gc-payments.example/login'), 'https[:]/a[:]///gc-payments[.]example/login');
+  assert.equal(plainText('x'.repeat(500)).length, 200);
   assert.doesNotMatch(rejected.text, /https?:/);
   assert.doesNotMatch(rejected.html, /<script|<b>/);
   assert.match(rejected.html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);

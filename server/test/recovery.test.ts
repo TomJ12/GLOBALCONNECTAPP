@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
 import { agentFamily, PASSWORD_RESET_TTL_MS, RESET_REQUESTS_PER_HOUR } from '../src/auth/service';
+import { loadConfig } from '../src/config';
 import { AMIRA, BEN, DANA, harness, PASSWORD, type Harness } from './helpers';
 
 let h: Harness;
@@ -278,4 +279,167 @@ test('security notices: a sign-in from a new network and a lock are told to the 
   const count = h.outbox.sent.length;
   for (let n = 0; n < 20; n += 1) await h.call('POST', '/v1/auth/login', { body: { email: 'nobody@nowhere.example', password: 'x' }, headers: from(`198.20.${n}.1`) });
   assert.equal(h.outbox.sent.length, count);
+});
+
+// --- The review of ae7f104: mail allowances, the warning before an authenticator reset, races -----------------------
+const HOUR = 60 * 60_000;
+const REAL = loadConfig({ APP_ENV: 'development' });
+const userOf = async (id: string) => (await h.stores.directory.getUser(id)) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getUser>>>;
+const schedule = async (userId: string, requestId: string) => h.authenticatorResets.schedule(await userOf(userId), { id: requestId, requestedBy: 'ops.admin@globalconnect.example', approvedBy: 'ops.admin2@globalconnect.example' }, '127.0.0.1');
+const resetOf = async (id: string) => (await h.stores.auth.authenticatorResets.get(id)) as NonNullable<Awaited<ReturnType<typeof h.stores.auth.authenticatorResets.get>>>;
+
+test('AT THE PRODUCTION MAIL LIMITS: a flood of payment notifications cannot silence a reset link, a security notice or the warning before an authenticator reset', async () => {
+  h = await harness({ mailPerRecipientPerHour: REAL.mailPerRecipientPerHour, mailGlobalPerHour: REAL.mailGlobalPerHour, authenticatorResetDelayMs: 24 * HOUR, notificationsPerUserPerHour: 100 });
+  assert.deepEqual([REAL.mailPerRecipientPerHour, REAL.mailGlobalPerHour], [20, 1000]);
+  const dana = await h.activate(DANA);
+  // A colleague makes 30 payments in a few minutes: Dana, who can approve them, is notified of each.
+  for (let n = 0; n < 30; n += 1) assert.equal(await h.notifier.notify({ userId: 'usr_dana', companyId: 'co_northfield', category: 'approvals', kind: 'payment_awaiting', note: { amount: '125.00', currency: 'GBP', payee: 'Harbour Print Ltd', createdBy: 'Amira Shah', expiresAt: 0 }, dedupe: `flood:${n}` }), 'created');
+  // In the app: all thirty. By email: twenty, and ONE digest saying the rest are in the app.
+  assert.equal((await h.notifier.list('usr_dana')).unread, 30);
+  assert.equal(mailsTo(DANA, /^A payment is waiting for your approval/).length, 20);
+  assert.equal(mailsTo(DANA, /^More notifications are waiting for you in Global Connect$/).length, 1);
+
+  // Her password-reset link still arrives...
+  await request(DANA);
+  assert.equal(mailsTo(DANA, RESET).length, 1);
+  assert.equal((await audit('client.password_reset.request')).find((entry) => entry.outcome === 'success')?.detail.email, 'sent');
+  // ...so does a security notice...
+  assert.deepEqual(await h.notices.send({ id: 'usr_dana', email: DANA, name: 'Dana Reid' }, 'client', 'password_changed'), { duplicate: false, state: 'sent', sentAt: h.clock.now });
+  assert.equal(mailsTo(DANA, NOTICE).length, 1);
+  // ...and so does the WARNING that staff have approved a reset of her authenticator. The delay runs from its delivery.
+  const reset = await schedule('usr_dana', 'req_flood');
+  assert.deepEqual([reset.status, reset.warnedAt, reset.dueAt], ['waiting', h.clock.now, h.clock.now + 24 * HOUR]);
+  assert.match(mailsTo(DANA, NOTICE).at(-1)?.text ?? '', /Global Connect staff have approved a reset of the authenticator on your account/);
+  // Nothing of hers is waiting on an allowance or was dropped.
+  assert.deepEqual((await h.stores.mail.list({ to: DANA })).filter((row) => row.status !== 'sent').map((row) => [row.class, row.status]), Array.from({ length: 10 }, () => ['payments', 'suppressed']));
+  assert.equal((await h.stores.mail.list({ to: DANA })).filter((row) => row.deferred).length, 0);
+  // She signs in with what she has: the reset is cancelled, as before.
+  assert.equal((await h.login(DANA, dana.secret)).status, 200);
+  assert.equal((await resetOf(reset.id)).status, 'cancelled');
+
+  // The operator command says what REALLY became of an invitation: the seventh link to one address in an hour is not "sent".
+  const invites = [];
+  for (let n = 0; n < 7; n += 1) invites.push((await h.adminCall('/admin/invites', { email: BEN })).json);
+  assert.deepEqual(invites.slice(0, 6).map((reply) => [reply.sentTo, reply.email]), Array.from({ length: 6 }, () => ['b…@castlebrook.example', 'sent']));
+  assert.deepEqual([invites[6].sentTo, invites[6].queuedFor, invites[6].email], [undefined, 'b…@castlebrook.example', 'deferred']);
+  assert.equal((await audit('system.client.activation_link'))[0]?.detail.email, 'deferred');
+  // ...and it is delivered, by itself, when the hour has passed.
+  const before = h.outbox.sent.filter((message) => message.to === BEN).length;
+  h.clock.advance(HOUR + 1);
+  await h.mail.pump();
+  assert.equal(h.outbox.sent.filter((message) => message.to === BEN).length, before + 1);
+});
+
+test('the delay before an authenticator reset starts only when the mail server has ACCEPTED the warning; an undelivered warning holds the reset back; the warning is also shown in the app', async () => {
+  h = await harness({ authenticatorResetDelayMs: 24 * HOUR });
+  const dana = await h.activate(DANA);
+  const send = h.outbox.send.bind(h.outbox);
+  let failing = true;
+  h.outbox.send = async (message) => {
+    if (failing) throw Object.assign(new Error('mail server down'), { code: 'ETIMEDOUT' });
+    return send(message);
+  };
+  // Approved while the mail server is down: the warning is in the outbox, not delivered. Nothing is due.
+  const reset = await schedule('usr_dana', 'req_1');
+  assert.deepEqual([reset.status, reset.warnedAt], ['waiting', null]);
+  assert.deepEqual((await h.authenticatorResets.waitingWithWarning()).map((item) => item.warning), ['queued']);
+  // In the app she is told at once, whatever the mail server does.
+  const inApp = (await h.notifier.list('usr_dana')).items;
+  assert.deepEqual(inApp.map((item) => [item.category, item.title]), [['security', 'Security notice about your account']]);
+  assert.match(inApp[0]?.body ?? '', /Global Connect staff have approved a reset of the authenticator on your account\.\nIt has NOT happened yet\. It will not happen before /);
+  // The whole delay passes, and more: STILL nothing happens, because she has not been warned by email.
+  h.clock.advance(30 * HOUR);
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.equal((await userOf('usr_dana')).totpSecret, dana.secret);
+  assert.equal((await audit('system.client.reset_authenticator.warned')).length, 0);
+  // The mail server comes back; the outbox delivers the warning. The delay starts NOW.
+  failing = false;
+  await h.mail.pump();
+  const sentAt = h.clock.now;
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.deepEqual([(await resetOf(reset.id)).warnedAt, (await resetOf(reset.id)).dueAt], [sentAt, sentAt + 24 * HOUR]);
+  assert.equal((await audit('system.client.reset_authenticator.warned')).length, 1);
+  assert.deepEqual((await h.authenticatorResets.waitingWithWarning()).map((item) => item.warning), ['sent']);
+  h.clock.advance(24 * HOUR - 1000);
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.equal((await userOf('usr_dana')).totpSecret, dana.secret);
+  h.clock.advance(1000);
+  assert.equal(await h.authenticatorResets.runDue(), 1);
+  assert.equal((await userOf('usr_dana')).totpSecret, null);
+
+  // A warning the mail server refuses for good is not the end of it: it is on record, a fresh one is queued, and the reset goes on waiting.
+  const amira = await h.activate(AMIRA);
+  failing = true;
+  const second = await schedule('usr_amira', 'req_2');
+  for (let n = 0; n < 8; n += 1) {
+    h.clock.advance(4 * HOUR);
+    await h.mail.pump();
+  }
+  assert.deepEqual((await h.authenticatorResets.waitingWithWarning()).map((item) => item.warning), ['failed']);
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.deepEqual([(await resetOf(second.id)).warningTries, (await resetOf(second.id)).warnedAt, (await userOf('usr_amira')).totpSecret], [1, null, amira.secret]);
+  assert.equal((await audit('system.client.reset_authenticator.warning_failed')).length, 1);
+  failing = false;
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.equal((await resetOf(second.id)).warnedAt, h.clock.now);
+  assert.equal((await userOf('usr_amira')).totpSecret, amira.secret);
+});
+
+test('an authenticator reset is claimed before anything is cleared (a sign-in cannot "cancel" one that then clears the credentials); proving you hold the authenticator cancels a pending one', async () => {
+  h = await harness({ authenticatorResetDelayMs: 24 * HOUR });
+  const amira = await h.activate(AMIRA);
+  const first = await schedule('usr_amira', 'req_1');
+  h.clock.advance(25 * HOUR);
+  // A sign-in's cancellation lands at the worst moment: just as the credentials are about to be cleared.
+  const clear = h.auth.clearCredentials.bind(h.auth);
+  let cancelledByRace = -1;
+  h.auth.clearCredentials = async (userId: string) => {
+    cancelledByRace = await h.auth.cancelAuthenticatorResets(await userOf(userId), 'signed in');
+    return clear(userId);
+  };
+  assert.equal(await h.authenticatorResets.runDue(), 1);
+  h.auth.clearCredentials = clear;
+  // It was too late to cancel, and nothing says it was cancelled: the reset is done and the account says so.
+  assert.equal(cancelledByRace, 0);
+  assert.equal((await resetOf(first.id)).status, 'done');
+  assert.equal((await audit('system.client.reset_authenticator.cancelled')).length, 0);
+  assert.equal(mailsTo(AMIRA, NOTICE).filter((message) => /was cancelled\. Nothing was changed/.test(message.text)).length, 0);
+  assert.equal((await userOf('usr_amira')).totpSecret, null);
+  assert.ok(amira.secret);
+
+  // Dana has a reset pending. She resets her PASSWORD with the emailed link and a code from her authenticator:
+  // she plainly still has it, so the authenticator reset is cancelled.
+  const dana = await h.activate(DANA);
+  const second = await schedule('usr_dana', 'req_2');
+  await request(DANA);
+  assert.equal((await complete(resetCodeOf(DANA), h.freshCode(dana.secret))).status, 200);
+  assert.equal((await resetOf(second.id)).status, 'cancelled');
+  assert.equal((await audit('system.client.reset_authenticator.cancelled'))[0]?.detail.by, 'password reset with an authenticator code');
+  // The same when she changes her password, signed in, with a code.
+  const signedIn = await h.login(DANA, dana.secret, NEW_PASSWORD);
+  assert.equal(signedIn.status, 200);
+  const third = await schedule('usr_dana', 'req_3');
+  const changed = await h.call('POST', '/v1/account/password', { token: signedIn.json.token, body: { currentPassword: NEW_PASSWORD, code: h.freshCode(dana.secret), newPassword: 'emerald kettle window frost' } });
+  assert.equal(changed.status, 200, JSON.stringify(changed.json));
+  assert.deepEqual([(await resetOf(third.id)).status, (await resetOf(third.id)).closedBy], ['cancelled', 'password changed with an authenticator code']);
+  // A RECOVERY code does not show that she holds the authenticator: that reset stays.
+  const fourth = await schedule('usr_dana', 'req_4');
+  h.clock.advance(HOUR + 1);
+  await request(DANA);
+  assert.equal((await complete(resetCodeOf(DANA), dana.recoveryCodes[0] as string, 'copper lantern meadow stone', 'recovery')).status, 200);
+  assert.equal((await resetOf(fourth.id)).status, 'waiting');
+});
+
+test('reset links asked for at the same moment: never more than the hourly limit, and exactly one live link', async () => {
+  h = await harness({}, undefined, { storeLatency: true });
+  await h.activate(AMIRA);
+  const replies = await Promise.all(Array.from({ length: 15 }, () => h.call('POST', '/v1/auth/password-reset/request', { body: { email: AMIRA } })));
+  await h.auth.settle();
+  assert.ok(replies.every((reply) => reply.status === 200));
+  const codes = h.outbox.sent.filter((message) => message.to === AMIRA && RESET.test(message.subject)).map((message) => /\/reset#code=([A-Z2-7-]+)/.exec(message.text)?.[1] as string);
+  assert.equal(codes.length, RESET_REQUESTS_PER_HOUR);
+  const usable = [];
+  for (const code of codes) usable.push((await h.call('POST', '/v1/auth/password-reset/start', { body: { resetCode: code } })).status);
+  assert.deepEqual(usable.sort(), [200, 400, 400]);
+  assert.equal((await audit('client.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').length, 12);
 });

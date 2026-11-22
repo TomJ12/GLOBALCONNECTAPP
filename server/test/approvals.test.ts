@@ -1231,15 +1231,26 @@ for (const company of COMPANIES) {
     assert.equal((await act(approver, first, 'reject', { reason })).status, 200);
     const told = await notesOf(creator);
     assert.deepEqual([told.unread, told.items[0]?.category, told.items[0]?.title], [1, 'payments', 'Your payment was rejected']);
-    assert.equal(told.items[0]?.body, `Your payment of ${sum} to ${payeeName} was rejected by Abel. It was not sent.\nReason given: “Wrong <b>invoice</b> see evil.example/pay & "ask" Abel”`);
+    assert.equal(told.items[0]?.body, `Your payment of ${sum} to ${payeeName} was rejected by Abel. It was not sent.\nReason given: “Wrong <b>invoice</b> see https[:]//evil[.]example/pay & "ask" Abel”`);
     const rejection = mailsTo(creator, /^An update on a payment you created in Global Connect$/);
     assert.equal(rejection.length, 1);
     assert.doesNotMatch(rejection[0]?.text ?? '', /https?:/);
-    assert.match(rejection[0]?.html ?? '', /Wrong &lt;b&gt;invoice&lt;\/b&gt; see evil\.example\/pay &amp; &quot;ask&quot; Abel/);
+    assert.ok((rejection[0]?.html ?? '').includes('Wrong &lt;b&gt;invoice&lt;/b&gt; see https[:]//evil[.]example/pay &amp; &quot;ask&quot; Abel'));
     assert.doesNotMatch(rejection[0]?.html ?? '', /<b>/);
     // The creator also sees it on the payment itself, as data (the app shows it as text).
-    assert.deepEqual((await heldOf(creator, first)).held.rejection, { by: 'Abel', reason });
+    assert.deepEqual((await heldOf(creator, first)).held.rejection, { by: 'Abel', reason: 'Wrong <b>invoice</b> see https[:]//evil[.]example/pay & "ask" Abel' });
     assert.equal((await heldOf(creator, first)).held.state, 'rejected');
+    // A link NESTED so that stripping it once would leave a working one, and a bare address: the creator still gets
+    // the notification AND the email (an email that could not be written out used to be lost for good), with neither a link.
+    const nested = (await create(company, creator, payee)).id;
+    const emailsBefore = mailsTo(creator, /^An update on a payment you created/).length;
+    assert.equal((await act(approver, nested, 'reject', { reason: 'https:/a:///gc-payments.example/login or www.gc-payments.example/verify' })).status, 200);
+    const nestedNote = (await notesOf(creator)).items[0];
+    assert.equal(nestedNote?.body.split('\n')[1], 'Reason given: “https[:]/a[:]///gc-payments[.]example/login or www[.]gc-payments[.]example/verify”');
+    const nestedMail = mailsTo(creator, /^An update on a payment you created/);
+    assert.equal(nestedMail.length, emailsBefore + 1, 'the email was sent');
+    assert.doesNotMatch(`${nestedMail.at(-1)?.text}${nestedMail.at(-1)?.html}`, /https?:\/\/|www\.gc|gc-payments\.example/);
+    assert.equal((await h.stores.mail.list({ status: 'failed' })).length, 0);
     // No reason is fine too.
     const second = (await create(company, creator, payee)).id;
     assert.equal((await act(admin, second, 'reject')).status, 200);
@@ -1253,7 +1264,7 @@ for (const company of COMPANIES) {
     assert.equal((await notesOf(creator)).items[0]?.body, `Your payment of ${sum} to ${payeeName} was approved and has been sent for processing.`);
     assert.equal(await h.paymentNotes.scan(), 0);
     assert.equal((await titlesOf(creator)).filter((title) => title === 'Your payment was sent for processing').length, 1);
-    assert.equal(mailsTo(creator, /^An update on a payment you created/).length, 3);
+    assert.equal(mailsTo(creator, /^An update on a payment you created/).length, 4);
 
     // CANCELLED by an administrator: the creator is told. Cancelled by the creator themselves: nobody needs telling.
     const fourth = (await create(company, creator, payee)).id;
@@ -1273,7 +1284,7 @@ for (const company of COMPANIES) {
     // The audit log has who was told and which kind; nothing a notification said.
     const entries = await audit('notification');
     assert.ok(entries.length >= 9);
-    assert.ok(entries.every((entry) => entry.action !== 'notification' || (Object.keys(entry.detail).sort().join() === 'category,email,kind' && !JSON.stringify(entry).includes(payeeName) && !JSON.stringify(entry).includes('evil.example'))));
+    assert.ok(entries.every((entry) => entry.action !== 'notification' || (Object.keys(entry.detail).sort().join() === 'category,email,kind' && !JSON.stringify(entry).includes(payeeName) && !JSON.stringify(entry).includes('evil'))));
   });
 
   test(on('notifications: about to expire and expired; email can be turned off per category but not for security; rate-limited'), async () => {
