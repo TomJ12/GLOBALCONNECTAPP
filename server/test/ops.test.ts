@@ -1729,7 +1729,7 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
   // Outside development the delay cannot be switched off.
   assert.equal(loadConfig({ APP_ENV: 'development' }).authenticatorResetDelayMs, 24 * HOUR_MS);
   assert.equal(loadConfig({ APP_ENV: 'development', AUTHENTICATOR_RESET_DELAY_HOURS: '0' }).authenticatorResetDelayMs, 0);
-  const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/x.sqlite', DATA_ENCRYPTION_KEY: TEST_DATA_KEY };
+  const LIVE = { APP_URL: 'https://app.globalconnect.example', CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/x.sqlite', DATA_ENCRYPTION_KEY: TEST_DATA_KEY };
   assert.throws(() => loadConfig({ ...LIVE, AUTHENTICATOR_RESET_DELAY_HOURS: '0' }), /AUTHENTICATOR_RESET_DELAY_HOURS must be at least 1 outside development/);
 });
 
@@ -1821,7 +1821,7 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const page = await olu.browser.get('/ops/companies/co_northfield');
   assert.match(page.body, /<h2>FX margin<\/h2><p>Now: <strong>default 50 bp; forwards as spot<\/strong> \(the server default: this company has no configuration of its own\)/);
   assert.match(page.body, /A client only ever sees their own rate: never the provider’s rate and never this margin/);
-  assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.293500', '1.306500']);
+  assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.2934', '1.3065']);
 
   // BOUNDS. Negative: never. Above 300 bp: only when the request says so. Above 2000: never. Nothing is requested.
   const refused = async (fields: Record<string, string>, message: RegExp) => {
@@ -1852,9 +1852,9 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   assert.equal(asked.status, 303, asked.body.slice(-400));
   const id = idOf(asked.location);
   assert.equal(await stored(), null);
-  assert.equal((await clientRate()).rate, '1.293500');
+  assert.equal((await clientRate()).rate, '1.2934');
   const request = await h.stores.ops.approvals.get(id);
-  assert.match(request?.summary ?? '', /Change the FX margin for company “Northfield Trading Ltd” \(co_northfield\) FROM default 50 bp; forwards as spot \(the server default\) TO default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from 50000: 60 bp\./);
+  assert.match(request?.summary ?? '', /Change the FX margin for company “Northfield Trading Ltd” \(co_northfield\) FROM default 50 bp; forwards as spot \(the server default\) TO default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from GBP 50000: 60 bp\./);
   assert.match(request?.summary ?? '', /Worked example at the provider’s rate when this was requested: selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800, so they receive USD 12948\.00 instead of USD 12935\.00; buying GBP 10,000 with USD: the client rate changes from 1\.306500 to 1\.310400, so they pay USD 13104\.00 instead of USD 13065\.00; selling GBP 50,000 for USD: [^;]+; a forward selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.284400[^;]+; selling EUR 10,000 for USD: /);
   const approvalPage = await admin.browser.get(`/ops/approvals/${id}`);
   assert.match(approvalPage.body, /selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800/);
@@ -1868,17 +1868,17 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const wrong = await confirmed((to, fields) => admin.browser.post(to, fields), approve, {}, 'not the password');
   assert.notEqual(wrong.status, 303);
   assert.equal(await stored(), null);
-  assert.equal((await clientRate()).rate, '1.293500');
+  assert.equal((await clientRate()).rate, '1.2934');
   assert.equal((await admin.act(approve)).status, 303);
 
   // Done: stored, the client's rate moved (override: 40 bp selling GBP; default 80 bp buying), audited with old and new values and both people.
   const now = await stored();
   assert.deepEqual([now?.defaultBps, now?.forwardBps, now?.overrides, now?.tiers, now?.updatedBy, now?.approvedBy], [80, 120, [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }, { pair: 'EURUSD', direction: 'both', bps: 35 }], [{ fromAmount: '50000', bps: 60 }], olu.email, admin.email]);
-  assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.294800', '1.310400']);
+  assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.2947', '1.3104']);
   const entry = (await audit('ops.company.margin')).find((item) => item.outcome === 'success');
-  assert.deepEqual([entry?.target?.id, entry?.detail.from, entry?.detail.to, entry?.detail.approvedBy, entry?.actor.label], ['co_northfield', 'default 50 bp; forwards as spot', 'default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from 50000: 60 bp', admin.email, olu.email]);
+  assert.deepEqual([entry?.target?.id, entry?.detail.from, entry?.detail.to, entry?.detail.approvedBy, entry?.actor.label], ['co_northfield', 'default 50 bp; forwards as spot', 'default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from GBP 50000: 60 bp', admin.email, olu.email]);
   assert.equal((await audit('ops.approval.approve')).find((item) => item.detail.request === id)?.detail.passwordChecked, 'yes');
-  assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, new RegExp(`Now: <strong>default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from 50000: 60 bp</strong> \\(set [^)]* by ${olu.email}, approved by ${admin.email}\\)`));
+  assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, new RegExp(`Now: <strong>default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from GBP 50000: 60 bp</strong> \\(set [^)]* by ${olu.email}, approved by ${admin.email}\\)`));
   // The other company is untouched.
   assert.equal(await h.stores.margins.get('co_castlebrook'), null);
 
@@ -1916,7 +1916,7 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const revenue = await admin.browser.get('/ops/revenue');
   assert.equal(revenue.status, 200);
   assert.match(revenue.body, /<td>Northfield Trading Ltd<\/td><td>2026-11<\/td><td>1<\/td><td>USD 10\.40<\/td>/);
-  assert.match(revenue.body, /sold GBP 1000\.00, bought USD 1289\.60<\/td><td>1\.3000<\/td><td>1\.289600<\/td><td>80 bp<\/td><td>USD 10\.40<\/td><td>Booked<\/td>/);
+  assert.match(revenue.body, /sold GBP 1000\.00, bought USD 1289\.60<\/td><td>1\.3000<\/td><td>1\.289600<\/td><td>80 bp \(80\.00 after rounding\)<\/td><td>USD 10\.40<\/td><td>Booked<\/td>/);
   assert.match((await admin.browser.get('/ops/revenue?company=co_castlebrook')).body, /No conversions in this period/);
   assert.match((await admin.browser.get('/ops/revenue?from=2026-11-11&to=2026-11-11')).body, /USD 10\.40/);
   assert.match((await admin.browser.get('/ops/revenue?from=2026-11-12')).body, /No conversions in this period/);
@@ -1926,17 +1926,31 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   assert.equal(csv.status, 200);
   assert.match(String(csv.headers['content-type']), /^text\/csv/);
   const lines = csv.body.trim().split('\r\n');
-  assert.equal(lines[0], 'booked_at,company_id,company,conversion_id,status,kind,pair,direction,sell_currency,buy_currency,provider_rate,client_rate,provider_sell_amount,provider_buy_amount,client_sell_amount,client_buy_amount,margin_bps,margin_applied_by,revenue_amount,revenue_currency,needs_checking');
+  assert.equal(lines[0], 'booked_at,company_id,company,conversion_id,status,kind,pair,direction,sell_currency,buy_currency,provider_rate,client_rate,provider_sell_amount,provider_buy_amount,client_sell_amount,client_buy_amount,margin_bps,effective_margin_bps,margin_applied_by,revenue_amount,revenue_currency,counted_in_totals,booked_sell_amount,booked_buy_amount,needs_checking');
   assert.equal(lines.length, 2);
-  assert.equal(lines[1], `2026-11-11T${new Date(h.clock.now).toISOString().slice(11)},co_northfield,Northfield Trading Ltd,${booked.json.id},booked,spot,GBPUSD,sell,GBP,USD,1.3000,1.289600,1000.00,1300.00,1000.00,1289.60,80,server,10.40,USD,no`);
+  assert.equal(lines[1], `2026-11-11T${new Date(h.clock.now).toISOString().slice(11)},co_northfield,Northfield Trading Ltd,${booked.json.id},booked,spot,GBPUSD,sell,GBP,USD,1.3000,1.289600,1000.00,1300.00,1000.00,1289.60,80,80.00,server,10.40,USD,yes,1000.00,1289.60,no`);
   const exported = (await audit('ops.revenue.export'))[0];
   assert.equal((await audit('ops.revenue.export')).length, exports + 1);
   assert.deepEqual([exported?.actor.label, exported?.detail.rows, exported?.detail.company], [admin.email, '1', 'co_northfield']);
+  // A conversion the provider booked WITHOUT the client's terms is NOT counted: the total stays what it was, and it is listed by itself with both sets of figures.
+  const originalRequest = h.providerA.request.bind(h.providerA);
+  h.providerA.request = async (request) => {
+    if (request.path !== '/v2/conversions/create') return originalRequest(request);
+    const { client_buy_amount: _buy, client_sell_amount: _sell, ...params } = request.params ?? {};
+    return originalRequest({ ...request, params });
+  };
+  const odd = (await h.call('POST', '/v1/quotes', { token: amira, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '500.00' } })).json;
+  assert.equal((await h.call('POST', '/v1/conversions', { token: amira, body: { quoteId: odd.id }, headers: { 'idempotency-key': 'ops-revenue-0002' } })).json.differsFromQuote, true);
+  h.providerA.request = originalRequest;
+  const withOdd = (await admin.browser.get('/ops/revenue')).body;
+  assert.match(withOdd, /<td>Northfield Trading Ltd<\/td><td>2026-11<\/td><td>1<\/td><td>USD 10\.40<\/td>/, 'the total did not grow');
+  assert.match(withOdd, /<h2>Booked WITHOUT the client’s terms: not in the totals<\/h2>[^]*<td>sell GBP 500\.00, buy USD 644\.80 at 1\.289600<\/td><td>sell GBP 500\.00, buy USD 650\.00 at 1\.3000<\/td><td>USD 5\.20<\/td>/);
+  assert.match((await admin.browser.get('/ops/revenue.csv?company=co_northfield')).body, /,644\.80,80,80\.00,server,5\.20,USD,no,500\.00,650\.00,yes\r\n/);
   // A company name that a spreadsheet would run as a formula is written as text.
   await h.stores.directory.updateCompany('co_northfield', (company) => ({ ...company, name: '=HYPERLINK("http://x.example","Northfield, Ltd")' }));
   assert.match((await admin.browser.get('/ops/revenue.csv')).body, /,co_northfield,"'=HYPERLINK\(""http:\/\/x\.example"",""Northfield, Ltd""\)",/);
   // Nothing the client was sent in all of this carries any of it (every reply was scanned as it came; and by value:)
-  for (const body of h.bodies) assert.ok(!/1\.3000|"1\.3"|10\.40/.test(body), body.slice(0, 200));
+  for (const body of h.bodies.filter((item) => !item.includes('differsFromQuote'))) assert.ok(!/1\.3000|"1\.3"|10\.40/.test(body), body.slice(0, 200));
 });
 
 test('ops: staff see a person’s notification state (counts and choices), never what any notification or alert says', async () => {

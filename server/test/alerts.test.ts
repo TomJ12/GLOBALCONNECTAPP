@@ -59,14 +59,14 @@ test('an alert is checked against the client’s own rate, fires once, says the 
   await setMargin('co_northfield', 20);
   assert.equal(await h.alerts.check(), 1);
   const [fired] = await alertsOf(amira.token);
-  assert.deepEqual([fired?.status, fired?.triggeredRate, fired?.triggeredAt], ['triggered', '1.297400', new Date(h.clock.now).toISOString()]);
+  assert.deepEqual([fired?.status, fired?.triggeredRate, fired?.triggeredAt], ['triggered', '1.2973', new Date(h.clock.now).toISOString()]);
   assert.equal((await alertsOf(ben.token))[0]?.status, 'active');
   const notes = await notesOf(amira.token);
   assert.equal(notes.unread, 1);
   assert.deepEqual([notes.items[0]?.category, notes.items[0]?.title, notes.items[0]?.read], ['rates', 'Rate alert: GBP/USD', false]);
-  assert.match(notes.items[0]?.body ?? '', /^Your rate to sell GBP for USD reached 1\.297400 when we checked at 2026-11-11 10:\d\d UTC\. Your alert was set at 1\.295 or better\.\nThis rate is indicative: it is not held for you and it may have moved since\. To convert, open the app and get a rate there\.\nThis alert has now stopped\./);
+  assert.match(notes.items[0]?.body ?? '', /^Your rate to sell GBP for USD reached 1\.2973 when we checked at 2026-11-11 10:\d\d UTC\. Your alert was set at 1\.295 or better\.\nThis rate is indicative: it is not held for you and it may have moved since\. To convert, open the app and get a rate there\.\nThis alert has now stopped\./);
   assert.equal(alertMails(amira.email).length, 1);
-  assert.match(alertMails(amira.email)[0]?.text ?? '', /Your rate to sell GBP for USD reached 1\.297400/);
+  assert.match(alertMails(amira.email)[0]?.text ?? '', /Your rate to sell GBP for USD reached 1\.2973/);
   assert.doesNotMatch(`${alertMails(amira.email)[0]?.subject} ${alertMails(amira.email)[0]?.text}`, /1\.3000|guarantee|will be|held for you until/);
   assert.equal((await notesOf(ben.token)).items.length, 0);
   assert.equal(alertMails(ben.email).length, 0);
@@ -79,7 +79,7 @@ test('an alert is checked against the client’s own rate, fires once, says the 
   assert.equal((await notesOf(amira.token)).items.length, 1);
   assert.equal(alertMails(amira.email).length, 1);
   const trail = await audit('client.alert.triggered');
-  assert.deepEqual([trail.length, trail[0]?.target?.label, trail[0]?.detail.rate, trail[0]?.detail.pair], [1, AMIRA, '1.297400', 'GBPUSD']);
+  assert.deepEqual([trail.length, trail[0]?.target?.label, trail[0]?.detail.rate, trail[0]?.detail.pair], [1, AMIRA, '1.2973', 'GBPUSD']);
 
   // Armed again by its owner (explicitly): it fires again, once.
   const again = await h.call('POST', `/v1/alerts/${fired?.id}`, { token: amira.token, body: { enabled: true } });
@@ -99,8 +99,8 @@ test('an alert is checked against the client’s own rate, fires once, says the 
   assert.equal(await h.alerts.check(), 1);
   const mine = await alertsOf(amira.token);
   assert.equal(mine.find((item) => item.id === low.json.id)?.status, 'active');
-  assert.deepEqual([mine.find((item) => item.id === reached.json.id)?.status, mine.find((item) => item.id === reached.json.id)?.triggeredRate], ['triggered', '1.302600']);
-  assert.match((await notesOf(amira.token)).items[0]?.body ?? '', /^Your rate to buy GBP with USD reached 1\.302600/);
+  assert.deepEqual([mine.find((item) => item.id === reached.json.id)?.status, mine.find((item) => item.id === reached.json.id)?.triggeredRate], ['triggered', '1.3026']);
+  assert.match((await notesOf(amira.token)).items[0]?.body ?? '', /^Your rate to buy GBP with USD reached 1\.3026/);
 
   // Marking as read: one's own, by id or all at once; the badge follows.
   const list = await notesOf(amira.token);

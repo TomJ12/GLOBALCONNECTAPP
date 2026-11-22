@@ -21,7 +21,7 @@ let h: Harness;
 afterEach(async () => h?.close());
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const LIVE = { DEFAULT_MARGIN_BPS: '40', CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: path.join(mkdtempSync(path.join(tmpdir(), 'gc-live-')), 'data.sqlite'), DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
+const LIVE = { APP_URL: 'https://app.globalconnect.example', DEFAULT_MARGIN_BPS: '40', CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: path.join(mkdtempSync(path.join(tmpdir(), 'gc-live-')), 'data.sqlite'), DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
 const from = (address: string) => ({ 'x-forwarded-for': address });
 const login = (email: string, password: string, address?: string) => h.call('POST', '/v1/auth/login', { body: { email, password }, headers: address ? from(address) : {} });
 async function signedIn(email: string) {
@@ -49,6 +49,11 @@ test('H3: strict by default. Only APP_ENV=development is lenient; NODE_ENV decid
   }
   assert.throws(() => loadConfig({ ...LIVE, OPS_URL: 'http://ops.globalconnect.example' }), /OPS_URL must be set to the https/);
   assert.throws(() => loadConfig({ ...LIVE, OPS_URL: undefined }), /OPS_URL must be set to the https/);
+  // The same for the address the client app is at: activation and reset links are built from it, and outside development it has no default.
+  assert.throws(() => loadConfig({ ...LIVE, APP_URL: undefined }), /APP_URL must be set to the https/);
+  assert.throws(() => loadConfig({ ...LIVE, APP_URL: 'http://app.globalconnect.example' }), /APP_URL must be set to the https/);
+  assert.equal(loadConfig(LIVE).appUrl, 'https://app.globalconnect.example');
+  assert.equal(loadConfig({ APP_ENV: 'development' }).appUrl, 'http://localhost:8081');
   assert.throws(() => loadConfig({ APP_ENV: 'development', NODE_ENV: 'production' }), /cannot be combined/);
   assert.throws(() => loadConfig({ ...LIVE, APP_ENV: 'dev' }), /APP_ENV must be/);
 

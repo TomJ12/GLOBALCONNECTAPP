@@ -173,6 +173,10 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     // margin or what Global Connect earns may be in it, under any name.
     const leaked = forbiddenInClientResponse(response.body) ?? forbiddenInClientResponse(JSON.stringify(response.headers));
     if (leaked) throw new Error(`${method} ${url} sent a client something it must never see: ${leaked}`);
+    // ...and no reply may carry a PAIR OF NUMBERS from which a configured margin can be read off exactly: where it has
+    // a sell rate and a buy rate, (buy - sell) / (buy + sell) must not be any margin in force, to six places.
+    const exact = await marginReadableFrom(response.body, stores, config);
+    if (exact) throw new Error(`${method} ${url} sent a client two rates that give the margin away exactly: ${exact}`);
     let json: unknown = null;
     try {
       json = JSON.parse(response.body);
@@ -236,9 +240,28 @@ export function dumpDatabase(stores: SqliteStores): string {
  */
 const FORBIDDEN_MID = /"(mid|mid_?(market|rate|price)[^"]*|[^"]*_mid)"\s*:/i;
 const FORBIDDEN_FIELD = /"[^"]*(margin|markup|spread|bps|basis|wholesale|partner|core_?rate|provider_?(rate|sell|buy|amount|terms|quote)|revenue|applied_?by|mismatch)[^"]*"\s*:/i;
+/** A provider's own parameter name in an error's list of fields (snake_case, or the second provider's names). */
+const FORBIDDEN_FIELD_NAME = /"fields":\[[^\]]*"([^"]*_[^"]*|clientAmounts|quoteRequestId|orderId|sourceCurrency|targetCurrency)"/;
 const FORBIDDEN_WORD = /mid[- ]?market|\bmargin|mark-?up|basis points?|\bbps\b|wholesale|revenue/i;
 export function forbiddenInClientResponse(body: string): string | null {
-  return FORBIDDEN_MID.exec(body)?.[0] ?? FORBIDDEN_FIELD.exec(body)?.[0] ?? FORBIDDEN_WORD.exec(body)?.[0] ?? null;
+  return FORBIDDEN_MID.exec(body)?.[0] ?? FORBIDDEN_FIELD.exec(body)?.[0] ?? FORBIDDEN_FIELD_NAME.exec(body)?.[0] ?? FORBIDDEN_WORD.exec(body)?.[0] ?? null;
+}
+
+/** Every margin in force anywhere (the default and each company's figures), in basis points. */
+async function marginsInForce(stores: SqliteStores, config: Config): Promise<number[]> {
+  const all = new Set<number>([config.defaultMarginBps]);
+  for (const record of await stores.margins.list()) for (const bps of [record.defaultBps, record.forwardBps, ...record.overrides.map((item) => item.bps), ...record.tiers.map((item) => item.bps)]) if (bps !== null) all.add(bps);
+  return [...all];
+}
+/** If `body` holds a sell rate and a buy rate whose spread is EXACTLY a margin in force (to six places), says which; else null. */
+export async function marginReadableFrom(body: string, stores: SqliteStores, config: Config): Promise<string | null> {
+  const match = /"rate":"(\d+(?:\.\d+)?)","buyRate":"(\d+(?:\.\d+)?)"/.exec(body);
+  if (!match) return null;
+  const [sell, buy] = [Number(match[1]), Number(match[2])];
+  if (!(buy > sell)) return null;
+  const spread = ((buy - sell) / (buy + sell)).toFixed(6);
+  const hit = (await marginsInForce(stores, config)).find((bps) => (bps / 10_000).toFixed(6) === spread);
+  return hit === undefined ? null : `${match[1]} / ${match[2]} is exactly ${hit} bp`;
 }
 
 export const OPS_PASSWORD = 'staff horse battery staple';

@@ -13,7 +13,12 @@ import * as schemas from '@/api/schemas';
 
 import { loadConfig } from '../src/config';
 import type { MarginConfig } from '../src/rates/margin';
-import { AMIRA, BEN, forbiddenInClientResponse, harness, type Harness } from './helpers';
+import { sha256 } from '../src/crypto';
+import { neutralFields } from '../src/http/app';
+import { ClientRates } from '../src/rates/service';
+import { MockCurrencycloudPlatform } from '../src/providers/currencycloudMock';
+import { MockEqualsServer } from '../src/providers/equals/mockServer';
+import { AMIRA, BEN, DANA, forbiddenInClientResponse, harness, type Harness } from './helpers';
 
 let h: Harness;
 afterEach(async () => {
@@ -47,18 +52,20 @@ test('a client sees only their own rate: sell and buy, indicative, margin agains
   const amira = await signedIn(AMIRA);
   const ben = await signedIn(BEN);
 
-  // Provider A's sample GBP/USD is 1.3000. With the default 50 bp: selling GBP gets less, buying GBP costs more.
+  // Provider A's sample GBP/USD is 1.3000. With the default 50 bp: selling GBP gets less (1.2935), buying GBP costs
+  // more (1.3065). The INDICATIVE figures are at the app's display precision, each rounded against the client, and
+  // (because both would otherwise sit exactly on a displayable figure) the sell side is shown one step lower.
   const rate = await get(amira.token, '/v1/rates/GBP/USD');
   assert.deepEqual(Object.keys(rate).sort(), ['asOf', 'base', 'buyRate', 'indicative', 'quote', 'rate']);
-  assert.deepEqual([rate.base, rate.quote, rate.rate, rate.buyRate, rate.indicative], ['GBP', 'USD', '1.293500', '1.306500', true]);
+  assert.deepEqual([rate.base, rate.quote, rate.rate, rate.buyRate, rate.indicative], ['GBP', 'USD', '1.2934', '1.3065', true]);
   schemas.ratePair.parse(rate);
   // Asked for the other way round, the margin is still against the client (0.7692 at the provider).
   const inverse = await get(amira.token, '/v1/rates/USD/GBP');
-  assert.deepEqual([inverse.rate, inverse.buyRate], ['0.765354', '0.773046']);
+  assert.deepEqual([inverse.rate, inverse.buyRate], ['0.76535', '0.77305']);
   assert.ok(new Big(inverse.rate).lt('0.7692') && new Big(inverse.buyRate).gt('0.7692'));
   // Provider B (Ben's company) the same way: 1.3000 there too.
   const bens = await get(ben.token, '/v1/rates/GBP/USD');
-  assert.deepEqual([bens.rate, bens.buyRate, bens.indicative], ['1.293500', '1.306500', true]);
+  assert.deepEqual([bens.rate, bens.buyRate, bens.indicative], ['1.2934', '1.3065', true]);
 
   // The trend line is the client's sell rate at each point, never the provider's series.
   const company = (await h.stores.directory.getCompany('co_northfield')) as NonNullable<Awaited<ReturnType<typeof h.stores.directory.getCompany>>>;
@@ -67,19 +74,20 @@ test('a client sees only their own rate: sell and buy, indicative, margin agains
   assert.equal(history.points.length, raw.points.length);
   assert.ok(raw.points.length > 5);
   for (const [index, point] of raw.points.entries()) {
-    const expected = new Big(point.rate).times('0.995').round(6, Big.roundDown).toFixed(6);
+    const expected = new Big(point.rate).times('0.995').round(4, Big.roundDown).toFixed(4);
     assert.equal(history.points[index].rate, expected);
     assert.notEqual(history.points[index].rate, point.rate);
   }
-  assert.equal(history.points.at(-1).rate, rate.rate, 'the line ends on the rate shown');
+  // The line ends at the rate shown (to within the one display step the two-way figure may be lowered by).
+  assert.ok(new Big(history.points.at(-1).rate).minus(rate.rate).abs().lte('0.0001'));
 
   // The company's own configuration: an override for one direction of one pair; the other direction keeps the default.
   await setMargin('co_northfield', { defaultBps: 50, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 20 }] });
   const mine = await get(amira.token, '/v1/rates/GBP/USD');
-  assert.deepEqual([mine.rate, mine.buyRate], ['1.297400', '1.306500']);
-  assert.deepEqual([(await get(amira.token, '/v1/rates/USD/GBP')).buyRate], ['0.770739'], 'the same trade spelled the other way gets the same override');
+  assert.deepEqual([mine.rate, mine.buyRate], ['1.2973', '1.3065']);
+  assert.deepEqual([(await get(amira.token, '/v1/rates/USD/GBP')).buyRate], ['0.77074'], 'the same trade spelled the other way gets the same override');
   // Another company is not affected.
-  assert.equal((await get(ben.token, '/v1/rates/GBP/USD')).rate, '1.293500');
+  assert.equal((await get(ben.token, '/v1/rates/GBP/USD')).rate, '1.2934');
 
   // Nothing any of these said mentions the provider's own figure.
   for (const body of h.bodies) assert.ok(!/1\.3000|1\.300000|"1\.3"|0\.769231|0\.7692"/.test(body), body);
@@ -95,7 +103,8 @@ test('the indicative rate, the held quote and the booked conversion agree, on bo
   const indicative = await get(amira.token, '/v1/rates/GBP/USD');
   const sell = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' });
   assert.deepEqual([sell.rate, sell.sellAmount, sell.buyAmount], ['1.297400', '1000.00', '1297.40']);
-  assert.equal(sell.rate, indicative.rate, 'the held quote is at the indicative sell rate');
+  // The held quote has the client's rate in full; the indicative figure is the same rate at display precision, never better.
+  assert.ok(new Big(indicative.rate).lte(sell.rate) && new Big(sell.rate).minus(indicative.rate).lte('0.0002'), 'the held quote is at the indicative sell rate, to display precision');
   assert.deepEqual(Object.keys(sell).sort(), ['buyAmount', 'buyCurrency', 'createdAt', 'expiresAt', 'fixedSide', 'id', 'kind', 'rate', 'rateBase', 'rateQuote', 'sellAmount', 'sellCurrency', 'settlementDate']);
   const [gbp, usd] = [await balance(amira.token, 'GBP'), await balance(amira.token, 'USD')];
   const booked = await book(amira.token, sell.id, 'rates-key-0001');
@@ -109,24 +118,25 @@ test('the indicative rate, the held quote and the booked conversion agree, on bo
   assert.deepEqual(again.json, booked.json);
   assert.deepEqual((await get(amira.token, '/v1/conversions/by-key/rates-key-0001')), booked.json);
   assert.equal(await balance(amira.token, 'USD'), new Big(usd).plus('1297.40').toFixed(2));
-  // The same key with a DIFFERENT quote: still the first conversion, on its terms; the record of it is not rewritten.
+  // The same key with a DIFFERENT quote is refused: one key is one booking of one quote. The record is not rewritten.
   const otherQuote = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '500.00' });
-  assert.deepEqual((await book(amira.token, otherQuote.id, 'rates-key-0001')).json, booked.json);
+  assert.deepEqual((await book(amira.token, otherQuote.id, 'rates-key-0001')).json, { error: { kind: 'validation', fields: ['idempotencyKey'] } });
   assert.deepEqual((await revenue()).map((item) => [item.clientSellAmount, item.quoteId, item.status]), [['1000.00', sell.id, 'booked']]);
+  assert.equal(await balance(amira.token, 'USD'), new Big(usd).plus('1297.40').toFixed(2));
 
   // What the server keeps on record (never sent to a client): both sides, the margin, the revenue.
   const [record] = await revenue();
   assert.equal((await revenue()).length, 1);
   assert.deepEqual(
     { ...record, key: undefined, createdAt: undefined, bookedAt: undefined },
-    { key: undefined, createdAt: undefined, bookedAt: undefined, companyId: 'co_northfield', userId: 'usr_amira', quoteId: sell.id, conversionId: booked.json.id, status: 'booked', kind: 'spot', appliedBy: 'server', pair: 'GBPUSD', direction: 'sell', sellCurrency: 'GBP', buyCurrency: 'USD', providerRate: '1.3000', providerSellAmount: '1000.00', providerBuyAmount: '1300.00', clientRate: '1.297400', clientSellAmount: '1000.00', clientBuyAmount: '1297.40', marginBps: 20, revenueAmount: '2.60', revenueCurrency: 'USD', mismatch: false },
+    { key: undefined, createdAt: undefined, bookedAt: undefined, companyId: 'co_northfield', userId: 'usr_amira', quoteId: sell.id, conversionId: booked.json.id, status: 'booked', kind: 'spot', appliedBy: 'server', pair: 'GBPUSD', direction: 'sell', quotedAs: 'GBPUSD', sellCurrency: 'GBP', buyCurrency: 'USD', providerRate: '1.3000', providerSellAmount: '1000.00', providerBuyAmount: '1300.00', clientRate: '1.297400', clientSellAmount: '1000.00', clientBuyAmount: '1297.40', marginBps: 20, effectiveBps: '20.00', revenueAmount: '2.60', revenueCurrency: 'USD', mismatch: false, bookedRate: '1.297400', bookedSellAmount: '1000.00', bookedBuyAmount: '1297.40' },
   );
   assert.equal(record?.bookedAt, h.clock.now);
 
   // --- Buys GBP with USD (the other direction of the pair): the default 50 bp, at the indicative BUY rate.
   const buy = await quoteFor(amira.token, { sellCurrency: 'USD', buyCurrency: 'GBP', fixedSide: 'buy', amount: '1000.00' });
   assert.deepEqual([buy.rate, buy.sellAmount, buy.buyAmount], ['1.306500', '1306.50', '1000.00']);
-  assert.equal(buy.rate, indicative.buyRate);
+  assert.ok(new Big(buy.rate).eq(indicative.buyRate));
   // Fixed the other way: spends exactly USD 1,000; receives 1000 / 1.3065 = 765.4037..., rounded DOWN.
   const spend = await quoteFor(amira.token, { sellCurrency: 'USD', buyCurrency: 'GBP', fixedSide: 'sell', amount: '1000.00' });
   assert.deepEqual([spend.rate, spend.sellAmount, spend.buyAmount], ['1.306500', '1000.00', '765.40']);
@@ -150,7 +160,7 @@ test('the indicative rate, the held quote and the booked conversion agree, on bo
   const bIndicative = await get(ben.token, '/v1/rates/GBP/EUR');
   const bSell = await quoteFor(ben.token, { sellCurrency: 'GBP', buyCurrency: 'EUR', fixedSide: 'sell', amount: '500.00' });
   assert.deepEqual([bSell.rate, bSell.sellAmount, bSell.buyAmount], ['1.174100', '500.00', '587.05']);
-  assert.equal(bSell.rate, bIndicative.rate);
+  assert.ok(new Big(bIndicative.rate).lte(bSell.rate) && new Big(bSell.rate).minus(bIndicative.rate).lte('0.0002'));
   const [bGbp, bEur] = [await balance(ben.token, 'GBP'), await balance(ben.token, 'EUR')];
   const bBooked = await book(ben.token, bSell.id, 'rates-key-b-0001');
   assert.equal(bBooked.status, 200, JSON.stringify(bBooked.json));
@@ -159,10 +169,12 @@ test('the indicative rate, the held quote and the booked conversion agree, on bo
   assert.deepEqual(await get(ben.token, '/v1/conversions/by-key/rates-key-b-0001'), bBooked.json);
   const bRecord = (await revenue()).find((item) => item.companyId === 'co_castlebrook');
   assert.deepEqual([bRecord?.providerRate, bRecord?.providerBuyAmount, bRecord?.clientBuyAmount, bRecord?.marginBps, bRecord?.revenueAmount, bRecord?.revenueCurrency, bRecord?.mismatch], ['1.1800', '590.00', '587.05', 50, '2.95', 'EUR', false]);
+  // On record in the ONE orientation used for every provider (EUR/GBP: selling GBP is buying EUR), with the orientation the rates are quoted in beside it.
+  assert.deepEqual([bRecord?.pair, bRecord?.direction, bRecord?.quotedAs, bRecord?.effectiveBps], ['EURGBP', 'buy', 'GBPEUR', '50.00']);
   // Sells EUR to buy GBP: the same trade as buying GBP in GBP/EUR, so the rate matches that side of the indicative pair.
   const bBuy = await quoteFor(ben.token, { sellCurrency: 'EUR', buyCurrency: 'GBP', fixedSide: 'sell', amount: '590.00' });
   const eurGbp = await get(ben.token, '/v1/rates/EUR/GBP');
-  assert.equal(bBuy.rate, eurGbp.rate);
+  assert.ok(new Big(eurGbp.rate).lte(bBuy.rate) && new Big(bBuy.rate).minus(eurGbp.rate).lte('0.00002'), `${bBuy.rate} / ${eurGbp.rate}`);
   assert.ok(new Big(bBuy.buyAmount).lt('500.00'), 'less than the provider’s 500.00');
 
   // Never better than the provider, whatever the amount and side, on both providers.
@@ -190,28 +202,57 @@ test('the indicative rate, the held quote and the booked conversion agree, on bo
   for (const url of ['/v1/revenue', '/v1/margin', '/v1/margins', '/v1/companies/co_northfield/margin', '/v1/rates/GBP/USD/provider']) assert.equal((await h.call('GET', url, { token: amira.token })).status, 404, url);
 });
 
-test('where the margin is applied is a setting per provider: with "provider" the server adds nothing on top', async () => {
-  h = await harness({ marginAppliedBy: { currencycloud: 'provider', equals: 'server' } });
+/** A harness whose provider A models a partner markup configured AT the provider (its client figures are worse than its own). */
+async function withProviderMarkup(overrides: Parameters<typeof harness>[0], markupBps: number): Promise<Harness> {
+  const clock = { now: Date.UTC(2026, 10, 11, 10, 0, 0), advance(ms: number) { clock.now += ms; } };
+  return harness(overrides, undefined, { clock, providers: { a: new MockCurrencycloudPlatform({ now: () => clock.now, partnerMarkupBps: markupBps }), b: new MockEqualsServer({ now: () => clock.now }) } });
+}
+
+test('where the margin is applied is a setting per provider: with "provider" the server adds nothing on top; a WRONG setting refuses to quote rather than give the wholesale rate or charge twice', async () => {
+  // RIGHT: the provider has a 100 bp partner markup configured, and the setting says so. The server adds nothing.
+  h = await withProviderMarkup({ marginAppliedBy: { currencycloud: 'provider', equals: 'server' } }, 100);
   const amira = await signedIn(AMIRA);
   const ben = await signedIn(BEN);
   await setMargin('co_northfield', { defaultBps: 80 }); // stored, but not used: the provider prices this company's trades
-  const rate = await get(amira.token, '/v1/rates/GBP/USD');
-  assert.deepEqual([rate.rate, rate.buyRate, rate.indicative], ['1.3', '1.3', true]); // exactly what the provider gave
   const quote = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' });
-  assert.deepEqual([quote.rate, quote.buyAmount], ['1.3000', '1300.00']);
+  assert.deepEqual([quote.rate, quote.buyAmount], ['1.287000', '1287.00'], 'the provider\'s own client figures, with nothing more taken');
+  assert.equal('markup' in quote, false);
   const usd = await balance(amira.token, 'USD');
   const booked = await book(amira.token, quote.id, 'rates-key-p-0001');
-  assert.equal(booked.status, 200);
-  assert.deepEqual([booked.json.rate, booked.json.buyAmount], ['1.3000', '1300.00']);
-  assert.equal(await balance(amira.token, 'USD'), new Big(usd).plus('1300.00').toFixed(2), 'no second margin was taken');
+  assert.equal(booked.status, 200, JSON.stringify(booked.json));
+  assert.deepEqual([booked.json.rate, booked.json.buyAmount], ['1.287000', '1287.00']);
+  assert.equal(await balance(amira.token, 'USD'), new Big(usd).plus('1287.00').toFixed(2), 'no second margin was taken');
   const [record] = await revenue();
-  assert.deepEqual([record?.appliedBy, record?.marginBps, record?.revenueAmount, record?.revenueCurrency, record?.clientBuyAmount, record?.status], ['provider', null, null, null, '1300.00', 'booked']);
-  assert.ok(new Big((await get(amira.token, '/v1/rates/GBP/USD/history')).points.at(-1).rate).eq('1.3'));
+  assert.deepEqual([record?.appliedBy, record?.marginBps, record?.revenueAmount, record?.revenueCurrency, record?.clientBuyAmount, record?.status, record?.effectiveBps], ['provider', null, null, null, '1287.00', 'booked', null]);
+  // The indicative rate is passed through from the provider (only after a real quote has shown its markup is there).
+  assert.deepEqual([(await get(amira.token, '/v1/rates/GBP/USD')).indicative, (await get(amira.token, '/v1/rates/GBP/USD')).rate], [true, '1.3']);
   // The other provider is still priced by the server.
-  assert.equal((await get(ben.token, '/v1/rates/GBP/USD')).rate, '1.293500');
+  assert.equal((await get(ben.token, '/v1/rates/GBP/USD')).rate, '1.2934');
+  await h.close();
+
+  // WRONG, one way: the setting says "provider" but the provider's quotes carry NO markup. The client would be shown
+  // and given the wholesale rate. Nothing is quoted: no rate, no history-free quote, no booking; the log says why.
+  h = await harness({ marginAppliedBy: { currencycloud: 'provider', equals: 'server' } });
+  const wholesale = await signedIn(AMIRA);
+  for (const reply of [await h.call('GET', '/v1/rates/GBP/USD', { token: wholesale.token }), await h.call('POST', '/v1/quotes', { token: wholesale.token, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' } })]) {
+    assert.deepEqual([reply.status, reply.json], [502, { error: { kind: 'server' } }]);
+  }
+  assert.equal((await h.stores.quotes.list()).length, 0);
+  assert.ok(h.logs.some((line) => /is \\"provider\\", but the provider's quote carries no partner markup/.test(line)));
+  assert.ok(h.bodies.every((body) => !/1\.3000|"1\.3"/.test(body)), 'the wholesale rate was never sent');
+  await h.close();
+
+  // WRONG, the other way: the setting says "server" but the provider ALREADY marks up. The client would pay twice. Refused.
+  h = await withProviderMarkup({}, 100);
+  const twice = await signedIn(AMIRA);
+  const refused = await h.call('POST', '/v1/quotes', { token: twice.token, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' } });
+  assert.deepEqual([refused.status, refused.json], [502, { error: { kind: 'server' } }]);
+  assert.ok(h.logs.some((line) => /already carries a partner markup: the client would be charged twice/.test(line)));
+  // A provider whose quotes do not say whether they carry a markup cannot be set to "provider" at all.
+  assert.throws(() => loadConfig({ APP_ENV: 'development', MARGIN_APPLIED_BY_EQUALS: 'provider' }), /MARGIN_APPLIED_BY_EQUALS=provider is refused/);
 });
 
-test('a provider that books without the client’s terms: the client still sees only their terms, and the record is flagged; a booking whose answer was lost is closed when it is found', async () => {
+test('a provider that books WITHOUT the client’s terms: the client is shown what was really booked, flagged and told; the record is flagged and audited; a booking whose answer was lost is closed when it is found', async () => {
   h = await harness();
   const amira = await signedIn(AMIRA);
   // A provider that ignores the two parameters carrying the client's side.
@@ -227,16 +268,28 @@ test('a provider that books without the client’s terms: the client still sees 
   const booked = await book(amira.token, quote.id, 'rates-key-m-0001');
   assert.equal(booked.status, 200);
   assert.deepEqual([sent[0]?.client_buy_amount, sent[0]?.client_sell_amount], ['1293.50', '1000.00'], 'the client’s terms were sent');
-  assert.deepEqual([booked.json.rate, booked.json.buyAmount], ['1.293500', '1293.50'], 'not the provider’s 1.3000 / 1,300.00');
-  assert.deepEqual((await get(amira.token, '/v1/conversions/by-key/rates-key-m-0001')), booked.json);
-  assert.equal((await revenue())[0]?.mismatch, true);
+  // What moved on the account is 1,300.00, not the quoted 1,293.50: the client is shown THAT, with a flag that it differs.
+  assert.deepEqual([booked.json.buyAmount, booked.json.sellAmount, booked.json.differsFromQuote], ['1300.00', '1000.00', true]);
+  schemas.conversion.parse(booked.json);
+  assert.deepEqual(await get(amira.token, '/v1/conversions/by-key/rates-key-m-0001'), booked.json);
+  assert.deepEqual((await book(amira.token, quote.id, 'rates-key-m-0001')).json, booked.json, 'asked again: the same answer, nothing booked twice');
+  assert.equal(sent.length, 1);
+  const [flagged] = await revenue();
+  assert.deepEqual([flagged?.mismatch, flagged?.clientBuyAmount, flagged?.bookedBuyAmount, flagged?.bookedSellAmount], [true, '1293.50', '1300.00', '1000.00']);
   assert.ok(h.logs.some((line) => /without the client terms/.test(line)));
+  // Audited once, and the person who booked it is told once, in the app and by email.
+  const audited = await h.stores.audit.query({ action: 'system.conversion.mismatch' });
+  assert.deepEqual([audited.length, audited[0]?.detail.quoted, audited[0]?.detail.booked], [1, '1000.00 GBP for 1293.50 USD', '1000.00 GBP for 1300.00 USD']);
+  const told = (await get(amira.token, '/v1/notifications')).items;
+  assert.deepEqual(told.map((item: { title: string }) => item.title), ['A conversion was not booked as quoted']);
+  assert.match(told[0].body, /^You were quoted GBP 1000\.00 for USD 1293\.50\. What was booked is GBP 1000\.00 for USD 1300\.00: that is what moved on the account\.\nPlease contact Global Connect before converting again: \[/);
+  assert.equal(h.outbox.sent.filter((message) => /^A conversion in Global Connect needs your attention$/.test(message.subject)).length, 1);
   // The same for a forward, and for the list of forwards read back from the provider afterwards.
   const forward = await quoteFor(amira.token, { kind: 'forward', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00', settlementDate: '2027-03-01' });
   const forwardBooked = await book(amira.token, forward.id, 'rates-key-m-0009');
   assert.equal(forwardBooked.status, 200);
   const listed = (await get(amira.token, '/v1/forwards')).items.find((item: { id: string }) => item.id === forwardBooked.json.id);
-  assert.deepEqual([listed.rate, listed.sellAmount, listed.buyAmount], ['1.293500', '1000.00', '1293.50']);
+  assert.deepEqual([listed.sellAmount, listed.buyAmount, listed.differsFromQuote], ['1000.00', '1300.00', true]);
 
   // The answer to a booking never arrives; the record stays open, and is closed when the conversion is found by its key.
   h.providerA.request = async (request) => {
@@ -250,10 +303,12 @@ test('a provider that books without the client’s terms: the client still sees 
   const open = (await revenue()).find((item) => item.quoteId === second.id);
   assert.deepEqual([open?.status, open?.conversionId, open?.clientBuyAmount], ['booking', null, '258.70']);
   h.providerA.request = original;
-  const found = await get(amira.token, '/v1/conversions/by-key/rates-key-m-0002');
-  assert.deepEqual([found.rate, found.buyAmount], ['1.293500', '258.70']);
+  // Asked again with the same key and quote: answered from the conversion that WAS made (found by its key), not booked again.
+  const retried = await book(amira.token, second.id, 'rates-key-m-0002');
+  assert.deepEqual([retried.status, retried.json.rate, retried.json.buyAmount, retried.json.differsFromQuote], [200, '1.293500', '258.70', undefined]);
   const closed = (await revenue()).find((item) => item.quoteId === second.id);
-  assert.deepEqual([closed?.status, closed?.conversionId, closed?.mismatch], ['booked', found.id, false]);
+  assert.deepEqual([closed?.status, closed?.conversionId, closed?.mismatch], ['booked', retried.json.id, false]);
+  assert.deepEqual(await get(amira.token, '/v1/conversions/by-key/rates-key-m-0002'), retried.json);
 
   // A definite refusal: nothing was booked, and the record says so.
   const third = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '99999999.00' });
@@ -264,6 +319,101 @@ test('a provider that books without the client’s terms: the client still sees 
   const tiny = await h.call('POST', '/v1/quotes', { token: amira.token, body: { kind: 'spot', sellCurrency: 'JPY', buyCurrency: 'GBP', fixedSide: 'sell', amount: '1' } });
   assert.equal(tiny.status, 400);
   assert.equal(forbiddenInClientResponse(JSON.stringify(tiny.json)), null);
+});
+
+test('a quote is checked BY THIS SERVER when it is booked: this person’s, in this company, not run out, used once, and priced by the margin still in force; it survives a restart; provider field names never reach the client', async () => {
+  h = await harness();
+  const amira = await signedIn(AMIRA);
+  const dana = await signedIn(DANA);
+  assert.equal((await h.call('POST', '/v1/session/company', { token: dana.token, body: { companyId: 'co_northfield' } })).status, 200);
+  const ben = await signedIn(BEN);
+  // Every refusal below is made HERE: the provider is never asked to book.
+  const original = h.providerA.request.bind(h.providerA);
+  let bookings = 0;
+  h.providerA.request = async (request) => {
+    if (request.path === '/v2/conversions/create') bookings += 1;
+    return original(request);
+  };
+  const expired = (reply: { status: number; json: any }) => assert.deepEqual([reply.status, reply.json], [409, { error: { kind: 'quote_expired' } }]);
+  const fresh = () => quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '100.00' });
+
+  // Somebody else's quote: a colleague in the same company, and a person in another company.
+  let quote = await fresh();
+  expired(await book(dana.token, quote.id, 'l5-key-000001'));
+  expired(await book(ben.token, quote.id, 'l5-key-000002'));
+  // Kept in the database (not in memory), with the provider's side that the client never sees.
+  const kept = await h.stores.quotes.get(`co_northfield:${quote.id}`);
+  assert.deepEqual([kept?.userId, kept?.client.rate, kept?.provider.rate, kept?.usedBy], ['usr_amira', '1.293500', '1.3000', null]);
+  // A "restart": a NEW service over the same database still knows the quote (it used to be in memory and was lost).
+  const restarted = new ClientRates(h.stores, h.config, () => h.clock.now);
+  assert.equal((await restarted.claimQuote({ id: 'co_northfield' }, 'usr_amira', quote.id, sha256('l5-key-000003').slice(0, 16)))?.client.id, quote.id);
+  assert.equal(await restarted.claimQuote({ id: 'co_northfield' }, 'usr_dana', quote.id, 'someone-else'), null);
+  assert.equal(bookings, 0);
+  const ok = await book(amira.token, quote.id, 'l5-key-000003');
+  assert.equal(ok.status, 200, JSON.stringify(ok.json));
+  assert.equal(bookings, 1);
+  // USED ONCE: the same quote under another key is refused here.
+  expired(await book(amira.token, quote.id, 'l5-key-000004'));
+  assert.equal(bookings, 1);
+
+  // RUN OUT: one second past its time.
+  quote = await fresh();
+  h.clock.advance(Date.parse(quote.expiresAt) - h.clock.now + 1000);
+  expired(await book(amira.token, quote.id, 'l5-key-000005'));
+  assert.equal(bookings, 1);
+
+  // A MARGIN CHANGE while a quote is held: a quote priced before the change cannot be booked after it.
+  quote = await fresh();
+  h.clock.advance(1000);
+  await setMargin('co_northfield', { defaultBps: 300 });
+  expired(await book(amira.token, quote.id, 'l5-key-000006'));
+  assert.equal(bookings, 1);
+  const repriced = await fresh();
+  assert.equal(repriced.rate, '1.261000');
+  assert.equal((await book(amira.token, repriced.id, 'l5-key-000007')).status, 200);
+  assert.equal(bookings, 2);
+
+  // What has run out is cleared away; the table does not only grow.
+  h.clock.advance(10 * 60_000);
+  await fresh();
+  assert.equal((await h.stores.quotes.list()).length, 1);
+
+  // A provider's refusal that names ITS parameters: the client is told the neutral API's field names, never the provider's.
+  quote = await fresh();
+  h.providerA.request = async (request) => (request.path === '/v2/conversions/create' ? original({ ...request, params: { ...request.params, client_sell_amount: '1.00' } }) : original(request));
+  const refused = await book(amira.token, quote.id, 'l5-key-000008');
+  assert.deepEqual([refused.status, refused.json], [400, { error: { kind: 'validation', fields: ['amount'] } }]);
+  assert.deepEqual(neutralFields(['client_sell_amount', 'quote_id', 'buy_currency', 'amount', 'some_provider_thing', 'clientAmounts', 'orderId']), ['amount', 'quoteId', 'buyCurrency']);
+  for (const leak of ['{"error":{"kind":"validation","fields":["client_sell_amount"]}}', '{"error":{"fields":["quote_id"]}}', '{"error":{"fields":["amount","clientAmounts"]}}']) assert.notEqual(forbiddenInClientResponse(leak), null, leak);
+});
+
+test('tiers through the API, on both providers: a trade’s size is measured in the company’s ONE tier currency, so 60,000 yen is not priced as 60,000 pounds', async () => {
+  h = await harness();
+  const amira = await signedIn(AMIRA);
+  const ben = await signedIn(BEN);
+  for (const company of ['co_northfield', 'co_castlebrook']) await setMargin(company, { defaultBps: 200, tiers: [{ fromAmount: '50000', bps: 10 }], tierCurrency: 'GBP' });
+  const marginOf = async (quoteId: string, company: string) => (await h.stores.quotes.get(`${company}:${quoteId}`))?.marginBps;
+  for (const [who, company] of [[amira, 'co_northfield'], [ben, 'co_castlebrook']] as const) {
+    // Selling 60,000 YEN (about GBP 306): the default, on BOTH providers, whichever currency the adapter calls the base.
+    const yen = await quoteFor(who.token, { sellCurrency: 'JPY', buyCurrency: 'GBP', fixedSide: 'sell', amount: '60000' });
+    assert.equal(await marginOf(yen.id, company), 200, `${company}: 60,000 yen`);
+    assert.ok(new Big(yen.buyAmount).lt('302'), `${company}: ${yen.buyAmount}`);
+    // Buying yen with GBP 306: the same.
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'GBP', buyCurrency: 'JPY', fixedSide: 'sell', amount: '306.00' })).id, company), 200);
+    // GBP 60,000 into yen, and yen worth GBP 60,000 into pounds, both get the tier: the size is the same either way round.
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'GBP', buyCurrency: 'JPY', fixedSide: 'sell', amount: '60000.00' })).id, company), 10);
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'JPY', buyCurrency: 'GBP', fixedSide: 'buy', amount: '60000.00' })).id, company), 10);
+    // The boundary, in pounds, to the penny.
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '49999.99' })).id, company), 200);
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '50000.00' })).id, company), 10);
+    // Neither side is the tier currency (EUR to USD): the size is converted at the provider's rate. EUR 60,000 is about GBP 50,847; EUR 58,000 is not GBP 50,000.
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'EUR', buyCurrency: 'USD', fixedSide: 'sell', amount: '60000.00' })).id, company), 10, `${company}: EUR 60,000`);
+    assert.equal(await marginOf((await quoteFor(who.token, { sellCurrency: 'EUR', buyCurrency: 'USD', fixedSide: 'sell', amount: '58000.00' })).id, company), 200, `${company}: EUR 58,000`);
+  }
+  // A company whose tiers are in another currency: the same trade is measured in THAT.
+  await setMargin('co_northfield', { defaultBps: 200, tiers: [{ fromAmount: '50000', bps: 10 }], tierCurrency: 'USD' });
+  assert.equal(await marginOf((await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '40000.00' })).id, 'co_northfield'), 10, 'GBP 40,000 is USD 52,000');
+  assert.equal(await marginOf((await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '38000.00' })).id, 'co_northfield'), 200, 'GBP 38,000 is USD 49,400');
 });
 
 test('the mock providers take the client’s side of a trade only when it is no better than the quote; configuration is checked', async () => {
@@ -286,7 +436,7 @@ test('the mock providers take the client’s side of a trade only when it is no 
   for (const DEFAULT_MARGIN_BPS of ['-1', '301', '12.5', 'some']) assert.throws(() => dev({ DEFAULT_MARGIN_BPS }), /DEFAULT_MARGIN_BPS must be a whole number/);
   assert.throws(() => dev({ RATE_CACHE_SECONDS: '-1' }), /RATE_CACHE_SECONDS/);
   // Outside development there is no default margin: it has to be said.
-  const LIVE = { CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/gc/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
+  const LIVE = { APP_URL: 'https://app.globalconnect.example', CURRENCYCLOUD_LOGIN_ID: 'a', CURRENCYCLOUD_API_KEY: 'b', EQUALS_API_KEY: 'c', OPS_URL: 'https://ops.globalconnect.example', SERVER_SECRET: 'Zq7Lm2Xv9Rt4Wp8Kd3Nf6Hs1Bg5Yc0JaUeOiTxMn', STAFF_EMAIL_DOMAINS: 'globalconnect.example', DATABASE_PATH: '/nonexistent/gc/data.sqlite', DATA_ENCRYPTION_KEY: 'q0v8Jm3ZxN5rT1yLw7KdP2sHf9BcVe4UaGiXoR6MtYE=' };
   assert.throws(() => loadConfig(LIVE), /DEFAULT_MARGIN_BPS must be set/);
   assert.equal(loadConfig({ ...LIVE, DEFAULT_MARGIN_BPS: '0' }).defaultMarginBps, 0);
 });
