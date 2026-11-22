@@ -49,7 +49,7 @@ export function NotificationBell() {
   );
 }
 
-const CATEGORY_LABELS: Record<AppNotification['category'], string> = { rates: 'Rate alert', approvals: 'To approve', payments: 'Your payment' };
+const CATEGORY_LABELS: Record<AppNotification['category'], string> = { rates: 'Rate alert', approvals: 'To approve', payments: 'Your payment', security: 'Security' };
 const CHOICES: { key: keyof NotificationEmailChoices; label: string }[] = [
   { key: 'rates', label: 'Rate alerts' },
   { key: 'approvals', label: 'Payments waiting for your approval' },
@@ -58,7 +58,8 @@ const CHOICES: { key: keyof NotificationEmailChoices; label: string }[] = [
 
 function NotificationRow({ item, onRead }: { item: AppNotification; onRead: () => void }) {
   // The title and the body are plain text from the server. A body may quote what a colleague typed (a reason, a
-  // payee's name): it is shown as text, never interpreted.
+  // payee's name): the server has already broken anything in it that could be a link, and here it is shown as
+  // text with link detection off, never interpreted.
   return (
     <Pressable
       accessibilityRole="button"
@@ -74,7 +75,10 @@ function NotificationRow({ item, onRead }: { item: AppNotification; onRead: () =
           {item.title}
         </AppText>
       </View>
-      <AppText>{item.body}</AppText>
+      {/* PLAIN TEXT, and nothing in it is made into a link: no link detection on a device, and on the web it is a text node. */}
+      <AppText dataDetectorType="none" selectable={false} testID={`notification-body-${item.id}`}>
+        {item.body}
+      </AppText>
       <AppText variant="caption" tone="muted">{`${CATEGORY_LABELS[item.category]} · ${formatDateTime(item.createdAt)}`}</AppText>
     </Pressable>
   );

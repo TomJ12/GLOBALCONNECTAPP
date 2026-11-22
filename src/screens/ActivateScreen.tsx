@@ -1,4 +1,4 @@
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import * as Clipboard from 'expo-clipboard';
 import { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
@@ -16,7 +16,7 @@ import { TextField } from '@/components/TextField';
 import { APP_NAME } from '@/config/app';
 import { useBeginActivation, useConfirmActivation, useSetActivationPassword } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { activationCodeFromLink, clearFragment, currentFragment } from '@/lib/activationLink';
+import { takeCodeFromAddressBar } from '@/lib/activationLink';
 import { showToast } from '@/state/toast';
 import { colors, radii, spacing } from '@/theme';
 
@@ -45,7 +45,6 @@ export function passwordProblem(password: string, repeat: string, minLength: num
  */
 export function ActivateScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ code?: string }>();
   const begin = useBeginActivation();
   const setPasswordMutation = useSetActivationPassword();
   const confirm = useConfirmActivation();
@@ -53,7 +52,8 @@ export function ActivateScreen() {
 
   const [stage, setStage] = useState<Stage>({ name: 'code' });
   // From the link: after "#" (never sent to a server), or handed over as a parameter by a deep link.
-  const [linkCode] = useState(() => activationCodeFromLink(params.code, currentFragment()));
+  // Only from after "#" in the address, and taken out of the address bar the moment it is read.
+  const [linkCode] = useState(() => takeCodeFromAddressBar());
   const [activationCode, setActivationCode] = useState(linkCode);
   const [password, setPassword] = useState('');
   const [repeat, setRepeat] = useState('');
@@ -84,7 +84,6 @@ export function ActivateScreen() {
   useEffect(() => {
     if (startedFromLink.current || linkCode === '') return;
     startedFromLink.current = true;
-    clearFragment();
     startRun(linkCode);
   }, [linkCode, startRun]);
 

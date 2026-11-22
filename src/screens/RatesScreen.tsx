@@ -27,7 +27,7 @@ import {
   useSetAlertEnabled,
 } from '@/hooks/queries';
 import { formatDate } from '@/lib/dates';
-import { formatMoney, formatRate } from '@/lib/money';
+import { formatIndicativeRate, formatMoney, formatRate } from '@/lib/money';
 import { requestConfirmation } from '@/state/confirm';
 import { colors, sizes, spacing } from '@/theme';
 import { useCapabilities } from '@/state/session';
@@ -41,8 +41,9 @@ function RateRow({ base, quote }: { base: string; quote: string }) {
   // The customer's OWN rates, one for each direction: what they get selling the base currency, what they pay
   // buying it. (The in-app demo has one sample rate for both.) Each opens Convert set up for that trade.
   if (rate.data) {
-    const sell = formatRate(rate.data.rate);
-    const buy = formatRate(rate.data.buyRate ?? rate.data.rate);
+    // Shown as the server gave them (it rounds indicative rates against the customer): never rounded again here.
+    const sell = formatIndicativeRate(rate.data.rate);
+    const buy = formatIndicativeRate(rate.data.buyRate ?? rate.data.rate);
     const side = (label: string, value: string, from: string, to: string, testID: string) => (
       <Pressable
         accessibilityRole="button"
@@ -143,7 +144,7 @@ function AlertRow({ alert }: { alert: RateAlert }) {
         <View style={styles.grow}>
           <AppText variant="bodyStrong">{`${pair} ${condition}`}</AppText>
           <AppText variant="caption" tone="muted">
-            {alert.triggered ? `Reached ${formatRate(alert.triggered.rate)} on ${formatDate(alert.triggered.at)}. Turn on to be told again.` : alert.enabled ? 'On' : 'Paused'}
+            {alert.triggered ? `Reached ${formatIndicativeRate(alert.triggered.rate)} on ${formatDate(alert.triggered.at)}. Turn on to be told again.` : alert.enabled ? 'On' : 'Paused'}
           </AppText>
         </View>
         <Switch

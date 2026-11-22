@@ -243,7 +243,8 @@ export function ConvertScreen() {
   if (result) {
     const isForward = result.kind === 'forward';
     const balanceAfter = balances.data?.find((item) => item.currency === result.buyCurrency);
-    const mismatch = confirmedQuote !== null && !conversionMatchesQuote(result, confirmedQuote);
+    // What was booked is not what was confirmed: the server says so (`differsFromQuote`), and the app checks for itself as well.
+    const mismatch = result.differsFromQuote === true || (confirmedQuote !== null && !conversionMatchesQuote(result, confirmedQuote));
     return (
       <Screen
         edges={['top', 'left', 'right']}
@@ -271,7 +272,7 @@ export function ConvertScreen() {
         </Card>
         {mismatch ? (
           <InlineMessage tone="danger">
-            These amounts are different from the rate you confirmed. The figures shown here are what was booked. Contact support before converting again.
+            {`These amounts are different from the rate you confirmed. The figures shown here are what was booked. ${disclosures.conversionDiffers}`}
           </InlineMessage>
         ) : null}
         <Card padded={false}>

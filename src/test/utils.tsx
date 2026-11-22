@@ -92,3 +92,28 @@ export async function renderScreen(ui: ReactElement): Promise<{ queryClient: Que
   );
   return { queryClient };
 }
+
+interface TestAddressBar {
+  location?: { hash?: string; pathname?: string; search?: string };
+  history?: { replaceState?: (data: unknown, unused: string, url?: string) => void };
+}
+/**
+ * Puts a link in the "address bar" as a browser would have it (the code after "#"), for one test. Returns the
+ * spy that records what the page did to the address, and a function that puts things back.
+ */
+export function openedFromLink(pathname: string, hash: string, search = ''): { replaceState: jest.Mock; restore: () => void } {
+  const address = globalThis as TestAddressBar;
+  const before = { location: address.location, history: address.history };
+  const replaceState = jest.fn((_data: unknown, _unused: string, url?: string) => {
+    address.location = { hash: '', pathname: url?.split('?')[0] ?? pathname, search: url?.includes('?') ? `?${url.split('?')[1]}` : '' };
+  });
+  address.location = { hash, pathname, search };
+  address.history = { replaceState };
+  return {
+    replaceState,
+    restore: () => {
+      address.location = before.location;
+      address.history = before.history;
+    },
+  };
+}

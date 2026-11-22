@@ -7,7 +7,7 @@ import { DEMO_ACTIVATION_CODE, DEMO_CODE } from '@/api/adapters/demoBackend';
 import { qrPath } from '@/components/QrCode';
 import { ActivateScreen, groupKey, passwordProblem } from '@/screens/ActivateScreen';
 import { useSession } from '@/state/session';
-import { installMockBackend, renderScreen } from '@/test/utils';
+import { installMockBackend, renderScreen, openedFromLink } from '@/test/utils';
 
 const expoRouter = jest.requireMock<{ __setParams: (params: Record<string, string>) => void; router: { replace: jest.Mock } }>('expo-router');
 
@@ -99,19 +99,40 @@ describe('ActivateScreen', () => {
       address.location = before.location;
       address.history = before.history;
     }
-    expect(activationCodeFromLink(undefined, '#code=ABCDE-FGHIJ-KLMNO-PQRST')).toBe('ABCDE-FGHIJ-KLMNO-PQRST');
-    expect(activationCodeFromLink('FROM-QUERY', '#other=1&code=FROM-FRAGMENT')).toBe('FROM-FRAGMENT');
-    expect(activationCodeFromLink('FROM-QUERY', '')).toBe('FROM-QUERY');
-    expect(activationCodeFromLink(undefined, '#code=<script>')).toBe('');
+    expect(activationCodeFromLink('#code=ABCDE-FGHIJ-KLMNO-PQRST')).toBe('ABCDE-FGHIJ-KLMNO-PQRST');
+    expect(activationCodeFromLink('#other=1&code=FROM-FRAGMENT')).toBe('FROM-FRAGMENT');
+    expect(activationCodeFromLink('')).toBe('');
+    expect(activationCodeFromLink('#code=<script>')).toBe('');
+  });
+
+  it('ignores a code in the QUERY string (it would be in every log on its way) and removes it from the address bar', async () => {
+    const spy = jest.spyOn(getAuthClient(), 'beginActivation');
+    spy.mockClear();
+    const link = openedFromLink('/activate', '', `?code=${DEMO_ACTIVATION_CODE}&x=1`);
+    try {
+      // Even if the router hands the query parameter over, it is not used.
+      expoRouter.__setParams({ code: DEMO_ACTIVATION_CODE });
+      await renderScreen(<ActivateScreen />);
+      expect(screen.queryByText('Step 1 of 3: choose a password')).not.toBeOnTheScreen();
+      expect(spy).not.toHaveBeenCalled();
+      expect(link.replaceState).toHaveBeenCalledWith(null, '', '/activate?x=1');
+    } finally {
+      link.restore();
+      expoRouter.__setParams({});
+    }
   });
 
   it('starts by itself when opened from an activation link', async () => {
     const spy = jest.spyOn(getAuthClient(), 'beginActivation');
-    expoRouter.__setParams({ code: DEMO_ACTIVATION_CODE });
-    await renderScreen(<ActivateScreen />);
-    expect(await screen.findByText('Step 1 of 3: choose a password')).toBeOnTheScreen();
-    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
-    expect(spy).toHaveBeenCalledWith(DEMO_ACTIVATION_CODE);
+    const link = openedFromLink('/activate', `#code=${DEMO_ACTIVATION_CODE}`);
+    try {
+      await renderScreen(<ActivateScreen />);
+      expect(await screen.findByText('Step 1 of 3: choose a password')).toBeOnTheScreen();
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      expect(spy).toHaveBeenCalledWith(DEMO_ACTIVATION_CODE);
+    } finally {
+      link.restore();
+    }
   });
 
   it('formats the key, checks passwords and draws a QR code on the device', () => {

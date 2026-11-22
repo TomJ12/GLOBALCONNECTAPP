@@ -1,6 +1,7 @@
 import { fireEvent, screen } from '@testing-library/react-native';
 
 import type { RatePair } from '@/api/types';
+import { formatIndicativeRate } from '@/lib/money';
 import { HomeScreen } from '@/screens/HomeScreen';
 import { RatesScreen } from '@/screens/RatesScreen';
 import { installMockBackend, renderScreen, signIn, startTestSession } from '@/test/utils';
@@ -12,7 +13,8 @@ function serveClientRates(mock: ReturnType<typeof installMockBackend>): void {
   const original = mock.client.getRate.bind(mock.client);
   jest.spyOn(mock.client, 'getRate').mockImplementation(async (base: string, quote: string): Promise<RatePair> => {
     const raw = await original(base, quote);
-    const scaled = (factor: number) => (Number(raw.rate) * factor).toFixed(6);
+    // At the app's display precision, already rounded against the customer by the server.
+    const scaled = (factor: number) => (Number(raw.rate) * factor).toFixed(4);
     return { ...raw, rate: scaled(0.995), buyRate: scaled(1.005), indicative: true };
   });
 }
@@ -41,6 +43,20 @@ describe('RatesScreen: the customer’s own buy and sell rates', () => {
     expect(router.push).toHaveBeenLastCalledWith({ pathname: '/convert', params: { sell: 'GBP', buy: 'USD' } });
     await fireEvent.press(screen.getByTestId('rate-buy-GBPUSD'));
     expect(router.push).toHaveBeenLastCalledWith({ pathname: '/convert', params: { sell: 'USD', buy: 'GBP' } });
+  });
+
+  it('an indicative rate is shown exactly as the server gave it: never rounded again in the customer’s favour', async () => {
+    const mock = installMockBackend();
+    await startTestSession();
+    const original = mock.client.getRate.bind(mock.client);
+    // 0.76535 rounded to four places "to the nearest" would show 0.7654: better than the customer would get.
+    jest.spyOn(mock.client, 'getRate').mockImplementation(async (base: string, quote: string) => ({ ...(await original(base, quote)), rate: base === 'GBP' && quote === 'USD' ? '0.76535' : '195.03', buyRate: base === 'GBP' && quote === 'USD' ? '1.3' : '196.01', indicative: true }));
+    await renderScreen(<RatesScreen />);
+    expect(await screen.findByTestId('rate-GBPUSD')).toHaveTextContent('Sell GBP0.76535');
+    expect(screen.getByTestId('rate-buy-GBPUSD')).toHaveTextContent('Buy GBP1.3000');
+    expect(screen.getByTestId('rate-GBPEUR')).toHaveTextContent('Sell GBP195.03');
+    expect(formatIndicativeRate('0.0051025')).toBe('0.0051025');
+    expect(formatIndicativeRate('not a rate')).not.toMatch(/\d/);
   });
 
   it('in the in-app demo there is one sample rate, shown for both directions', async () => {

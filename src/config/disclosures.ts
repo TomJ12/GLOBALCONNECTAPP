@@ -18,6 +18,8 @@ export const disclosures = {
   openAccount: '[HOW TO OPEN AN ACCOUNT]',
   /** How a client reaches Global Connect when something cannot be done in the app (a lost authenticator, for example). */
   contactSupport: '[HOW TO CONTACT GLOBAL CONNECT]',
+  /** What a customer should do when a conversion was booked on terms other than the ones they confirmed. */
+  conversionDiffers: '[CONVERSION DIFFERS FROM QUOTE — what the customer should do and how to reach Global Connect]',
   /** Any reassurance about how sign-in is protected. Do not describe it as "secure" in a screen. */
   signInAssurance: '[SIGN-IN SECURITY WORDING]',
 } as const;

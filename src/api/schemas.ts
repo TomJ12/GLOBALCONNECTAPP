@@ -224,7 +224,7 @@ export const payment: z.ZodType<Payment> = z.object({
     .optional(),
 });
 export const notificationList = z.object({
-  items: z.array(z.object({ id: text, category: z.enum(['rates', 'approvals', 'payments']), title: text, body: z.string(), createdAt: text, read: z.boolean() })),
+  items: z.array(z.object({ id: text, category: z.enum(['rates', 'approvals', 'payments', 'security']), title: text, body: z.string(), createdAt: text, read: z.boolean() })),
   unread: z.number().int().min(0),
 });
 export const notificationRead = z.object({ ok: z.literal(true), unread: z.number().int().min(0) });

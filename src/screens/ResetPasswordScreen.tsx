@@ -1,4 +1,4 @@
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
@@ -14,7 +14,7 @@ import { TextField } from '@/components/TextField';
 import { APP_NAME } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { activationCodeFromLink, clearFragment, currentFragment } from '@/lib/activationLink';
+import { takeCodeFromAddressBar } from '@/lib/activationLink';
 import { isValidEmail } from '@/lib/validation';
 import { spacing } from '@/theme';
 
@@ -23,6 +23,8 @@ import { passwordProblem } from './ActivateScreen';
 /** Said after asking for a link, whatever the address: it must not reveal whether the address has an account. */
 export const RESET_REQUESTED = `If that address belongs to a ${APP_NAME} account, an email with a link is on its way. The link works for 30 minutes.`;
 /** Email alone is never enough: there is no way back online without the authenticator or a recovery code. */
+/** Shown when finishing a reset is refused because the link is no longer good: which is also what a retry sees after a reset that DID go through. */
+export const RESET_MAYBE_DONE = 'That reset link is not valid any more. If you just pressed the button and did not see an answer, your password may already have been changed: try signing in with the new password before asking for another link.';
 export const NO_SECOND_FACTOR = `Lost your authenticator app and your recovery codes? That cannot be put right here: an email alone must never be enough to take over an account. Contact ${APP_NAME}, who will check who you are before anything is changed. ${disclosures.contactSupport}`;
 
 type Stage = { name: 'request' } | { name: 'requested' } | { name: 'link' } | { name: 'reset'; minLength: number; method: CodeMethod } | { name: 'done' };
@@ -34,10 +36,10 @@ type Stage = { name: 'request' } | { name: 'requested' } | { name: 'link' } | { 
  */
 export function ResetPasswordScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ code?: string }>();
   const selfService = getAuthClient().selfService;
-  // From the link: after "#" (never sent to a server), or handed over as a parameter by a deep link.
-  const [linkCode] = useState(() => activationCodeFromLink(params.code, currentFragment()));
+  // From the link: after "#" (never sent to a server), and only from there. It is taken out of the address bar the
+  // moment it is read, before anything is sent, whether or not it turns out to be good.
+  const [linkCode] = useState(() => takeCodeFromAddressBar());
   const [stage, setStage] = useState<Stage>(linkCode ? { name: 'link' } : { name: 'request' });
   const [email, setEmail] = useState('');
   const [resetCode, setResetCode] = useState(linkCode);
@@ -72,8 +74,6 @@ export function ResetPasswordScreen() {
     setFieldError({});
     try {
       const policy = await selfService?.beginPasswordReset(resetCode);
-      // The code has been read: do not leave it in the address bar or the browser history.
-      clearFragment();
       setStage({ name: 'reset', minLength: policy?.minLength ?? 12, method: 'totp' });
     } catch (caught) {
       setError(toProviderError(caught).userMessage);
@@ -100,11 +100,15 @@ export function ResetPasswordScreen() {
     } catch (caught) {
       const providerError = toProviderError(caught);
       setCode('');
-      // The link itself is no longer good: back to asking for a new one.
+      // The link itself is no longer good: back to asking for a new one. It may also be that the password WAS
+      // changed and only the answer was lost on the way (the link works once): say so, so that nobody is left
+      // asking for links to an account whose new password already works.
       if (providerError.reason === 'reset_invalid') {
         setPassword('');
         setRepeat('');
         setStage({ name: 'request' });
+        setError(RESET_MAYBE_DONE);
+        return;
       }
       setError(providerError.userMessage);
     }

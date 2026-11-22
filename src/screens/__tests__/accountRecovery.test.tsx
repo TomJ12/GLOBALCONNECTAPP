@@ -3,12 +3,12 @@ import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 import { getAuthClient } from '@/api';
 import type { SelfServiceClient } from '@/api/auth';
 import { ProviderError } from '@/api/errors';
-import { NO_SECOND_FACTOR, RESET_REQUESTED, ResetPasswordScreen } from '@/screens/ResetPasswordScreen';
+import { NO_SECOND_FACTOR, RESET_MAYBE_DONE, RESET_REQUESTED, ResetPasswordScreen } from '@/screens/ResetPasswordScreen';
 import { SecurityScreen } from '@/screens/SecurityScreen';
 import { SettingsScreen } from '@/screens/SettingsScreen';
 import { SignInScreen } from '@/screens/SignInScreen';
 import { useSession } from '@/state/session';
-import { installMockBackend, renderScreen, startTestSession } from '@/test/utils';
+import { installMockBackend, openedFromLink, renderScreen, startTestSession } from '@/test/utils';
 
 const expoRouter = jest.requireMock<{ __setParams: (params: Record<string, string>) => void; router: { replace: jest.Mock; push: jest.Mock } }>('expo-router');
 
@@ -68,12 +68,20 @@ describe('forgotten password', () => {
 
   it('the link is not enough: the new password needs a code from the authenticator, or a recovery code', async () => {
     const service = selfService();
-    // Opened from the emailed link: the code arrives with the page.
-    expoRouter.__setParams({ code: 'ABCDE-FGHIJ-KLMNO-PQRST' });
-    await renderScreen(<ResetPasswordScreen />);
-    await fireEvent.press(screen.getByTestId('reset-open'));
-    await waitFor(() => expect(service.beginPasswordReset).toHaveBeenCalledWith('ABCDE-FGHIJ-KLMNO-PQRST'));
-    expect(await screen.findByTestId('reset-second-factor')).toBeOnTheScreen();
+    // Opened from the emailed link: the code arrives with the page, after "#". It is taken out of the address bar
+    // AT ONCE, before anything has been sent anywhere (a link that turns out to be bad is not left there either).
+    const link = openedFromLink('/reset', '#code=ABCDE-FGHIJ-KLMNO-PQRST');
+    try {
+      await renderScreen(<ResetPasswordScreen />);
+      expect(link.replaceState).toHaveBeenCalledWith(null, '', '/reset');
+      expect(service.beginPasswordReset).not.toHaveBeenCalled();
+      await fireEvent.press(screen.getByTestId('reset-open'));
+      await waitFor(() => expect(service.beginPasswordReset).toHaveBeenCalledWith('ABCDE-FGHIJ-KLMNO-PQRST'));
+      expect(await screen.findByTestId('reset-second-factor')).toBeOnTheScreen();
+    } finally {
+      link.restore();
+    }
+
     // No code: nothing is sent.
     await fireEvent.changeText(screen.getByTestId('reset-password'), 'a long enough password');
     await fireEvent.changeText(screen.getByTestId('reset-password-repeat'), 'a long enough password');
@@ -95,10 +103,26 @@ describe('forgotten password', () => {
     expect(expoRouter.router.replace).toHaveBeenCalledWith('/sign-in');
   });
 
+  it('a reset code in the QUERY string is never used, and is taken out of the address bar', async () => {
+    selfService();
+    // A code in the QUERY string is not used (it would be in every log on its way): the person is asked for their email instead.
+    const query = openedFromLink('/reset', '', '?code=ABCDE-FGHIJ-KLMNO-PQRST');
+    try {
+      expoRouter.__setParams({ code: 'ABCDE-FGHIJ-KLMNO-PQRST' });
+      await renderScreen(<ResetPasswordScreen />);
+      expect(screen.getAllByTestId('reset-email').length).toBeGreaterThan(0);
+      expect(query.replaceState).toHaveBeenCalledWith(null, '', '/reset');
+    } finally {
+      query.restore();
+      expoRouter.__setParams({});
+    }
+  });
+
   it('a recovery code can be used instead, and a link that is no longer valid sends the person back to ask for a new one', async () => {
     const service = selfService({ completePasswordReset: jest.fn(async () => Promise.reject(new ProviderError('validation', { reason: 'reset_invalid' }))) });
-    expoRouter.__setParams({ code: 'ABCDE-FGHIJ-KLMNO-PQRST' });
+    const link = openedFromLink('/reset', '#code=ABCDE-FGHIJ-KLMNO-PQRST');
     await renderScreen(<ResetPasswordScreen />);
+    link.restore();
     await fireEvent.press(screen.getByTestId('reset-open'));
     await fireEvent.press(await screen.findByTestId('reset-toggle-method'));
     await fireEvent.changeText(screen.getByTestId('reset-second-factor'), 'AAAAA-BBBBB-CCCCC-DDDDD');
@@ -106,7 +130,9 @@ describe('forgotten password', () => {
     await fireEvent.changeText(screen.getByTestId('reset-password-repeat'), 'a long enough password');
     await fireEvent.press(screen.getByTestId('reset-finish'));
     await waitFor(() => expect(service.completePasswordReset).toHaveBeenCalledWith('AAAAA-BBBBB-CCCCC-DDDDD', 'recovery', 'a long enough password'));
-    expect(await screen.findByText(/That reset link is not valid any more/)).toBeOnTheScreen();
+    // The link works once, so this is also what a retry sees when the first answer was lost and the password WAS changed: the message says so.
+    expect(await screen.findByText(RESET_MAYBE_DONE)).toBeOnTheScreen();
+    expect(RESET_MAYBE_DONE).toMatch(/your password may already have been changed: try signing in with the new password/);
     expect(screen.getByTestId('reset-email')).toBeOnTheScreen();
   });
 });

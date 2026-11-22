@@ -75,6 +75,9 @@ describe('notifications', () => {
     expect(await screen.findByText('Your payment was rejected')).toBeOnTheScreen();
     // What a colleague typed is shown exactly as typed, as text.
     expect(screen.getByText(new RegExp(`Reason given: “${HOSTILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}”`))).toBeOnTheScreen();
+    // ...with link detection off: nothing in a notification is ever made into a link by the app.
+    expect(screen.getByTestId('notification-body-ntf_3').props.dataDetectorType).toBe('none');
+    expect(screen.queryByRole('link')).not.toBeOnTheScreen();
     expect(screen.getByTestId('unread-ntf_3')).toBeOnTheScreen();
     expect(screen.getByTestId('unread-ntf_2')).toBeOnTheScreen();
     expect(screen.queryByTestId('unread-ntf_1')).not.toBeOnTheScreen();
@@ -164,7 +167,7 @@ describe('rejecting with a reason', () => {
 describe('rate alerts kept by the server', () => {
   const SERVER_ALERTS = [
     { id: 'alr_1', base: 'GBP', quote: 'USD', side: 'sell', targetRate: '1.32', status: 'active', createdAt: '2026-11-11T10:00:00.000Z', triggeredAt: null, triggeredRate: null },
-    { id: 'alr_2', base: 'GBP', quote: 'EUR', side: 'buy', targetRate: '1.17', status: 'triggered', createdAt: '2026-11-11T10:00:00.000Z', triggeredAt: '2026-11-12T08:00:00.000Z', triggeredRate: '1.169900' },
+    { id: 'alr_2', base: 'GBP', quote: 'EUR', side: 'buy', targetRate: '1.17', status: 'triggered', createdAt: '2026-11-11T10:00:00.000Z', triggeredAt: '2026-11-12T08:00:00.000Z', triggeredRate: '1.1699' },
   ];
   function apiWith(routes: Record<string, unknown>) {
     const calls: { route: string; body: unknown }[] = [];
@@ -181,7 +184,7 @@ describe('rate alerts kept by the server', () => {
     const store: AlertsStore = api.alerts;
     expect(await store.list()).toEqual([
       { id: 'alr_1', base: 'GBP', quote: 'USD', direction: 'above', targetRate: '1.32', enabled: true, createdAt: '2026-11-11T10:00:00.000Z', triggered: null },
-      { id: 'alr_2', base: 'GBP', quote: 'EUR', direction: 'below', targetRate: '1.17', enabled: false, createdAt: '2026-11-11T10:00:00.000Z', triggered: { at: '2026-11-12T08:00:00.000Z', rate: '1.169900' } },
+      { id: 'alr_2', base: 'GBP', quote: 'EUR', direction: 'below', targetRate: '1.17', enabled: false, createdAt: '2026-11-11T10:00:00.000Z', triggered: { at: '2026-11-12T08:00:00.000Z', rate: '1.1699' } },
     ]);
     await store.create({ base: 'GBP', quote: 'USD', direction: 'above', targetRate: '1.32' });
     await store.create({ base: 'GBP', quote: 'USD', direction: 'below', targetRate: '1.29' }).catch(() => undefined);
@@ -222,11 +225,11 @@ describe('rate alerts kept by the server', () => {
     const mock = installMockBackend();
     await startTestSession();
     const original = mock.client.getRate.bind(mock.client);
-    jest.spyOn(mock.client, 'getRate').mockImplementation(async (base: string, quote: string) => ({ ...(await original(base, quote)), rate: '1.293500', buyRate: '1.306500', indicative: true }));
+    jest.spyOn(mock.client, 'getRate').mockImplementation(async (base: string, quote: string) => ({ ...(await original(base, quote)), rate: '1.2934', buyRate: '1.3065', indicative: true }));
     const created: unknown[] = [];
     const alerts: RateAlert[] = [
       { id: 'alr_1', base: 'GBP', quote: 'USD', direction: 'above', targetRate: '1.32', enabled: true, createdAt: '2026-11-11T10:00:00.000Z', triggered: null },
-      { id: 'alr_2', base: 'GBP', quote: 'EUR', direction: 'below', targetRate: '1.17', enabled: false, createdAt: '2026-11-11T10:00:00.000Z', triggered: { at: '2026-11-12T08:00:00.000Z', rate: '1.169900' } },
+      { id: 'alr_2', base: 'GBP', quote: 'EUR', direction: 'below', targetRate: '1.17', enabled: false, createdAt: '2026-11-11T10:00:00.000Z', triggered: { at: '2026-11-12T08:00:00.000Z', rate: '1.1699' } },
     ];
     (getAuthClient() as { alerts: AlertsStore | null }).alerts = {
       list: async () => alerts,
@@ -245,7 +248,7 @@ describe('rate alerts kept by the server', () => {
     await renderScreen(<NewAlertScreen />);
     // Selling GBP: the sell rate. Buying GBP: the buy rate. Both labelled as the customer's own, indicative.
     expect(await screen.findByText('Your rate to sell 1 GBP, in USD. Indicative.')).toBeOnTheScreen();
-    await waitFor(() => expect(screen.getByTestId('alert-current-rate')).toHaveTextContent('1.2935'));
+    await waitFor(() => expect(screen.getByTestId('alert-current-rate')).toHaveTextContent('1.2934'));
     expect(screen.getByTestId('alert-meaning')).toHaveTextContent('You will be told when your rate to sell GBP for USD is at the target or higher.');
     await fireEvent.press(screen.getByRole('radio', { name: 'Buy GBP at the target rate or better' }));
     expect(screen.getByText('Your rate to buy 1 GBP, in USD. Indicative.')).toBeOnTheScreen();

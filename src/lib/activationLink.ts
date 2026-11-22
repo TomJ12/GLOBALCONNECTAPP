@@ -1,15 +1,17 @@
 /**
- * The activation code carried by an activation link.
+ * The single-use code carried by an activation link or a password-reset link.
  *
- * The link is `/activate#code=…`: the code is in the fragment, which a browser
- * keeps to itself, so it is never sent to a server and cannot end up in a
- * request log. A `?code=` parameter (how a deep link hands it to the app) is
- * still read, but the server does not put one in a link.
+ * The link is `/activate#code=…` (or `/reset#code=…`): the code is in the
+ * FRAGMENT, which a browser keeps to itself, so it is never sent to a server
+ * and cannot end up in a request log, a proxy log or a Referer header.
+ *
+ * ONLY THE FRAGMENT IS READ. A `?code=` in the query string is ignored (the
+ * server never writes one, and a link made that way would put the code into
+ * every log on its way); on a device, where there is no address bar, the code
+ * is typed.
  */
-export function activationCodeFromLink(queryCode: unknown, fragment: string | undefined | null): string {
-  const fromFragment = /(?:^#|&)code=([A-Za-z0-9-]+)/.exec(fragment ?? '')?.[1];
-  if (fromFragment) return fromFragment;
-  return typeof queryCode === 'string' ? queryCode : '';
+export function activationCodeFromLink(fragment: string | undefined | null): string {
+  return /(?:^#|&)code=([A-Za-z0-9-]+)/.exec(fragment ?? '')?.[1] ?? '';
 }
 
 interface AddressBar {
@@ -22,9 +24,21 @@ export function currentFragment(): string {
   return (globalThis as AddressBar).location?.hash ?? '';
 }
 
-/** Takes the code out of the address bar once it has been read, so it is not left in the browser history. */
+/** Takes the code out of the address bar, so it is not left there or in the browser history. A `code` in the query string is removed as well (it is never used). */
 export function clearFragment(): void {
   const { location, history } = globalThis as AddressBar;
-  if (!location?.hash || !history?.replaceState) return;
-  history.replaceState(null, '', `${location.pathname ?? ''}${location.search ?? ''}`);
+  if (!location || !history?.replaceState) return;
+  const search = (location.search ?? '').replace(/([?&])code=[^&]*&?/g, '$1').replace(/[?&]$/, '');
+  if (!location.hash && search === (location.search ?? '')) return;
+  history.replaceState(null, '', `${location.pathname ?? ''}${search}`);
+}
+
+/**
+ * READ AND CLEARED IN ONE STEP: the code is taken from the address bar and the address bar is wiped at once,
+ * before anything is sent anywhere, whether or not the code turns out to be good.
+ */
+export function takeCodeFromAddressBar(): string {
+  const code = activationCodeFromLink(currentFragment());
+  clearFragment();
+  return code;
 }

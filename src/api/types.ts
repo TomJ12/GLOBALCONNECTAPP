@@ -357,7 +357,8 @@ export interface PaymentHold {
 /** One entry in the person's notification list. `title` and `body` are plain text written by the server. */
 export interface AppNotification {
   id: string;
-  category: 'rates' | 'approvals' | 'payments';
+  /** `security`: a notice about the account itself; always shown and always emailed. */
+  category: 'rates' | 'approvals' | 'payments' | 'security';
   title: string;
   body: string;
   createdAt: IsoDateTime;

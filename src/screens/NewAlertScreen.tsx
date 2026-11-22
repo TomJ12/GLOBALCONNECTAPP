@@ -15,7 +15,7 @@ import { WATCHLIST_PAIRS } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useCreateAlert, useRate } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { formatRate, parseDecimalInput } from '@/lib/money';
+import { formatIndicativeRate, parseDecimalInput } from '@/lib/money';
 import { showToast } from '@/state/toast';
 import { spacing } from '@/theme';
 
@@ -79,7 +79,7 @@ export function NewAlertScreen() {
       <Card>
         <AppText tone="muted">{`Your rate to ${selling ? 'sell' : 'buy'} 1 ${base}, in ${quote}. Indicative.`}</AppText>
         <AppText variant="amount" testID="alert-current-rate">
-          {current ? formatRate(current) : rate.isError ? 'Unavailable' : '…'}
+          {current ? formatIndicativeRate(current) : rate.isError ? 'Unavailable' : '…'}
         </AppText>
       </Card>
       <View style={{ gap: spacing.sm }}>
@@ -111,7 +111,7 @@ export function NewAlertScreen() {
         keyboardType="decimal-pad"
         inputMode="decimal"
         maxLength={16}
-        placeholder={current ? formatRate(current) : '0.0000'}
+        placeholder={current ? formatIndicativeRate(current) : '0.0000'}
         error={error}
         testID="alert-target"
       />
