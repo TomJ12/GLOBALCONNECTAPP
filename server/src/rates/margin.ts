@@ -1,9 +1,12 @@
 /**
  * GLOBAL CONNECT'S MARGIN ON FX, and the client's rate that results.
  *
- * A client only ever sees THEIR rate. The provider's rate, the mid-market
- * rate and the margin itself never leave the server: nothing in this file is
- * ever serialised to a client (a test scans every client response).
+ * A client only ever sees THEIR rate. No response names the provider's rate,
+ * a mid-market rate or the margin (a test scans every client response for
+ * such fields and wording). A client who is shown both a sell and a buy rate
+ * can still ESTIMATE a midpoint and a spread, as from any two-way price; the
+ * indicative figures are rounded so that the estimate is not exact
+ * (`indicativePair`).
  *
  * THE MARGIN ALWAYS WORKS AGAINST THE CLIENT, in both directions. A rate is
  * "how many units of the quote currency one unit of the base currency is

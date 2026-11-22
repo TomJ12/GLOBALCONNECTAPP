@@ -779,8 +779,15 @@ no push notification.
 ### Client rates and Global Connect's margin
 
 A client only ever sees **their own rate**: what they get after Global Connect's
-margin. The provider's rate, the mid-market rate and the margin itself never leave the
-server, in any API response or error message. The code is `server/src/rates/margin.ts`
+margin. **What is and is not disclosed, precisely:** no API response or error message
+has a field or wording that names the provider's rate, a mid-market rate, the margin or
+what Global Connect earns. But a client is shown a rate for selling **and** a rate for
+buying, and from any two-way price anyone can estimate a midpoint and a spread; that is
+not hidden and cannot be while both directions are shown. What the server does is stop
+that estimate being **exact for free**: indicative rates are given only to the
+precision the app displays (five significant figures), each rounded against the client
+by itself, and never as an exact image of the provider's rate and the margin (below).
+The code is `server/src/rates/margin.ts`
 (the arithmetic) and `server/src/rates/service.ts` (everything a client is told about a
 rate, a quote or a conversion passes through it).
 
@@ -800,8 +807,13 @@ The margin works against the client in both directions. All arithmetic is decima
 indicative rate, the held quote and the booked conversion because all three come from
 the same two functions:
 
-- a client rate is kept to **6 decimal places**, rounded **down** when the client sells
-  the base currency and **up** when they buy it;
+- a client rate is kept to **7 significant figures** (1.293500, 195.0325, 0.005102563),
+  rounded **down** when the client sells the base currency and **up** when they buy it.
+  Significant figures, not a fixed number of decimal places, so that rounding moves a
+  rate by less than one part in a million whatever its size (at six fixed places a rate
+  of 0.005 could lose 2 bp to rounding alone: a hidden margin);
+- the margin **really applied after rounding** (of the rate and of the amount) is worked
+  out and kept with the revenue record (`effectiveBps`), next to the configured one;
 - the amount on the side the client typed stays exactly what they typed; the other
   amount is worked out at the client rate and rounded **down** to the currency's minor
   unit if the client receives it, **up** if they pay it;
@@ -820,29 +832,54 @@ and direction; otherwise the tier for the amount (larger amounts, smaller margin
 otherwise the company's default. A company with no configuration of its own uses
 `DEFAULT_MARGIN_BPS`. An override is written for a pair and a direction (`GBPUSD
 sell 40`: 40 bp when the client sells GBP for USD) and also covers the same trade
-spelled the other way round (buying the first currency of `USDGBP`). Tier amounts are
-in the first currency of the pair as the provider quotes it. The indicative rate is for
-no particular amount, so no tier applies to it: a tier can only make a held quote
-better than the indicative rate, never worse. A forward with its own margin can be
+spelled the other way round (buying the first currency of `USDGBP`): inside the server
+every pair has ONE orientation (the market's usual order), whatever a provider's
+adapter calls the base. **Tier amounts are in ONE currency per company** (`tierCurrency`,
+default GBP, set with the margin and shown in the console): the size of a trade is
+converted to it at the provider's rate before a tier is chosen, so 60,000 yen is not
+priced as 60,000 pounds, on either provider and in either direction. If the size
+cannot be converted (the provider has no rate for it), no tier applies, which is never
+to the client's advantage. The indicative rate is for no particular amount, so no tier
+applies to it: a tier can only make a held quote better than the indicative rate,
+never worse. A forward with its own margin can be
 priced differently from the indicative (spot) rate.
 
 **What the app receives.** `GET /v1/rates/:base/:quote` returns `rate` (the client's
 rate when they sell the base currency), `buyRate` (when they buy it), `indicative:
-true` and `asOf`. The rate history is the client's sell rate at each point. A quote and
-a conversion carry the client's rate and amounts and the "held until" time. Nothing
-else. The Rates screen shows both directions for each pair ("Sell GBP" / "Buy GBP"),
+true` and `asOf`. **Indicative rates are at the app's display precision** (five
+significant figures: 1.2934, 195.03, 0.76535), each rounded against the client, and if
+the two roundings together moved the figures by less than a quarter of a display step
+the sell figure is shown one step lower: an indicative rate is never better than a
+quote, and the spread between the two figures is never the margin to six places. The
+app shows them exactly as given. The rate history is the client's indicative sell rate
+at each point. A quote and a conversion carry the client's rate **in full** (for that
+amount and direction) and amounts and the "held until" time. Nothing else. The Rates screen shows both directions for each pair ("Sell GBP" / "Buy GBP"),
 labelled "Your rate · Indicative"; each opens Convert set up for that trade, and
 Convert gets its held quote from the same code, so the two agree apart from market
 movement. The Home total is a valuation, not an offer: other currencies are valued at
 the rate the client would sell them at, and it says "estimated at your current sell
 rates". (A two-way price lets anyone estimate the midpoint between the two; that is
-true of any buy/sell price and is not hidden.)
+true of any buy/sell price and is not hidden. Two held quotes, one each way, give the
+client's two rates in full and so a closer estimate still.)
+
+**A quote is checked by this server when it is booked**, not left to the provider: it
+must be the quote this server gave **this person** in **this company**, not past its
+"held until" time, **not used by any other booking**, and priced by the margin
+configuration **still in force** (a quote taken before a margin change cannot be booked
+after it: the app is told the quote has expired and gets a new one). One idempotency
+key is one booking of one quote: the same key and quote again is answered from the
+conversion that was made (looked up by its key, never booked twice); the same key
+with a different quote is refused. Errors name the neutral API's fields only: a
+provider's parameter names are translated or dropped, and the response scan fails on
+any that get through.
 
 **Tests scan every client response.** The server test harness checks every reply the
 client API gives, in every test, for a field or wording that speaks of a mid rate, a
 margin, a markup, a spread, basis points, wholesale or partner figures, provider
-amounts or revenue (`forbiddenInClientResponse` in `server/test/helpers.ts`), and fails
-the test that caused it.
+amounts or revenue, or a provider's parameter name in an error
+(`forbiddenInClientResponse` in `server/test/helpers.ts`), and fails the test that
+caused it. It also fails if a reply carries a sell rate and a buy rate whose spread is
+**exactly** a margin in force, to six places (`marginReadableFrom`).
 
 **Where the margin is applied: a setting per provider.**
 
@@ -852,6 +889,16 @@ the test that caused it.
 | `provider` | The provider already returns the client's rate, with Global Connect's markup configured on the provider's side. The server adds **nothing** on top (that would charge the client twice), passes the provider's figures through, and does not know the revenue. A company's margin configuration is stored but not used. |
 
 These names are server configuration; no client sees them.
+
+**A wrong setting fails safe.** Provider A's quotes say whether they carry a partner
+markup (its client figures differ from its own). That is checked against the setting
+on **every quote**: `provider` with no markup there (the client would be shown and
+given the wholesale rate) and `server` with a markup there (the client would be charged
+twice) both **refuse to quote**, with the reason in the server log. With `provider`,
+an indicative rate is passed on only after one real quote has shown the markup is
+there (checked again every ten minutes). Provider B's quotes do not say, so
+`MARGIN_APPLIED_BY_EQUALS=provider` is **refused at start-up**: the server could not
+tell a marked-up rate from the wholesale one.
 
 **Changing a company's margin (ops console).** Any staff member can see a company's
 margin on its page. Changing it is a request that a **second staff member who is an ops
@@ -874,7 +921,8 @@ and month, filters for company and dates, and a CSV download (cells a spreadshee
 would run as a formula are written as text; each download is in the audit log). Only
 ops admins can open it; no client API serves any of it. A booking whose answer from the
 provider was lost stays on the list as "not confirmed by the provider" until the
-conversion is found again by its key.
+conversion is found again by its key. A conversion the provider booked without the
+client's terms is **not counted** in the totals and is listed by itself.
 
 **What is not settled, and must be before real use:**
 
@@ -886,13 +934,18 @@ conversion is found again by its key.
   `clientAmounts` field that only the mock understands. Either may turn out to need
   `provider` instead.
 - If a provider books a conversion **without** the client's terms it was sent, the
-  client is still shown only their own terms (from the server's record), the revenue
-  row is marked "CHECK" and an error is logged; but the provider's own statement and
-  balance for that client would then show the provider's figures. Nothing reconciles
-  that automatically.
-- Held quotes are in the server's memory: a restart forgets them and the client is
-  asked to get a new rate (the revenue record of a booking already sent is in the
-  database and survives).
+  client is shown **what was really booked** (that is what moved on their account),
+  flagged as differing from the quote, with wording from a placeholder
+  (`disclosures.conversionDiffers`) telling them to get in touch, and is notified in the
+  app and by email. The revenue row is **left out of the totals** and listed
+  separately on the Revenue page with what was quoted and what was booked; it is
+  audited (`system.conversion.mismatch`) and logged. In that case the client sees the
+  provider's own rate for that trade: that is what happened to their money. Nothing
+  puts it right automatically.
+- Held quotes are kept in the database, so a restart of this server does not lose
+  them. (The **mock** providers keep their own quotes in memory, so in the demo a quote
+  taken before a restart is refused by the mock afterwards and the app asks for a new
+  rate; a real provider would still know it.)
 - The default margin in development (50 bp) is a **sample**, not Global Connect's
   pricing. Outside development `DEFAULT_MARGIN_BPS` has no default and the server will
   not start without it.
@@ -927,8 +980,9 @@ their buy rate is at or below it.
   that the rate is **indicative** and not held, and that converting means getting a
   rate in the app. It promises nothing.
 - If a person is disabled or leaves the company, their alert is kept but not checked.
-  If the rate limit below is hit at the moment an alert fires, the alert is still marked
-  as fired and that one notification is lost (the audit log records it).
+  An alert is marked as fired **only when its notification exists**: if the notification
+  was held back (the hourly limit below) or could not be made, the alert stays on and
+  is tried again at the next check.
 - The app keeps its `AlertsStore` interface. Against the server it uses a
   server-backed implementation (the app's "at or above" is selling, "at or below" is
   buying); the in-app demo keeps alerts on the device, where nothing checks them.
@@ -938,7 +992,7 @@ their buy rate is at or below it.
 | Channel | What it is |
 | --- | --- |
 | In the app | A list kept on the server, opened from the bell on Home, with an unread count. Tap one to mark it read, or mark all. Always on. |
-| Email | Through the mail queue (see "Email"): written to the outbox first, retried, never sent twice for one event. Can be turned off per kind. |
+| Email | Through the mail queue (see "Email"): written to the outbox first and retried. One event is QUEUED once; delivery is at least once (in one failure case, described under "Email", the same message can arrive twice). Can be turned off per kind. |
 
 **Push is not built.** `PushChannel` in `notifier.ts` is the interface a push sender
 would implement (it is given the person and the words); nothing implements it, no
@@ -983,9 +1037,19 @@ per address and overall.
 **The reason for a rejection.** An approver may type a reason (optional, at most 200
 characters, no control characters or line breaks; the server refuses them). The creator
 sees it in the notification and on the payment. It is another person's free text and is
-treated as such everywhere: one line, any `scheme://` removed so it cannot become a
-link, escaped in the HTML part of an email, shown as plain text in the app; the audit
-log stores it as data and the ops console escapes everything it prints.
+treated as such everywhere. One function (`plainText` in `server/src/validate.ts`) is
+applied to every piece of typed text that goes into a notification, an email or the
+payment's own "rejected by" line: it is put on one line and anything a mail client or
+an app would turn into a link is **visibly broken**, not silently removed
+(`https://pay.example` becomes `https[:]//pay[.]example`, `www.pay.example` becomes
+`www[.]pay[.]example`, `a@pay.example` becomes `a[@]pay[.]example`), repeated until
+nothing changes so that nesting one scheme inside another cannot put a working link
+back together. It is escaped in the HTML part of an email and shown in the app as
+plain text with link detection off. The audit log stores what was typed as data, and
+the ops console escapes everything it prints. The notification's email is written to
+the outbox **before** the notification is recorded as made, so nothing that goes
+wrong afterwards can lose it; an email that cannot be written out at all is recorded
+as failed, audited and shown on the Mail page, never swallowed.
 
 **The audit log** records alert create / pause / re-arm / delete / fired (pair,
 direction, target, rate), each notification (who, which kind, whether email was queued:
@@ -1292,11 +1356,16 @@ a description of how identity was verified; that text is shown to the approver a
 stored in the audit log with both staff members' names. The console cannot check that
 the verification really happened. So, for a **client**, an approved reset **waits**:
 
-1. The client is emailed a notice at once: a reset has been approved, when it will take
-   effect, and that signing in now cancels it.
+1. A **warning** is queued for the client at once, by email and in the app's
+   notification list: a reset has been approved, the earliest it can take effect, and
+   that signing in now cancels it.
 2. **Nothing changes** for `AUTHENTICATOR_RESET_DELAY_HOURS` (default 24; at least 1
-   outside development; the confirmation page tells staff how long). The client's
-   current password, authenticator and recovery codes go on working.
+   outside development; the confirmation page tells staff how long), **counted from
+   the moment the mail server accepted the warning**, not from the approval. While the
+   warning is still queued or deferred nothing is due; if the mail server refuses it
+   for good it is queued afresh and the reset goes on waiting. The console shows, on
+   the person's page and under Approvals, whether the warning has been delivered. The
+   client's current password, authenticator and recovery codes go on working.
 3. If the client **signs in successfully** during the delay (password and code), the
    reset is cancelled automatically and that is audited
    (`system.client.reset_authenticator.cancelled`, by "signed in"): whoever has the
@@ -1496,10 +1565,32 @@ same message at once. The body, which may hold a single-use link, is stored encr
 and erased once the message is sent, has failed for good or was held back. Sent
 messages are kept as counts (no content) for 30 days.
 
-**Limits.** At most 20 messages an hour are queued for one address and 1,000 for
-everyone together, counted from the outbox itself (a restart does not reset them).
-Beyond that a message is recorded as held back (`system.mail.suppressed`), not sent.
-Nobody can use this server to flood an address.
+**Limits, by class of email.** Nobody can use this server to flood an address, and no
+class of email can use up another's allowance. Each class is counted by itself, per
+address and overall, over the last hour of what was actually sent (from the outbox, so
+a restart does not reset it):
+
+| Class | To one address, per hour | Overall, per hour |
+| --- | --- | --- |
+| Security notices | 12 | `MAIL_GLOBAL_PER_HOUR` (1,000) |
+| Activation and reset links | 6 | 1,000 |
+| Payment notifications | `MAIL_PER_RECIPIENT_PER_HOUR` (20) | 1,000 |
+| Rate alerts | half of that (10) | 500 |
+| Digest ("more is waiting in the app") | 1 | 1,000 |
+
+So a burst of ordinary notifications **cannot hold back** a security notice, a
+password-reset link or an activation link. A message over its allowance is **never
+dropped**: it is **deferred** (`system.mail.deferred`), stays in the outbox with its
+content and is sent when the allowance frees. The one exception: an ordinary
+notification beyond one address's allowance is folded into a single digest email for
+that hour, which says more is waiting in the app (every notification is in the app's
+list anyway).
+
+**Callers are told what became of a message** (sent, queued, deferred, not sent) and
+say so: the ops console, the approval page, the operator commands and the audit log
+report "sent" only when the mail server has accepted the message, and otherwise that
+it is queued or deferred. A forgotten-password request always gets the same answer;
+its link is delivered when its allowance frees.
 
 **What the Mail page shows.** How many are waiting, sent, failed or held back, and for
 each that did not go: when, the recipient **masked**, the kind of message, the number of

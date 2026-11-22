@@ -4,9 +4,9 @@
  *
  * Outside explicit development mode the server will not run on in-memory mock
  * providers, without a real mailer, without a database file, or without the
- * data encryption key. Since this repository contains no live provider
- * transport and no real mailer yet, it cannot start outside development mode
- * at all. That is deliberate: a "production" process serving sample data from
+ * data encryption key. A real mailer exists (SMTP: mail/smtp.ts), but this
+ * repository contains no live provider transport, so it still cannot start
+ * outside development mode. That is deliberate: a "production" process serving sample data from
  * a mock is worse than no process.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
