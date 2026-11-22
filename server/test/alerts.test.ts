@@ -106,7 +106,7 @@ test('an alert is checked against the client’s own rate, fires once, says the 
   // The audit log says who was told and which kind; never what it said.
   const told = await audit('notification');
   assert.equal(told.length, 3);
-  assert.deepEqual([told[0]?.target?.label, told[0]?.detail], [AMIRA, { kind: 'rate_alert', category: 'rates', email: 'queued' }]);
+  assert.deepEqual([told[0]?.target?.label, told[0]?.detail], [AMIRA, { kind: 'rate_alert', category: 'rates', email: 'sent' }]);
   assert.doesNotMatch(JSON.stringify(told), /1\.29|1\.30|reached|indicative/);
 });
 

@@ -8,7 +8,7 @@
  * queued message is the person, the kind and the window; on top of that the
  * outbox has its own per-recipient limit.
  */
-import type { MailQueue } from '../mail/queue';
+import type { Delivery, MailQueue } from '../mail/queue';
 import { mailOf, type SecurityNotice } from '../mail/templates';
 
 const HOUR = 60 * 60_000;
@@ -33,28 +33,42 @@ export interface NoticePerson {
   name: string;
 }
 
+/** Shows a client's security notice in the app as well (their notification list). Set by the app once the notifier exists. */
+export type InAppNotice = (person: NoticePerson, kind: SecurityNotice, data: { at: number; until?: number }, key: string) => Promise<unknown>;
+
 export class SecurityNotices {
+  private inApp: InAppNotice | null = null;
   constructor(
     private readonly mail: MailQueue,
     private readonly now: () => number,
     private readonly onError: (message: string) => void = () => {},
   ) {}
 
-  /** Never throws: a notice that cannot be queued must not undo or fail what it is about. */
-  async send(person: NoticePerson, audience: 'client' | 'staff', kind: SecurityNotice, extra: { until?: number } = {}): Promise<void> {
+  attachInApp(inApp: InAppNotice): void {
+    this.inApp = inApp;
+  }
+
+  /** The key a notice is queued under. With `key`, the caller names the message so that it can ask later what became of it. */
+  keyOf(person: Pick<NoticePerson, 'id'>, audience: 'client' | 'staff', kind: SecurityNotice, at: number, key?: string): string {
+    return key ?? `security:${audience}:${person.id}:${kind}:${Math.floor(at / WINDOW_MS[kind])}`;
+  }
+
+  /**
+   * Never throws: a notice that cannot be queued must not undo or fail what it is about. Returns where the email
+   * stands (sent, queued, deferred...), or null if it could not even be queued: a caller for whom the notice
+   * MATTERS (the warning before an authenticator reset) must look at it.
+   */
+  async send(person: NoticePerson, audience: 'client' | 'staff', kind: SecurityNotice, extra: { until?: number } = {}, options: { key?: string } = {}): Promise<Delivery | null> {
     const at = this.now();
+    const key = this.keyOf(person, audience, kind, at, options.key);
+    let delivery: Delivery | null = null;
     try {
-      await this.mail.enqueue(
-        mailOf({
-          to: person.email,
-          template: 'security.notice',
-          data: { name: person.name, audience, kind, at, ...extra },
-          key: `security:${audience}:${person.id}:${kind}:${Math.floor(at / WINDOW_MS[kind])}`,
-          category: 'security',
-        }),
-      );
+      delivery = await this.mail.enqueue(mailOf({ to: person.email, template: 'security.notice', data: { name: person.name, audience, kind, at, ...extra }, key, category: 'security' }));
     } catch (error) {
       this.onError(error instanceof Error ? error.message : 'security notice failed');
     }
+    // A client also sees it in the app, whatever happens to the email.
+    if (audience === 'client' && this.inApp) await this.inApp(person, kind, { at, ...extra }, key).catch((error: unknown) => this.onError(error instanceof Error ? error.message : 'security notice in the app failed'));
+    return delivery;
   }
 }

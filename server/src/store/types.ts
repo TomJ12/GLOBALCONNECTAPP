@@ -131,6 +131,9 @@ export interface PasswordResetRecord {
   expiresAt: number;
   /** Wrong second factors entered with this link. At five the link is withdrawn. */
   attempts: number;
+  /** Only on a person's LEDGER row (auth/resetLedger.ts): when links were asked for in the last hour, and which link is live. */
+  requests?: number[];
+  current?: string | null;
 }
 
 /**
@@ -147,7 +150,19 @@ export interface AuthenticatorResetRecord {
   approvedAt: number;
   /** When the credentials are cleared and the new activation link is emailed. */
   dueAt: number;
-  status: 'waiting' | 'done' | 'cancelled';
+  /**
+   * `running`: its delay has passed and it has been claimed to be carried out (a sign-in can no longer cancel it).
+   * It becomes `done` once the credentials are cleared and the new link is queued; a crash in between is finished
+   * at the next run.
+   */
+  status: 'waiting' | 'running' | 'done' | 'cancelled';
+  /**
+   * When the mail server accepted the WARNING email. The delay runs from then: until it is set, nothing is due.
+   * (A waiting row from before this existed has none: it is warned afresh and its delay starts from then.)
+   */
+  warnedAt?: number | null;
+  /** How many times the warning has had to be queued again because the mail server refused it for good. */
+  warningTries?: number;
   closedAt: number | null;
   /** Who or what cancelled it: a staff email, or "signed in". */
   closedBy: string | null;
@@ -279,6 +294,8 @@ export interface ApprovalRecord {
    * the console; it is never silently treated as done or as never approved.
    */
   status: 'pending' | 'applying' | 'approved' | 'rejected' | 'cancelled' | 'expired';
+  /** For a request whose result is an email: what had become of that email when the request was carried out (sent, queued, deferred, failed). */
+  mailed?: string;
   decidedBy: { id: string; email: string } | null;
   decidedAt: number | null;
 }
@@ -503,7 +520,14 @@ export interface MailRecord {
   category: string;
   template: string;
   body: string | null;
+  /** Which allowance it is counted against (mail/queue.ts). Rows written before classes existed have none: it is worked out from the template. */
+  class?: 'security' | 'links' | 'payments' | 'rates' | 'digest';
+  /** `suppressed`: an ordinary notification that was folded into the hourly digest instead of being sent by itself. */
   status: 'queued' | 'sending' | 'sent' | 'failed' | 'suppressed';
+  /** Set while it waits for its hourly allowance: which limit ("recipient" or "global"). It is still queued and will be sent. */
+  deferred?: string | null;
+  /** The hour (since 1970) in which it was sent: lets the allowance be counted through an index. */
+  sentHour?: number | null;
   attempts: number;
   nextAttemptAt: number;
   attemptAt: number | null;
@@ -585,7 +609,8 @@ export interface RateAlertRecord {
   triggeredRate: string | null;
 }
 
-export type NotificationCategory = 'rates' | 'approvals' | 'payments';
+/** `security` is shown in the app always and is emailed as a security notice (notify/security.ts): it is not a choice. */
+export type NotificationCategory = 'rates' | 'approvals' | 'payments' | 'security';
 
 /** One entry in a person's in-app notification list. `body` (what it says, as data for the wording in mail/templates.ts) is stored encrypted. */
 export interface NotificationRecord {
@@ -604,7 +629,7 @@ export interface NotificationRecord {
 /** Which categories a person also gets by email. Security notices are not here: they cannot be turned off. */
 export interface NotificationPrefsRecord {
   userId: string;
-  email: Record<NotificationCategory, boolean>;
+  email: Record<Exclude<NotificationCategory, 'security'>, boolean>;
   updatedAt: number;
 }
 

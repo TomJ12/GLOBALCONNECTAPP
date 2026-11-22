@@ -39,8 +39,14 @@ try {
     console.error(reasons[response.status] ?? `The server answered ${response.status}.`);
     process.exit(1);
   }
-  const sent = (await response.json()) as { sentTo: string; expiresAt: string };
-  console.log(`Activation email sent to ${sent.sentTo}`);
+  const sent = (await response.json()) as { sentTo?: string; queuedFor?: string; notSentTo?: string; email?: string; expiresAt: string };
+  // What really became of it: sent, still in the outbox (queued, or deferred by the hourly allowance), or not sent.
+  if (sent.sentTo) console.log(`Activation email sent to ${sent.sentTo}`);
+  else if (sent.queuedFor) console.log(`Activation email for ${sent.queuedFor} is in the outbox but NOT SENT YET (${sent.email}). It will be sent on its own; the ops console, Mail, shows when.`);
+  else {
+    console.error(`The activation email to ${sent.notSentTo} could NOT be sent (see the ops console, Mail).`);
+    process.exitCode = 1;
+  }
   console.log(`Expires: ${sent.expiresAt}`);
   console.log('(In development mode the email is printed in the server console.)');
 } catch {

@@ -765,7 +765,7 @@ test('four-eyes can be switched off only in explicit development mode, and then 
   h = await harness({ fourEyes: false });
   const admin = await staff();
   const reply = await admin.act('/ops/users/usr_ben/activation-link');
-  assert.equal(reply.location, '/ops/users/usr_ben?done=mailed');
+  assert.equal(reply.location, '/ops/users/usr_ben?done=mailed_sent');
   assert.deepEqual(h.outbox.sent.map((message) => message.to), [BEN]);
   // Still no link on the screen.
   assert.doesNotMatch((await admin.browser.get(reply.location)).body, LINK_OR_CODE);
@@ -942,7 +942,7 @@ test('bootstrap: the operator command creates ops admins only while fewer than t
   assert.equal((await h.adminCall('/admin/ops-admins', body, 'wrong-token-0123456789')).status, 404);
   const created = await h.adminCall('/admin/ops-admins', body);
   assert.equal(created.status, 200);
-  assert.deepEqual(Object.keys(created.json).sort(), ['expiresAt', 'sentTo']);
+  assert.deepEqual(Object.keys(created.json).sort(), ['email', 'expiresAt', 'sentTo']);
   assert.doesNotMatch(JSON.stringify(created.json), LINK_OR_CODE);
   assert.match(h.outbox.sent[0]?.text ?? '', /^[^]*http:\/\/localhost:3001\/ops\/activate#code=/);
   const firstCode = h.mailedCode('first.admin@globalconnect.example');
@@ -1552,7 +1552,7 @@ test('a change of a company\'s approval rule is written to the company as it is 
 // --- Email ------------------------------------------------------------------------------------------
 
 test('Mail page: staff see how many emails are waiting, sent, failed or held back, and which failed, without ever seeing a subject, a body, a link or a whole address', async () => {
-  h = await harness({ mailPerRecipientPerHour: 3 });
+  h = await harness();
   const { admin, second } = await pair();
   const olu = await staff('olu@globalconnect.example', 'ops');
   await h.activate(AMIRA);
@@ -1562,7 +1562,7 @@ test('Mail page: staff see how many emails are waiting, sent, failed or held bac
     if (failing) throw Object.assign(new Error(`could not deliver ${message.text}`), { code: 'ETIMEDOUT' });
     return send(message);
   };
-  // One that goes, one that fails for good, and more to one address than the limit allows.
+  // One that goes, one that fails for good, and more links to one address than its hourly allowance (6).
   await fourEyes(admin, second, '/ops/users/usr_ben/activation-link');
   failing = true;
   await fourEyes(admin, second, '/ops/users/usr_dana/activation-link');
@@ -1575,14 +1575,28 @@ test('Mail page: staff see how many emails are waiting, sent, failed or held bac
     await signIn(who.browser, who.email, who.secret);
     await who.browser.get('/ops/users');
   }
-  for (let n = 0; n < 4; n += 1) await fourEyes(admin, second, '/ops/users/usr_ben/activation-link');
+  let last = await fourEyes(admin, second, '/ops/users/usr_ben/activation-link');
+  // While it is within the allowance the console says "sent", and the audit entry says sentTo...
+  assert.match((await second.browser.get(`/ops/approvals/${last.id}`)).body, /An activation email was sent to b…@castlebrook\.example\./);
+  for (let n = 0; n < 6; n += 1) last = await fourEyes(admin, second, '/ops/users/usr_ben/activation-link');
+  // ...and the one over it is NOT called sent: the console says it is deferred, and so does the audit log.
+  const approvalPage = (await second.browser.get(`/ops/approvals/${last.id}`)).body;
+  assert.match(approvalPage, /An activation email for b…@castlebrook\.example was written to the outbox and was <strong>not sent yet \(deferred\)<\/strong>/);
+  assert.doesNotMatch(approvalPage, /An activation email was sent to/);
+  const linkEntries = (await audit('ops.client.activation_link')).filter((entry) => entry.outcome === 'success' && entry.target?.id === 'usr_ben');
+  assert.deepEqual([linkEntries[0]?.detail.email, linkEntries[0]?.detail.queuedFor, linkEntries[0]?.detail.sentTo], ['deferred', 'b…@castlebrook.example', undefined]);
+  assert.deepEqual([linkEntries[1]?.detail.email, linkEntries[1]?.detail.sentTo, linkEntries[1]?.detail.queuedFor], ['sent', 'b…@castlebrook.example', undefined]);
   const page = await olu.browser.get('/ops/mail');
   assert.equal(page.status, 200);
-  assert.match(page.body, /<dt>Waiting to be sent<\/dt><dd>0<\/dd>/);
+  assert.match(page.body, /<dt>Waiting to be sent<\/dt><dd>1 \(the oldest since [^)]+\)<\/dd>/);
+  assert.match(page.body, /<dt>Of those, deferred by an hourly allowance \(they WILL be sent\)<\/dt><dd>1<\/dd>/);
   assert.match(page.body, /<dt>Failed<\/dt><dd>1<\/dd>/);
-  assert.match(page.body, /<dt>Not sent: over a limit<\/dt><dd>1<\/dd>/);
   assert.match(page.body, /<td>d…@adviser\.example<\/td><td>activation: activation\.client<\/td><td>failed<\/td><td>6<\/td><td>ETIMEDOUT<\/td>/);
-  assert.match(page.body, /<td>b…@castlebrook\.example<\/td><td>activation: activation\.client<\/td><td>suppressed<\/td><td>0<\/td><td>recipient limit<\/td>/);
+  assert.match(page.body, /<td>b…@castlebrook\.example<\/td><td>activation: activation\.client<\/td><td>deferred: will be sent when the allowance frees<\/td><td>0<\/td><td>recipient allowance<\/td>/);
+  // An hour later it goes, by itself.
+  h.clock.advance(60 * 60_000 + 1);
+  await h.mail.pump();
+  assert.equal(linksTo(BEN).length, 8);
   assert.match(page.body, /No mail server is configured: in development mode every email is printed in the server console/);
   // Nothing of any message: no link or code, no subject, no whole address, none of the transport's own error text.
   assert.doesNotMatch(page.body, LINK_OR_CODE);
@@ -1618,7 +1632,7 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
 
   // The request and its confirmation say there is a delay, and how long.
   const page = await admin.browser.post('/ops/users/usr_amira/reset-authenticator', { verification: 'Called back on the number on file' });
-  assert.match(page.body, /Once approved, NOTHING changes for 24 hours: the client is emailed a notice at once, their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it/);
+  assert.match(page.body, /Once approved, a warning is emailed to the client and shown to them in the app\. NOTHING changes until 24 hours after the mail server has ACCEPTED that warning \(if the warning cannot be delivered, the reset waits\): their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it/);
 
   // --- 1. Approved: the client is told, nothing else happens.
   const first = await ask('usr_amira');
@@ -1628,7 +1642,7 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
   assert.equal(linksTo(AMIRA).length, 0, 'no activation link yet');
   const due = new Date(h.clock.now + 24 * HOUR_MS).toISOString().slice(0, 16).replace('T', ' ');
   assert.equal(noticesTo(AMIRA).length, 1);
-  assert.match(noticesTo(AMIRA)[0] ?? '', new RegExp(`It has NOT happened yet\\. On ${due} UTC your current password, authenticator and recovery codes will stop working`));
+  assert.match(noticesTo(AMIRA)[0] ?? '', new RegExp(`It has NOT happened yet\\. It will not happen before ${due} UTC\\. After that your current password, authenticator and recovery codes will stop working`));
   assert.match(noticesTo(AMIRA)[0] ?? '', /sign in now with your current password and authenticator code \(that cancels the reset\)/);
   assert.doesNotMatch(noticesTo(AMIRA)[0] ?? '', /https?:/);
   // Staff see it waiting, with when it takes effect; an ops admin is offered Cancel, an ops user is not.
@@ -1695,12 +1709,17 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
   const realMutate = h.stores.auth.authenticatorResets.mutate.bind(h.stores.auth.authenticatorResets);
   let crash = true;
   h.stores.auth.authenticatorResets.mutate = (async (key: string, change: any, auditOf: any) => {
-    if (crash) throw new Error('the process stopped here');
-    return realMutate(key, change, auditOf);
+    // The process stops at the last step: the reset has been claimed, the credentials cleared and the link queued, but it is not yet marked done.
+    return realMutate(key, (current: any) => {
+      const next = change(current);
+      if (crash && next?.status === 'done') throw new Error('the process stopped here');
+      return next;
+    }, auditOf);
   }) as typeof realMutate;
   await assert.rejects(h.authenticatorResets.runDue());
   crash = false;
-  assert.equal((await h.authenticatorResets.waiting()).length, 1);
+  assert.deepEqual((await h.authenticatorResets.waiting()).map((item) => item.status), ['running']);
+  assert.equal((await h.stores.directory.getUser('usr_amira'))?.activatedAt, null);
   assert.equal(await h.authenticatorResets.runDue(), 1);
   assert.equal((await h.stores.directory.getUser('usr_amira'))?.activatedAt, null);
   // The first link (from before the crash) was replaced by the second: one link works.

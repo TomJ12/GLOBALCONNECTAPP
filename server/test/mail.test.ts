@@ -4,9 +4,9 @@ import { afterEach, test } from 'node:test';
 
 import { loadConfig } from '../src/config';
 import { ConsoleOutbox } from '../src/mailer';
-import { MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue } from '../src/mail/queue';
+import { LINKS_PER_RECIPIENT, MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue, SECURITY_PER_RECIPIENT } from '../src/mail/queue';
 import { SmtpMailer, failureCode } from '../src/mail/smtp';
-import { activationMail, MAIL_FOOTER, NOTIFICATIONS, notificationText, render, SECURITY_NOTICES, TEMPLATES, type NotificationKind, type TemplateName } from '../src/mail/templates';
+import { activationMail, mailOf, MAIL_FOOTER, NOTIFICATIONS, notificationText, render, SECURITY_NOTICES, TEMPLATES, type NotificationKind, type TemplateName } from '../src/mail/templates';
 import { createRuntime } from '../src/startup';
 import { harness, type Harness } from './helpers';
 import { FakeSmtp } from './support/smtp';
@@ -27,6 +27,7 @@ const settings = (port: number, extra: Record<string, string> = {}) => loadConfi
 
 const PAYMENT_NOTE = { amount: '125.00', currency: 'GBP', payee: 'Harbour Freight Ltd', createdBy: 'Amira Shah', expiresAt: 86_400_000, by: 'Dana Okafor', reason: 'Wrong invoice' };
 const ALERT_NOTE = { base: 'GBP', quote: 'USD', side: 'sell' as const, target: '1.2940', rate: '1.2950', at: 0 };
+const noteFor = (kind: NotificationKind): unknown => (kind === 'rate_alert' ? ALERT_NOTE : kind === 'security_notice' ? { kind: 'authenticator_reset_requested', at: 0, until: 86_400_000 } : PAYMENT_NOTE);
 /** One of each template, with values that would be embarrassing in a subject line. Adding a template without adding it here does not compile. */
 const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'activation.client': { name: 'Amira Shah', link: LINK, expiresAt: 0 },
@@ -35,12 +36,13 @@ const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'reset.staff': { name: 'Amira Shah', link: `${OPS}/ops/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
   'security.notice': { name: 'Amira Shah', audience: 'client', kind: 'password_changed', at: 0 },
   notification: { name: 'Amira Shah', kind: 'payment_awaiting', note: PAYMENT_NOTE },
+  'notification.digest': {},
 };
 /** Every variant of every template: each security notice is its own wording. */
 const VARIANTS: [TemplateName, unknown][] = (Object.keys(TEMPLATES) as TemplateName[]).flatMap((name): [TemplateName, unknown][] =>
   name === 'security.notice' ? (Object.keys(SECURITY_NOTICES) as (keyof typeof SECURITY_NOTICES)[]).flatMap((kind) => (['client', 'staff'] as const).map((audience): [TemplateName, unknown] => [name, { name: 'Amira Shah', audience, kind, at: 0, until: 86_400_000 }]))
     : name === 'notification'
-      ? (Object.keys(NOTIFICATIONS) as NotificationKind[]).map((kind): [TemplateName, unknown] => [name, { name: 'Amira Shah', kind, note: kind === 'rate_alert' ? ALERT_NOTE : PAYMENT_NOTE }])
+      ? (Object.keys(NOTIFICATIONS) as NotificationKind[]).map((kind): [TemplateName, unknown] => [name, { name: 'Amira Shah', kind, note: noteFor(kind) }])
       : [[name, SAMPLES[name]]],
 );
 
@@ -95,7 +97,7 @@ test('templates: every message has a harmless subject, the same lines as text an
   assert.match(alert, /Your rate to sell GBP for USD reached 1\.2950 when we checked at 1970-01-01 00:00 UTC\. Your alert was set at 1\.2940 or better\.\nThis rate is indicative: it is not held for you and it may have moved since\./);
   assert.match(render('notification', { name: 'A', kind: 'rate_alert', note: { ...ALERT_NOTE, side: 'buy' } }, [APP, OPS]).text, /Your rate to buy GBP with USD reached/);
   for (const kind of Object.keys(NOTIFICATIONS) as NotificationKind[]) {
-    const { title, lines } = notificationText(kind, kind === 'rate_alert' ? ALERT_NOTE : PAYMENT_NOTE);
+    const { title, lines } = notificationText(kind, noteFor(kind));
     const words = [title, ...lines].join(' ');
     assert.doesNotMatch(words, /sort code|account number|IBAN|SWIFT|BIC|guarantee|will arrive|within \d|mid-market|margin/i, kind);
     assert.ok(title.length <= 80 && !/[\r\n]/.test(words), kind);
@@ -169,14 +171,14 @@ test('outbox: the request only writes; a mail-server hiccup loses nothing and se
 
   // The mail server answers "try later": the request is not failed, the message waits.
   smtp.fault = 'reject';
-  assert.equal(await queue.enqueue(request(1)), 'queued');
+  assert.deepEqual(await queue.enqueue(request(1)), { duplicate: false, state: 'queued', sentAt: null });
   await queue.pump();
   assert.deepEqual((await rows()).map((row) => [row.status, row.attempts, row.lastError]), [['queued', 1, 'EMESSAGE 451']]);
   // The body is in the database only encrypted, and never in the audit log.
   const raw = JSON.stringify(h.stores.db.all('SELECT data FROM mail_outbox'));
   assert.ok(!raw.includes('ABCDE-FGHIJ') && !raw.includes('Amira Shah') && raw.includes('gcm1:'));
   // Asked for again (a retried request, a resumed approval): still one message.
-  assert.equal(await queue.enqueue(request(1)), 'duplicate');
+  assert.equal((await queue.enqueue(request(1))).duplicate, true);
   assert.equal((await rows()).length, 1);
   // Not before its time...
   await queue.pump();
@@ -235,32 +237,89 @@ test('outbox: the request only writes; a mail-server hiccup loses nothing and se
   assert.deepEqual(errors, []);
 });
 
-test('outbox: no more than a few messages an hour for one address, and a ceiling for everyone together; what is held back is recorded, not sent', async () => {
+/** An ordinary notification email (payments class) and a security notice, for the allowance tests. */
+const noteMail = (n: number, to = 'victim@northfield.example', category: 'payments' | 'rates' = 'payments') => mailOf({ to, template: 'notification', data: { name: 'V', kind: category === 'rates' ? 'rate_alert' : 'payment_awaiting', note: category === 'rates' ? ALERT_NOTE : PAYMENT_NOTE }, key: `note:${category}:${to}:${n}`, category });
+const securityMail = (n: number, to = 'victim@northfield.example') => mailOf({ to, template: 'security.notice', data: { name: 'V', audience: 'client', kind: 'password_changed', at: n }, key: `sec:${to}:${n}`, category: 'security' });
+
+test('outbox: each class of email has its own hourly allowance; ordinary notifications can never hold back security mail or links; nothing over an allowance is dropped', async () => {
   h = await harness();
   const outbox = new ConsoleOutbox(() => {});
-  const queue = queueOf(outbox, { delivery: 'inline' });
-  const results: string[] = [];
-  for (let n = 0; n < 7; n += 1) results.push(await queue.enqueue(request(n, 'victim@northfield.example')));
-  assert.deepEqual(results, ['queued', 'queued', 'queued', 'queued', 'queued', 'suppressed', 'suppressed']);
-  assert.equal(outbox.sent.length, 5);
-  // Someone else still gets theirs, until the ceiling for everyone is reached.
-  const others: string[] = [];
-  for (let n = 0; n < 9; n += 1) others.push(await queue.enqueue(request(100 + n, `person${n}@northfield.example`)));
-  assert.deepEqual(others, ['queued', 'queued', 'queued', 'queued', 'queued', 'queued', 'queued', 'suppressed', 'suppressed']);
-  assert.equal(outbox.sent.length, 12);
-  // What was held back is on record: which limit, never the content.
-  const suppressed = await h.stores.audit.query({ action: 'system.mail.suppressed' });
-  assert.deepEqual(suppressed.map((entry) => entry.detail.limit).sort(), ['global', 'global', 'recipient', 'recipient']);
-  assert.ok((await rows()).filter((row) => row.status === 'suppressed').every((row) => row.body === null));
-  // The limits are counted from the outbox itself: a restart does not reset them, an hour does.
+  const queue = queueOf(outbox, { delivery: 'inline' }); // ordinary allowance: 5 an hour to one address, 12 overall
+  const to = (address: string, subject: RegExp) => outbox.sent.filter((message) => message.to === address && subject.test(message.subject)).length;
+  assert.deepEqual([queue.allowance('payments'), queue.allowance('rates'), queue.allowance('security'), queue.allowance('links'), queue.allowance('digest')], [{ recipient: 5, global: 12 }, { recipient: 2, global: 6 }, { recipient: SECURITY_PER_RECIPIENT, global: 12 }, { recipient: LINKS_PER_RECIPIENT, global: 12 }, { recipient: 1, global: 12 }]);
+
+  // A FLOOD of ordinary notifications to one address: five are sent; the rest are folded into ONE digest for the hour.
+  const flood = [];
+  for (let n = 0; n < 9; n += 1) flood.push((await queue.enqueue(noteMail(n))).state);
+  assert.deepEqual(flood, ['sent', 'sent', 'sent', 'sent', 'sent', 'digest', 'digest', 'digest', 'digest']);
+  assert.equal(to('victim@northfield.example', /waiting for your approval/), 5);
+  assert.equal(to('victim@northfield.example', /^More notifications are waiting for you in Global Connect$/), 1);
+  assert.deepEqual((await rows()).filter((row) => row.status === 'suppressed').map((row) => [row.body, row.lastError]), Array.from({ length: 4 }, () => [null, 'in digest']));
+  assert.equal((await h.stores.audit.query({ action: 'system.mail.digest' })).length, 4);
+
+  // The address that was flooded STILL gets its security notices and its links, at once: they are counted apart.
+  for (let n = 0; n < 3; n += 1) assert.deepEqual(await queue.enqueue(securityMail(n)), { duplicate: false, state: 'sent', sentAt: h.clock.now });
+  assert.equal((await queue.enqueue(request(1, 'victim@northfield.example'))).state, 'sent');
+  assert.equal(to('victim@northfield.example', /^Security notice/), 3);
+  assert.equal(to('victim@northfield.example', /^Activate/), 1);
+
+  // The OVERALL allowance of ordinary notifications (12) is used up by other people's (the last two of these already wait)...
+  for (let n = 0; n < 9; n += 1) await queue.enqueue(noteMail(n, `person${n}@northfield.example`));
+  const sentBefore = outbox.sent.length;
+  // ...so a further ordinary notification waits (deferred, not dropped, and no digest: that is for one address's own flood)...
+  assert.deepEqual(await queue.enqueue(noteMail(50, 'late@northfield.example')), { duplicate: false, state: 'deferred', sentAt: null });
+  assert.equal(outbox.sent.length, sentBefore);
+  // ...while security mail and links for anybody go straight out.
+  assert.equal((await queue.enqueue(securityMail(9, 'late@northfield.example'))).state, 'sent');
+  assert.equal((await queue.enqueue(request(2, 'late@northfield.example'))).state, 'sent');
+  // The same key again: nothing new, and the answer says where the first one stands.
+  assert.deepEqual(await queue.enqueue(noteMail(50, 'late@northfield.example')), { duplicate: true, state: 'deferred', sentAt: null });
+  assert.deepEqual(await queue.delivery('note:payments:late@northfield.example:50'), { duplicate: true, state: 'deferred', sentAt: null });
+  assert.equal(await queue.delivery('never-queued'), null);
+
+  // LINKS over their own allowance (6 an hour to one address) are DEFERRED, in the outbox with their body, and on record.
+  const links = [];
+  for (let n = 10; n < 18; n += 1) links.push((await queue.enqueue(request(n, 'victim@northfield.example'))).state);
+  assert.deepEqual(links, ['sent', 'sent', 'sent', 'sent', 'sent', 'deferred', 'deferred', 'deferred']);
+  const waiting = (await rows()).filter((row) => row.deferred);
+  assert.deepEqual(waiting.map((row) => [row.status, row.deferred, typeof row.body, row.attempts]).sort(), [['queued', 'global', 'string', 0], ['queued', 'global', 'string', 0], ['queued', 'global', 'string', 0], ['queued', 'recipient', 'string', 0], ['queued', 'recipient', 'string', 0], ['queued', 'recipient', 'string', 0]]);
+  const deferred = await h.stores.audit.query({ action: 'system.mail.deferred' });
+  assert.deepEqual(deferred.map((entry) => [entry.detail.class, entry.detail.limit]).sort(), [['links', 'recipient'], ['links', 'recipient'], ['links', 'recipient'], ['payments', 'global'], ['payments', 'global'], ['payments', 'global']]);
+  assert.equal((await queue.summary()).deferred, 6);
+  // Looked at again and again within the hour: still waiting, recorded once each, nothing sent, nothing lost.
+  for (let n = 0; n < 3; n += 1) {
+    h.clock.advance(61_000);
+    await queue.pump();
+  }
+  assert.equal((await h.stores.audit.query({ action: 'system.mail.deferred' })).length, 6);
+  assert.equal(to('victim@northfield.example', /^Activate/), 6);
+  // The allowance is counted from the outbox itself: a restart does not reset it...
   const restarted = queueOf(outbox, { delivery: 'inline' });
-  assert.equal(await restarted.enqueue(request(200, 'victim@northfield.example')), 'suppressed');
-  h.clock.advance(60 * 60_000 + 1);
-  assert.equal(await restarted.enqueue(request(201, 'victim@northfield.example')), 'queued');
+  await restarted.recover();
+  await restarted.pump();
+  assert.equal(to('victim@northfield.example', /^Activate/), 6);
+  // ...an hour does: everything that waited is SENT.
+  h.clock.advance(60 * 60_000);
+  await restarted.pump();
+  assert.equal(to('victim@northfield.example', /^Activate/), 9);
+  assert.equal(to('late@northfield.example', /waiting for your approval/), 1);
+  assert.equal((await rows()).filter((row) => row.status === 'queued').length, 0);
+  assert.equal((await queue.summary()).deferred, 0);
+
+  // A message that cannot be written out (a template refuses what it was given) is not lost silently: failed, on record, and the caller is told.
+  const errors: string[] = [];
+  const strict = queueOf(outbox, { delivery: 'inline', onError: (message) => void errors.push(message) });
+  assert.deepEqual(await strict.enqueue(activationMail({ activationLink: 'https://evil.example/activate#code=X', expiresAt: 0 }, 'x@northfield.example', 'X', 'client')), { duplicate: false, state: 'failed', sentAt: null });
+  assert.equal(errors.length, 1);
+  assert.deepEqual((await rows()).filter((row) => row.lastError === 'could not be rendered').map((row) => [row.status, row.body]), [['failed', null]]);
+  assert.equal((await h.stores.audit.query({ action: 'system.mail.failed' })).filter((entry) => entry.detail.error === 'render').length, 1);
+  assert.equal((await strict.summary()).problems.some((item) => item.lastError === 'could not be rendered'), true);
+
   // Old finished messages are cleared away; nothing waiting ever is.
   await restarted.sweep();
   assert.ok((await rows()).length > 0);
   h.clock.advance(31 * 24 * 60 * 60_000);
+  await queue.enqueue(noteMail(999, 'fresh@northfield.example'));
   await restarted.sweep();
-  assert.equal((await rows()).length, 0);
+  assert.deepEqual((await rows()).map((row) => row.to), ['fresh@northfield.example']);
 });

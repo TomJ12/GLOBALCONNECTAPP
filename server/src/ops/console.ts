@@ -52,6 +52,7 @@ import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from '.
 import { h, Html, layout, qrSvg, when } from './html';
 import { currencyDecimals } from '@/lib/money';
 import { checkMarginConfig, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
+import { DELIVERY_WORDS, mailedDetail } from '../mail/queue';
 import { marginConfigOf, type ClientRates } from '../rates/service';
 import type { Notifier } from '../notify/notifier';
 import type { RateAlerts } from '../alerts/service';
@@ -705,8 +706,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         revoked: 'Sessions revoked.',
         disabled: 'Disabled.',
         enabled: 'Re-enabled.',
-        mailed: 'An activation email was sent to the address on file. The link is not shown to staff.',
+        // What REALLY became of the email, not what was hoped: sent, still in the outbox, or not sent.
+        mailed_sent: 'An activation email was sent to the address on file. The link is not shown to staff.',
+        mailed_queued: 'An activation email is QUEUED for the address on file and will be sent shortly. It has not been sent yet: the Mail page shows when it has. The link is not shown to staff.',
+        mailed_deferred: 'An activation email is in the outbox but DEFERRED: that address, or the server, has had its hourly allowance of this kind of email. It will be sent when the allowance frees; the Mail page shows it. The link is not shown to staff.',
+        mailed_failed: 'The activation email could NOT be sent (see the Mail page). Nothing was emailed. Issue the link again.',
+        mailed_digest: 'An activation email is in the outbox (see the Mail page).',
         reset_scheduled: 'The authenticator reset is approved and waiting out its delay. Nothing has changed yet; the client has been told by email, and can cancel it by signing in.',
+        reset_unwarned: 'The authenticator reset is approved, but its WARNING to the client has not been delivered yet (see the Mail page). Nothing has changed, and the delay does not start until the mail server has accepted the warning.',
         reset_cancelled: 'The authenticator reset was cancelled. Nothing was changed.',
         requested: 'Request created. Nothing has changed yet: a different staff member must approve it.',
         approved: 'Approved and carried out.',
@@ -759,13 +766,13 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       /** Emails a new activation link to the address on file. The link itself never reaches the console. */
       const mailClientLink = async (user: UserRecord): Promise<Record<string, string>> => {
         const invite = await auth.createInvite(user.email);
-        await mail.enqueue(activationMail(invite, user.email, user.name, 'client'));
-        return { sentTo: maskEmail(user.email), expires: when(invite.expiresAt) };
+        const delivery = await mail.enqueue(activationMail(invite, user.email, user.name, 'client'));
+        return { ...mailedDetail(maskEmail(user.email), delivery), expires: when(invite.expiresAt) };
       };
       const mailStaffLink = async (user: OpsUserRecord): Promise<Record<string, string>> => {
         const invite = await opsAuth.createInvite(user.id);
-        await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
-        return { sentTo: maskEmail(user.email), expires: when(invite.expiresAt) };
+        const delivery = await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
+        return { ...mailedDetail(maskEmail(user.email), delivery), expires: when(invite.expiresAt) };
       };
 
       ops.get('/', async (_request, reply) => reply.redirect('/ops/users', 303));
@@ -854,7 +861,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const target = applied.target ?? item.target;
         const done = await stores.ops.approvals.mutate(
           item.id,
-          (current) => (current && current.status === 'applying' ? { ...current, status: 'approved' } : undefined),
+          (current) => (current && current.status === 'applying' ? { ...current, status: 'approved', ...(applied.detail?.email ? { mailed: applied.detail.email } : {}) } : undefined),
           (stored) =>
             stored?.status === 'approved'
               ? [entryOf(opsParty(requester), `ops.${def.name}`, target, source, { ...applied.detail, ...both }), entryOf(opsParty(approver), 'ops.approval.approve', target, source, { ...both, action: def.name, ...(resuming ? { resumed: 'yes' } : {}) })]
@@ -878,12 +885,12 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           h`<tr><td><a href="/ops/approvals/${item.id}">${item.summary}</a></td><td>${item.requestedBy.email}</td><td>${when(item.requestedAt)}</td><td>${statusTag(item)}</td><td>${item.status === 'pending' ? `expires ${when(item.expiresAt)}` : item.decidedBy ? `${item.decidedBy.email}, ${when(item.decidedAt)}` : when(item.decidedAt)}</td></tr>`;
         const pending = all.filter((item) => item.status === 'pending');
         const interrupted = all.filter((item) => item.status === 'applying' && !carrying.has(item.id));
-        const resets = (await authenticatorResets.waiting()).sort((a, b) => a.dueAt - b.dueAt);
+        const resets = (await authenticatorResets.waitingWithWarning()).sort((a, b) => a.dueAt - b.dueAt);
         const people = new Map(await Promise.all(resets.map(async (item) => [item.userId, await stores.directory.getUser(item.userId)] as const)));
         const resetsCard =
           resets.length > 0
             ? h`<div class="card"><h2>Authenticator resets waiting out their delay</h2><p class="muted">Approved, and nothing has changed yet. Each takes effect at the time shown unless the client signs in with their current credentials first, or an ops admin cancels it.</p><table><tr><th>Client</th><th>Requested by</th><th>Approved by</th><th>Takes effect</th><th></th></tr>${resets.map(
-                (item) => h`<tr><td><a href="/ops/users/${item.userId}">${people.get(item.userId)?.name ?? item.userId}</a></td><td>${item.requestedBy}</td><td>${item.approvedBy}</td><td>${when(item.dueAt)}</td><td>${ctx.user.role === 'ops_admin' ? form(ctx, `/ops/authenticator-resets/${item.id}/cancel`, h``, 'Cancel reset') : h`<span class="muted">an ops admin can cancel</span>`}</td></tr>`,
+                (item) => h`<tr><td><a href="/ops/users/${item.userId}">${people.get(item.userId)?.name ?? item.userId}</a></td><td>${item.requestedBy}</td><td>${item.approvedBy}</td><td>${item.warning === 'sent' ? when(item.dueAt) : h`<strong>not yet: the warning has not been delivered (${item.warning})</strong>`}</td><td>${ctx.user.role === 'ops_admin' ? form(ctx, `/ops/authenticator-resets/${item.id}/cancel`, h``, 'Cancel reset') : h`<span class="muted">an ops admin can cancel</span>`}</td></tr>`,
               )}</table></div>`
             : '';
         return send(
@@ -912,7 +919,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             h`<div class="grid"><div class="card"><h2>${item.summary} ${statusTag(item)}</h2>${item.warnings.map((warning) => h`<p class="warn">${warning}</p>`)}<dl><dt>Action</dt><dd>${item.action}</dd><dt>About</dt><dd>${item.target?.label ?? ''}</dd><dt>Requested by</dt><dd>${item.requestedBy.email}, ${when(item.requestedAt)}</dd><dt>Expires</dt><dd>${when(item.expiresAt)}</dd>${
               item.decidedBy && h`<dt>Decided by</dt><dd>${item.decidedBy.email}, ${when(item.decidedAt)}</dd>`
             }${Object.entries(item.params).map(([key, value]) => h`<dt>${key}</dt><dd>${value}</dd>`)}</dl>${
-              item.status === 'approved' && def?.mails && item.target && h`<p class="flash">An activation email was sent to ${maskEmail(item.target.label)}. The link is not shown to staff.</p>`
+              // What REALLY became of the email when the request was carried out (and where it stands now is on the Mail page).
+              item.status === 'approved' && def?.mails && item.target && h`<p class="flash">${item.mailed === 'sent' ? h`An activation email was sent to ${maskEmail(item.target.label)}.` : item.mailed === 'failed' ? h`<strong>The activation email to ${maskEmail(item.target.label)} could NOT be sent.</strong> Issue the link again.` : item.mailed ? h`An activation email for ${maskEmail(item.target.label)} was written to the outbox and was <strong>not sent yet (${item.mailed})</strong> when this was carried out. The Mail page shows whether it has gone since.` : h`An activation email for ${maskEmail(item.target.label)} was written to the outbox. The Mail page shows whether it has been sent.`} The link is not shown to staff.</p>`
             }</div>
 <div>${
               item.status === 'applying'
@@ -1574,9 +1582,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const alertCounts = await alerts.countsOf(user.id);
         const nameOf = (companyId: string) => companies.find((company) => company.id === companyId)?.name ?? companyId;
         const free = companies.filter((company) => !company.deactivatedAt && !memberships.some((item) => item.companyId === company.id));
-        const pendingReset = (await stores.auth.authenticatorResets.list({ userId: user.id, status: 'waiting' }))[0];
+        const pendingReset = (await authenticatorResets.waitingWithWarning()).find((item) => item.userId === user.id);
         const pendingResetCard = pendingReset
-          ? h`<div class="card"><h2>Authenticator reset waiting</h2><p class="warn">Approved by ${pendingReset.approvedBy} on ${when(pendingReset.approvedAt)}. Nothing has changed yet. It takes effect on ${when(pendingReset.dueAt)} unless this person signs in with their current credentials first, or an ops admin cancels it.</p>${ctx.user.role === 'ops_admin' ? form(ctx, `/ops/authenticator-resets/${pendingReset.id}/cancel`, h``, 'Cancel reset') : ''}</div>`
+          ? h`<div class="card"><h2>Authenticator reset waiting</h2><p class="warn">Approved by ${pendingReset.approvedBy} on ${when(pendingReset.approvedAt)}. Nothing has changed yet. ${pendingReset.warning === 'sent' ? h`The warning reached the mail server on ${when(pendingReset.warnedAt ?? null)}; it takes effect on ${when(pendingReset.dueAt)}` : h`<strong>The warning to the client has NOT been delivered yet (${DELIVERY_WORDS[pendingReset.warning as keyof typeof DELIVERY_WORDS] ?? pendingReset.warning}).</strong> The delay does not start until it has been, so this will not take effect before then`} unless this person signs in with their current credentials first, or an ops admin cancels it.</p>${ctx.user.role === 'ops_admin' ? form(ctx, `/ops/authenticator-resets/${pendingReset.id}/cancel`, h``, 'Cancel reset') : ''}</div>`
           : '';
         // Status only. No credential of the person is read into this page.
         return send(
@@ -1660,7 +1668,8 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         },
         async apply(params) {
           const user = await linkable(params.id);
-          return { target: clientParty(user), detail: await mailClientLink(user), redirect: `/ops/users/${user.id}?done=mailed` };
+          const mailed = await mailClientLink(user);
+          return { target: clientParty(user), detail: mailed, redirect: `/ops/users/${user.id}?done=mailed_${mailed.email}` };
         },
       });
       const resettable = async (id: string | undefined): Promise<UserRecord> => {
@@ -1701,7 +1710,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             warnings: [
               `Removes their password, authenticator and recovery codes, ends ${sessions === 1 ? 'their 1 active session' : `their ${sessions} active sessions`}, and emails a new activation link to ${maskEmail(user.email)}. Whoever reads that mailbox gets the account.`,
               config.authenticatorResetDelayMs > 0
-                ? `Once approved, NOTHING changes for ${delayText}: the client is emailed a notice at once, their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it. Only after ${delayText} are the credentials cleared and the link sent.`
+                ? `Once approved, a warning is emailed to the client and shown to them in the app. NOTHING changes until ${delayText} after the mail server has ACCEPTED that warning (if the warning cannot be delivered, the reset waits): their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it. Only then are the credentials cleared and the link sent.`
                 : 'THE DELAY IS SWITCHED OFF (AUTHENTICATOR_RESET_DELAY_HOURS=0, development only): the reset happens as soon as it is approved.',
               `How their identity was verified: “${identityVerification}”. Check this before approving.`,
             ],
@@ -1716,8 +1725,9 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
           const reset = await authenticatorResets.schedule(user, { id: requestId ?? `direct_${randomToken().slice(0, 12)}`, requestedBy: requester.email, approvedBy: (approver ?? requester).email }, source);
           return {
             target: clientParty(user),
-            detail: { identityVerification: params.identityVerification ?? '', reset: reset.id, status: reset.status, takesEffect: when(reset.dueAt), noticeTo: maskEmail(user.email) },
-            redirect: `/ops/users/${user.id}?done=${reset.status === 'done' ? 'mailed' : 'reset_scheduled'}`,
+            // The warning: what became of it, honestly. The delay runs only from when the mail server accepted it.
+            detail: { identityVerification: params.identityVerification ?? '', reset: reset.id, status: reset.status, ...(reset.status === 'waiting' ? ((reset.warnedAt ?? null) !== null ? { warningSentTo: maskEmail(user.email), takesEffect: when(reset.dueAt) } : { warningQueuedFor: maskEmail(user.email), takesEffect: 'not before the warning has been delivered' }) : {}) },
+            redirect: `/ops/users/${user.id}?done=${reset.status === 'done' ? 'mailed_sent' : (reset.warnedAt ?? null) !== null ? 'reset_scheduled' : 'reset_unwarned'}`,
           };
         },
       });
@@ -1767,16 +1777,16 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
       // The outbox, as numbers and as a list of what did not go: who it was for (masked), what kind of message, how
       // often it was tried and a short error code. Never a subject, a body or a link.
       page('/mail', {}, async (ctx, _request, reply) => {
-        const { counts, oldestQueuedAt, problems } = await mail.summary();
+        const { counts, deferred, oldestQueuedAt, problems } = await mail.summary();
         return send(
           reply,
           200,
           layout(
             chromeOf(ctx, 'Mail'),
-            h`<div class="card"><h2>Outbox</h2><dl><dt>Waiting to be sent</dt><dd>${String(counts.queued + counts.sending)}${oldestQueuedAt !== null ? h` (the oldest since ${when(oldestQueuedAt)})` : ''}</dd><dt>Sent</dt><dd>${String(counts.sent)}</dd><dt>Failed</dt><dd>${String(counts.failed)}</dd><dt>Not sent: over a limit</dt><dd>${String(counts.suppressed)}</dd></dl>
-<p class="muted">${config.smtp ? h`Email is sent through the mail server ${config.smtp.host}.` : 'No mail server is configured: in development mode every email is printed in the server console instead.'} A message that cannot be sent is tried again ${String(MAIL_MAX_ATTEMPTS - 1)} more times over about four and a half hours, then marked failed. At most ${String(config.mailPerRecipientPerHour)} messages an hour are queued for one address, and ${String(config.mailGlobalPerHour)} for everyone together. Sent messages are counted for 30 days.</p></div>
-<div class="card"><h2>Not delivered</h2><table><tr><th>Queued</th><th>To</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Error</th></tr>${problems.map(
-              (item) => h`<tr><td>${when(item.createdAt)}</td><td>${maskEmail(item.to)}</td><td>${item.category}: ${item.template}</td><td>${item.status === 'queued' ? 'waiting to be tried again' : item.status}</td><td>${String(item.attempts)}</td><td>${item.lastError ?? ''}</td></tr>`,
+            h`<div class="card"><h2>Outbox</h2><dl><dt>Waiting to be sent</dt><dd>${String(counts.queued + counts.sending)}${oldestQueuedAt !== null ? h` (the oldest since ${when(oldestQueuedAt)})` : ''}</dd><dt>Sent</dt><dd>${String(counts.sent)}</dd><dt>Of those, deferred by an hourly allowance (they WILL be sent)</dt><dd>${String(deferred)}</dd><dt>Failed</dt><dd>${String(counts.failed)}</dd><dt>Ordinary notifications folded into a digest instead of being sent one by one</dt><dd>${String(counts.suppressed)}</dd></dl>
+<p class="muted">${config.smtp ? h`Email is sent through the mail server ${config.smtp.host}.` : 'No mail server is configured: in development mode every email is printed in the server console instead.'} A message that cannot be sent is tried again ${String(MAIL_MAX_ATTEMPTS - 1)} more times over about four and a half hours, then marked failed. Each kind of email has its own hourly allowance, so one kind can never hold back another: security notices (${String(mail.allowance('security').recipient)} an hour to one address) and activation and reset links (${String(mail.allowance('links').recipient)}) are counted apart from payment notifications (${String(mail.allowance('payments').recipient)}) and rate alerts (${String(mail.allowance('rates').recipient)}); overall, ${String(config.mailGlobalPerHour)} an hour of each. A message over its allowance is deferred and sent when the allowance frees, never dropped; ordinary notifications beyond one address’s allowance are folded into one digest email an hour (they are all in the app). Sent messages are counted for 30 days.</p></div>
+<div class="card"><h2>Not delivered, or not yet</h2><table><tr><th>Queued</th><th>To</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Error</th></tr>${problems.map(
+              (item) => h`<tr><td>${when(item.createdAt)}</td><td>${maskEmail(item.to)}</td><td>${item.category}: ${item.template}</td><td>${item.state === 'deferred' ? 'deferred: will be sent when the allowance frees' : item.state === 'digest' ? 'folded into a digest' : item.status === 'queued' ? 'waiting to be tried again' : item.status}</td><td>${String(item.attempts)}</td><td>${item.lastError ?? ''}</td></tr>`,
             )}</table>${problems.length === 0 && h`<p class="muted">Nothing has failed or been held back.</p>`}<p class="muted">The content of a message is never shown here. An activation link that failed can be issued again from the person’s page.</p></div>`,
           ),
         );
@@ -1844,12 +1854,16 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         async apply(params, { requester, approver, source, requestId }) {
           // Carried out before and interrupted after the account was made: the account is this request's, the email is sent again.
           const begun = requestId ? await stores.ops.users.findByEmail(needEmail(params)) : null;
-          if (begun && begun.activatedAt === null && !begun.disabledAt && begun.name === params.name && begun.role === params.role) return { target: opsParty(begun), detail: { role: begun.role, ...(await mailStaffLink(begun)) }, redirect: `/ops/staff/${begun.id}?done=mailed` };
+          if (begun && begun.activatedAt === null && !begun.disabledAt && begun.name === params.name && begun.role === params.role) {
+            const mailed = await mailStaffLink(begun);
+            return { target: opsParty(begun), detail: { role: begun.role, ...mailed }, redirect: `/ops/staff/${begun.id}?done=mailed_${mailed.email}` };
+          }
           const { name, email, role } = await newStaffOf(params);
           const user = await opsAuth.createUser(email, name, role);
           // On its own line in the audit log, where it is looked for: somebody new can now act as staff.
           await append(opsParty(requester), 'ops.staff.new', 'success', opsParty(user), source, { role, requestedBy: requester.email, approvedBy: approver?.email ?? '(four-eyes off)', how: 'console invite' });
-          return { target: opsParty(user), detail: { role, ...(await mailStaffLink(user)) }, redirect: `/ops/staff/${user.id}?done=mailed` };
+          const mailed = await mailStaffLink(user);
+          return { target: opsParty(user), detail: { role, ...mailed }, redirect: `/ops/staff/${user.id}?done=mailed_${mailed.email}` };
         },
       });
       page('/staff/:id', { admin: true }, async (ctx, request, reply) => {
@@ -1898,7 +1912,7 @@ ${
             const user = await staffOf(params.id);
             await check(user, params, actors.requester.id, true);
             const detail = await run(user, params, actors);
-            return { target: opsParty(user), detail: detail ?? {}, redirect: `/ops/staff/${user.id}?done=${options.flash}` };
+            return { target: opsParty(user), detail: detail ?? {}, redirect: `/ops/staff/${user.id}?done=${options.flash === 'mailed' ? `mailed_${detail?.email ?? 'queued'}` : options.flash}` };
           },
         });
       staffAction(

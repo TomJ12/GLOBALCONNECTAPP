@@ -263,7 +263,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const opsPasswordResets = new SqlTable<PasswordResetRecord>(db, 'ops_password_resets', { indexed: ['userId'] });
   const authenticatorResets = new SqlTable<AuthenticatorResetRecord>(db, 'authenticator_resets', { indexed: ['userId', 'status'], audit });
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
-  const mail = new SqlTable<MailRecord>(db, 'mail_outbox', { indexed: ['status'], secret: { field: 'body', keys } });
+  const mail = new SqlTable<MailRecord>(db, 'mail_outbox', { indexed: ['status', 'to', 'sentHour'], secret: { field: 'body', keys } });
   const alerts = new SqlTable<RateAlertRecord>(db, 'rate_alerts', { indexed: ['userId', 'status'], audit });
   const notifications = new SqlTable<NotificationRecord>(db, 'notifications', { indexed: ['userId'], secret: { field: 'body', keys }, audit });
   const notificationPrefs = new SqlTable<NotificationPrefsRecord>(db, 'notification_prefs', { audit });

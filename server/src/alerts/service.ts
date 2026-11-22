@@ -9,6 +9,7 @@
  *   buy   fires when the client's buy rate is at or BELOW the target
  *
  * IT FIRES ONCE. A fired alert is `triggered` and is not looked at again until its owner turns it on again.
+ * It is marked as fired ONLY once its notification exists; if the notification was held back, it is tried again.
  * Checking again after a restart cannot fire it twice: the notification is made under a key of the alert and the
  * moment it was last turned on (notify/notifier.ts makes one notification per key), and only then is the alert
  * marked triggered; a crash in between repeats the first step, which then does nothing.
@@ -27,7 +28,7 @@ import { ApiError } from '../errors';
 import type { ProviderAdapter } from '../providers/adapter';
 import type { MarginConfig } from '../rates/margin';
 import type { ClientRates } from '../rates/service';
-import type { AuditInput, CompanyRecord, RateAlertRecord, Stores, UserRecord } from '../store/types';
+import type { AuditInput, CompanyMember, CompanyRecord, RateAlertRecord, Stores, UserRecord } from '../store/types';
 import { noteOf, type Notifier } from '../notify/notifier';
 
 /** What the app is given for one alert. */
@@ -168,6 +169,7 @@ export class RateAlerts {
     if (active.length === 0) return 0;
     const companies = new Map<string, CompanyRecord | null>();
     const margins = new Map<string, MarginConfig>();
+    const members = new Map<string, CompanyMember[]>();
     // One fetch per provider and pair for this whole check, shared by every company on that provider.
     const fetched = new Map<string, Promise<RatePair | null>>();
     let fired = 0;
@@ -176,7 +178,9 @@ export class RateAlerts {
       const company = companies.get(alert.companyId);
       // Only for a person who is still an active member of an active company. (The alert is kept: it works again if that is restored.)
       if (!company || company.deactivatedAt) continue;
-      const member = (await stores.directory.listMembers(company.id)).find((item) => item.userId === alert.userId);
+      // The members of a company are read once per check, not once per alert.
+      if (!members.has(company.id)) members.set(company.id, await stores.directory.listMembers(company.id));
+      const member = members.get(company.id)?.find((item) => item.userId === alert.userId);
       if (!member || !member.active) continue;
       const pairKey = `${company.providerKey}:${alert.base}${alert.quote}`;
       if (!fetched.has(pairKey)) fetched.set(pairKey, this.deps.withProvider(company, (provider) => rates.providerRate(company, provider, alert.base, alert.quote)).catch(() => null));
@@ -194,7 +198,10 @@ export class RateAlerts {
       if (!reached) continue;
       const at = now();
       // FIRST the notification (made once per alert and arming, whatever happens next), THEN the alert is marked.
-      await notifier.notify(noteOf({ userId: alert.userId, companyId: company.id, category: 'rates', kind: 'rate_alert', note: { base: alert.base, quote: alert.quote, side: alert.side, target: alert.targetRate, rate, at }, dedupe: `alert:${alert.id}:${alert.arming}` }));
+      const told = await notifier.notify(noteOf({ userId: alert.userId, companyId: company.id, category: 'rates', kind: 'rate_alert', note: { base: alert.base, quote: alert.quote, side: alert.side, target: alert.targetRate, rate, at }, dedupe: `alert:${alert.id}:${alert.arming}` }));
+      // ONLY when the notification exists (made now, or made before a crash) is the alert marked as fired. If it was
+      // held back (the hourly limit) or could not be made, the alert stays on and is looked at again at the next check.
+      if (told !== 'created' && told !== 'duplicate') continue;
       const stored = await stores.alerts.mutate(
         alert.id,
         (current) => (current && current.status === 'active' && current.arming === alert.arming ? { ...current, status: 'triggered', triggeredAt: at, triggeredRate: rate } : undefined),

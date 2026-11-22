@@ -23,7 +23,7 @@ import type { Config } from '../config';
 import { safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
 import { ConsoleOutbox, maskEmail, type Mailer } from '../mailer';
-import { MailQueue } from '../mail/queue';
+import { MailQueue, mailedDetail } from '../mail/queue';
 import { activationMail } from '../mail/templates';
 import { SecurityNotices } from '../notify/security';
 import { AuthenticatorResets } from '../auth/authenticatorResets';
@@ -144,9 +144,9 @@ export async function bootstrapOpsAdmin(stores: Stores, opsAuth: OpsAuthService,
   if (existing && (existing.role !== 'ops_admin' || existing.disabledAt !== null || existing.activatedAt !== null)) return null;
   const user = existing ?? (await opsAuth.createUser(email, name, 'ops_admin'));
   const invite = await opsAuth.createInvite(user.id);
-  await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
-  await stores.audit.append({ at, actor: SYSTEM, target: { type: 'ops', id: user.id, label: user.email }, action: existing ? 'ops.bootstrap_admin' : 'ops.staff.new', outcome: 'success', source, detail: { role: 'ops_admin', how: 'operator command (bootstrap)' } });
-  return { sentTo: maskEmail(user.email), expiresAt: invite.expiresAt };
+  const delivery = await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
+  await stores.audit.append({ at, actor: SYSTEM, target: { type: 'ops', id: user.id, label: user.email }, action: existing ? 'ops.bootstrap_admin' : 'ops.staff.new', outcome: 'success', source, detail: { role: 'ops_admin', how: 'operator command (bootstrap)', email: delivery.state } });
+  return { ...mailedDetail(maskEmail(user.email), delivery), expiresAt: invite.expiresAt };
 }
 
 /**
@@ -179,9 +179,10 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
       stores.audit.append({ at: now(), actor: SYSTEM, target: user ? partyOf(user) : { type: 'client', id: null, label: email.slice(0, 80) }, action: 'system.client.activation_link', outcome, source: request.ip, detail });
     try {
       const invite = await auth.createInvite(email);
-      await mail.enqueue(activationMail(invite, email, user?.name ?? '', 'client'));
-      await record('success', { expires: new Date(invite.expiresAt).toISOString() });
-      return { sentTo: maskEmail(email), expiresAt: new Date(invite.expiresAt).toISOString() };
+      const delivery = await mail.enqueue(activationMail(invite, email, user?.name ?? '', 'client'));
+      // The answer and the audit entry say what became of the email, not that it was "sent" when it was not.
+      await record(delivery.state === 'failed' ? 'failure' : 'success', { expires: new Date(invite.expiresAt).toISOString(), email: delivery.state });
+      return { ...mailedDetail(maskEmail(email), delivery), expiresAt: new Date(invite.expiresAt).toISOString() };
     } catch (error) {
       await record('failure', { reason: reasonOf(error) });
       throw error;
@@ -240,9 +241,9 @@ export async function buildAdminApp(deps: { config: Config; stores: Stores; auth
     }
     const sessions = await opsAuth.clearCredentials(user.id);
     const invite = await opsAuth.createInvite(user.id);
-    await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
-    await record('success', { sessionsEnded: String(sessions), sentTo: maskEmail(user.email) });
-    return { done: 'reset', staff: maskEmail(user.email), expiresAt: new Date(invite.expiresAt).toISOString() };
+    const delivery = await mail.enqueue(activationMail(invite, user.email, user.name, 'staff'));
+    await record(delivery.state === 'failed' ? 'failure' : 'success', { sessionsEnded: String(sessions), ...mailedDetail(maskEmail(user.email), delivery) });
+    return { done: 'reset', staff: maskEmail(user.email), email: delivery.state, expiresAt: new Date(invite.expiresAt).toISOString() };
   });
   return admin;
 }
@@ -432,6 +433,8 @@ export async function buildApp(deps: AppDeps) {
 
   /** Notifications (in-app list and email), who is told what about held payments, and rate alerts. */
   const notifier = new Notifier(deps.stores, mail, { now, perUserPerHour: config.notificationsPerUserPerHour, push: null, onError: (message) => app.log.error({ message }, 'notification failed') });
+  // A client's security notice is shown in the app as well as emailed.
+  notices.attachInApp((person, kind, data, key) => notifier.security(person, kind, data, key));
   const paymentNotes = new PaymentNotifications(deps.stores, notifier, { now, expiryWarningMs: config.paymentExpiryWarningMs, onError: (message) => app.log.error({ message }, 'payment notifications failed') });
   const alerts = new RateAlerts({
     stores: deps.stores,

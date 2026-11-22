@@ -80,7 +80,7 @@ test('there is no self-signup: the operator command is not on the public listene
   assert.equal((await h.adminCall('/admin/invites', { email: 'stranger@nowhere.example' })).status, 404);
   const ok = await h.adminCall('/admin/invites', { email: AMIRA });
   assert.equal(ok.status, 200);
-  assert.deepEqual(Object.keys(ok.json).sort(), ['expiresAt', 'sentTo']);
+  assert.deepEqual(Object.keys(ok.json).sort(), ['email', 'expiresAt', 'sentTo']);
   assert.equal(ok.json.sentTo, 'a…@northfield.example');
   assert.doesNotMatch(JSON.stringify(ok.json), /[A-Z2-7]{5}-[A-Z2-7]{5}|code=/);
   // The link went to the address on file, with the code after "#".

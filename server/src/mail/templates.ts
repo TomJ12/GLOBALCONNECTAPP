@@ -47,7 +47,7 @@ export const SECURITY_NOTICES = {
   account_enabled: () => ['Your account has been enabled again by Global Connect.'],
   authenticator_reset_requested: (data: { until?: number }) => [
     'Global Connect staff have approved a reset of the authenticator on your account.',
-    `It has NOT happened yet. On ${utc(data.until ?? 0)} your current password, authenticator and recovery codes will stop working and a new activation link will be emailed to this address.`,
+    `It has NOT happened yet. It will not happen before ${utc(data.until ?? 0)}. After that your current password, authenticator and recovery codes will stop working and a new activation link will be emailed to this address.`,
     'If you did not ask for this: sign in now with your current password and authenticator code (that cancels the reset), and tell Global Connect.',
   ],
   authenticator_reset_cancelled: () => ['The reset of the authenticator on your account was cancelled. Nothing was changed: your password, authenticator and recovery codes work as before.'],
@@ -108,6 +108,8 @@ export const NOTIFICATIONS = {
     title: 'A payment waiting for approval is about to expire',
     lines: [`The payment of ${payment(data)}, created by ${typed(data.createdBy, 120)}, is still waiting for approval. It has not been sent.`, `It expires ${utc(data.expiresAt ?? 0)}. If it is not approved by then it will not be sent and would have to be created again.`],
   }),
+  // A security notice, shown in the app as well as emailed. The same words as the email (SECURITY_NOTICES).
+  security_notice: (data: { kind: SecurityNotice; at: number; until?: number }): NoteText => ({ title: 'Security notice about your account', lines: [...SECURITY_NOTICES[data.kind](data), `Time: ${utc(data.at)}.`, NOT_YOU] }),
   payment_approved: (data: PaymentNote): NoteText => ({ title: 'Your payment was approved', lines: [`Your payment of ${payment(data)} has all the approvals it needs and is being sent for processing.`] }),
   payment_rejected: (data: PaymentNote): NoteText => ({
     title: 'Your payment was rejected',
@@ -133,7 +135,7 @@ export type NotificationData<K extends NotificationKind> = Parameters<(typeof NO
 export const notificationText = (kind: NotificationKind, data: unknown): NoteText => (NOTIFICATIONS[kind] as (input: unknown) => NoteText)(data);
 /** The subject of a notification email: which kind of thing it is, and nothing about it. */
 const NOTIFICATION_SUBJECT = (kind: NotificationKind): string =>
-  kind === 'rate_alert' ? 'A rate alert on your Global Connect account' : kind === 'payment_awaiting' || kind === 'payment_expiring' ? 'A payment is waiting for your approval in Global Connect' : 'An update on a payment you created in Global Connect';
+  kind === 'security_notice' ? 'Security notice for your Global Connect account' : kind === 'rate_alert' ? 'A rate alert on your Global Connect account' : kind === 'payment_awaiting' || kind === 'payment_expiring' ? 'A payment is waiting for your approval in Global Connect' : 'An update on a payment you created in Global Connect';
 
 export const TEMPLATES = {
   'activation.client': (data: { name: string; link: string; expiresAt: number }): Draft => ({
@@ -194,6 +196,11 @@ export const TEMPLATES = {
   notification: (data: { name: string; kind: NotificationKind; note: unknown }): Draft => ({
     subject: NOTIFICATION_SUBJECT(data.kind),
     lines: [`Hello ${safe(data.name)},`, '', ...notificationText(data.kind, data.note).lines, '', 'You can choose which of these emails you get in the app, under Notifications.'],
+  }),
+  // Sent at most once an hour to an address that had more ordinary notifications than are emailed one by one.
+  'notification.digest': (_data: Record<string, never>): Draft => ({
+    subject: 'More notifications are waiting for you in Global Connect',
+    lines: ['Hello,', '', 'More notifications arrived for you in the last hour than we send by email one at a time.', 'All of them are in the Global Connect app, under Notifications. Nothing has been lost.'],
   }),
 } satisfies Record<string, (data: never) => Draft>;
 

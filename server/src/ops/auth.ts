@@ -11,6 +11,7 @@
  * As in the client service, security state is only ever changed through the
  * store's atomic operations.
  */
+import { claimResetLink, endResetLinks, isLiveResetLink } from '../auth/resetLedger';
 import type { Config } from '../config';
 import { PASSWORD_RESET_TTL_MS, reasonOf, RESET_REQUESTS_PER_HOUR, secondsToNextCode, SEEN_WRITE_MS, type Invitation } from '../auth/service';
 import type { MailQueue } from '../mail/queue';
@@ -308,8 +309,8 @@ export class OpsAuthService {
     this.mail = mail;
     this.notices = notices;
   }
-  private notice(user: OpsUserRecord, kind: SecurityNotice): Promise<void> {
-    return this.notices?.send({ id: user.id, email: user.email, name: user.name }, 'staff', kind) ?? Promise.resolve();
+  private async notice(user: OpsUserRecord, kind: SecurityNotice): Promise<void> {
+    await this.notices?.send({ id: user.id, email: user.email, name: user.name }, 'staff', kind);
   }
   private readonly background = new Set<Promise<unknown>>();
   async settle(): Promise<void> {
@@ -331,25 +332,24 @@ export class OpsAuthService {
       await this.log('ops.password_reset.request', 'failure', { type: 'ops', id: null, label: address }, source, { reason: 'no_usable_account' });
       return;
     }
-    const since = this.now() - 60 * 60_000;
-    const recent = await this.stores.mail.count({}, (row) => row.to === user.email && row.template === 'reset.staff' && row.createdAt > since);
-    if (recent >= RESET_REQUESTS_PER_HOUR) {
+    const resetCode = randomCode(4);
+    const codeKey = sha256(normaliseCode(resetCode));
+    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
+    // The limit and "one live link" in ONE transaction (auth/resetLedger.ts).
+    if (!(await claimResetLink(this.ops.passwordResets, user.id, codeKey, this.now(), RESET_REQUESTS_PER_HOUR, PASSWORD_RESET_TTL_MS))) {
       await this.log('ops.password_reset.request', 'failure', opsParty(user), source, { reason: 'rate_limited' });
       return;
     }
-    await this.ops.passwordResets.deleteWhere({ userId: user.id });
-    const resetCode = randomCode(4);
-    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
-    await this.ops.passwordResets.put(sha256(normaliseCode(resetCode)), { userId: user.id, expiresAt, attempts: 0 });
-    await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.staff', data: { name: user.name, link: `${this.config.opsUrl}/ops/reset#code=${resetCode}`, expiresAt }, key: `reset:staff:${sha256(resetCode)}`, category: 'security' }));
-    await this.log('ops.password_reset.request', 'success', opsParty(user), source, { expires: new Date(expiresAt).toISOString() });
+    await this.ops.passwordResets.put(codeKey, { userId: user.id, expiresAt, attempts: 0 });
+    const delivery = await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.staff', data: { name: user.name, link: `${this.config.opsUrl}/ops/reset#code=${resetCode}`, expiresAt }, key: `reset:staff:${sha256(resetCode)}`, category: 'security' }));
+    await this.log('ops.password_reset.request', delivery?.state === 'failed' ? 'failure' : 'success', opsParty(user), source, { expires: new Date(expiresAt).toISOString(), email: delivery?.state ?? 'none' });
   }
 
   private async passwordReset(resetCode: string) {
     const key = sha256(normaliseCode(resetCode));
     const record = await this.ops.passwordResets.get(key);
     const user = record && record.expiresAt > this.now() ? await this.ops.users.get(record.userId) : null;
-    if (!record || !user || !isActiveStaff(user)) throw new ApiError('validation', { reason: 'reset_invalid' });
+    if (!record || !user || !isActiveStaff(user) || !(await isLiveResetLink(this.ops.passwordResets, user.id, key))) throw new ApiError('validation', { reason: 'reset_invalid' });
     return { key, user };
   }
   async passwordResetStart(resetCode: string): Promise<void> {
@@ -374,6 +374,7 @@ export class OpsAuthService {
     // ONLY the password: the authenticator key and recovery codes are not touched.
     const saved = await this.ops.users.update(user.id, (current) => (isActiveStaff(current) && current.totpSecret === verified.totpSecret ? { ...current, passwordHash } : null));
     if (!saved) throw new ApiError('validation', { reason: 'reset_invalid' });
+    await endResetLinks(this.ops.passwordResets, user.id);
     const sessions = await this.revokeAllSessions(user.id);
     await this.lockout.unlock([`email:${user.email}`]);
     await this.log('ops.password_reset', 'success', opsParty(user), source, { method, sessionsEnded: String(sessions) });

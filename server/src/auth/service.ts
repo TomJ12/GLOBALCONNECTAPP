@@ -39,6 +39,7 @@ import { ApiError } from '../errors';
 import type { AuditParty, CompanyRecord, SessionRecord, Stores, UserRecord } from '../store/types';
 import { isKnownSource, Lockout, withKnownSource, type Attempt, type LockScope } from './lockout';
 import type { MailQueue } from '../mail/queue';
+import { claimResetLink, endResetLinks, isLiveResetLink } from './resetLedger';
 import { mailOf, type SecurityNotice } from '../mail/templates';
 import type { SecurityNotices } from '../notify/security';
 
@@ -108,8 +109,8 @@ export class AuthService {
     this.mail = mail;
     this.notices = notices;
   }
-  private notice(user: UserRecord, kind: SecurityNotice, extra: { until?: number } = {}): Promise<void> {
-    return this.notices?.send({ id: user.id, email: user.email, name: user.name }, 'client', kind, extra) ?? Promise.resolve();
+  private async notice(user: UserRecord, kind: SecurityNotice, extra: { until?: number } = {}): Promise<void> {
+    await this.notices?.send({ id: user.id, email: user.email, name: user.name }, 'client', kind, extra);
   }
   /** Work started by a request and finished after its answer (so that the answer's timing says nothing). Tests wait for it with `settle`. */
   private readonly background = new Set<Promise<unknown>>();
@@ -502,20 +503,21 @@ export class AuthService {
       await this.record('client.password_reset.request', 'failure', { type: 'client', id: null, label: address }, source, { reason: 'no_usable_account' });
       return;
     }
-    const since = this.now() - 60 * 60_000;
-    const recent = await this.stores.mail.count({}, (row) => row.to === user.email && row.template === 'reset.client' && row.createdAt > since);
-    if (recent >= RESET_REQUESTS_PER_HOUR) {
+    const resetCode = randomCode(4);
+    const codeKey = sha256(normaliseCode(resetCode));
+    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
+    // The limit and "one live link" in ONE transaction: a new link kills the old one, and requests arriving
+    // together cannot both pass the limit or leave two usable links (auth/resetLedger.ts).
+    if (!(await claimResetLink(this.stores.auth.passwordResets, user.id, codeKey, this.now(), RESET_REQUESTS_PER_HOUR, PASSWORD_RESET_TTL_MS))) {
       await this.record('client.password_reset.request', 'failure', partyOf(user), source, { reason: 'rate_limited' });
       return;
     }
-    // A new link kills the old one.
-    await this.stores.auth.passwordResets.deleteWhere({ userId: user.id });
-    const resetCode = randomCode(4);
-    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
-    await this.stores.auth.passwordResets.put(sha256(normaliseCode(resetCode)), { userId: user.id, expiresAt, attempts: 0 });
+    await this.stores.auth.passwordResets.put(codeKey, { userId: user.id, expiresAt, attempts: 0 });
     // The code is in the link's fragment, which browsers do not send to servers: it is in no request log.
-    await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.client', data: { name: user.name, link: `${this.config.appUrl}/reset#code=${resetCode}`, expiresAt }, key: `reset:${sha256(resetCode)}`, category: 'security' }));
-    await this.record('client.password_reset.request', 'success', partyOf(user), source, { expires: new Date(expiresAt).toISOString() });
+    // The answer to the person is the same whatever happens here; if the email is deferred by its hourly
+    // allowance it stays in the outbox and is sent when the allowance frees. What became of it is on record.
+    const delivery = await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.client', data: { name: user.name, link: `${this.config.appUrl}/reset#code=${resetCode}`, expiresAt }, key: `reset:${sha256(resetCode)}`, category: 'security' }));
+    await this.record('client.password_reset.request', delivery?.state === 'failed' ? 'failure' : 'success', partyOf(user), source, { expires: new Date(expiresAt).toISOString(), email: delivery?.state ?? 'none' });
   }
 
   private async passwordReset(resetCode: string) {
@@ -523,7 +525,7 @@ export class AuthService {
     const record = await this.stores.auth.passwordResets.get(key);
     const user = record && record.expiresAt > this.now() ? await this.stores.directory.getUser(record.userId) : null;
     // One answer for unknown, expired, used, replaced, and an account that has since been disabled or reset.
-    if (!record || !user || user.activatedAt === null || user.disabledAt) throw new ApiError('validation', { reason: 'reset_invalid' });
+    if (!record || !user || user.activatedAt === null || user.disabledAt || !(await isLiveResetLink(this.stores.auth.passwordResets, user.id, key))) throw new ApiError('validation', { reason: 'reset_invalid' });
     return { key, record, user };
   }
 
@@ -558,10 +560,14 @@ export class AuthService {
     // ONLY the password. The authenticator key and the recovery codes are not this function's to change.
     const saved = await this.stores.directory.updateUser(user.id, (current) => (current.activatedAt === null || current.disabledAt || current.totpSecret !== verified.totpSecret ? null : { ...current, passwordHash }));
     if (!saved) throw new ApiError('validation', { reason: 'reset_invalid' });
+    await endResetLinks(this.stores.auth.passwordResets, user.id);
     const sessions = await this.revokeAllSessions(user.id);
     await this.lockout.unlock([`email:${user.email}`]);
     await this.record('client.password_reset', 'success', partyOf(user), source, { method, sessionsEnded: String(sessions) });
     await this.notice(saved, 'password_reset');
+    // A code from the authenticator was just entered: whoever holds it evidently did not lose it, so a reset of
+    // the authenticator that is waiting is cancelled. (A recovery code does not show that.)
+    if (method === 'totp') await this.cancelAuthenticatorResets(saved, 'password reset with an authenticator code', source);
   }
 
   // --- Signed in: your own security settings -----------------------------------------
@@ -594,9 +600,11 @@ export class AuthService {
     const saved = await this.stores.directory.updateUser(user.id, (current) => (current.passwordHash === verified.passwordHash && !current.disabledAt ? { ...current, passwordHash } : null));
     if (!saved) await fail('changed_meanwhile', new ApiError('validation', { reason: 'invalid_credentials' }));
     const others = await this.revokeSessionsExcept(user.id, context.session.id);
-    await this.stores.auth.passwordResets.deleteWhere({ userId: user.id });
+    await endResetLinks(this.stores.auth.passwordResets, user.id);
     await this.record('client.password_change', 'success', who, source, { otherSessionsEnded: String(others) });
     await this.notice(user, 'password_changed');
+    // The password was changed with a code from the authenticator: a waiting reset of it is cancelled.
+    await this.cancelAuthenticatorResets(user, 'password changed with an authenticator code', source);
   }
 
   /** An authenticator code buys a fresh set of recovery codes, shown once. The old ones stop working. */

@@ -111,7 +111,7 @@ test('H3: the real process. Strict start exits without printing a code; in devel
     assert.equal((await post('http://127.0.0.1:39411')).status, 404, 'the public listener has no /admin');
     const sent = await post('http://127.0.0.1:39412');
     assert.equal(sent.status, 200);
-    assert.deepEqual(Object.keys((await sent.json()) as object).sort(), ['expiresAt', 'sentTo']);
+    assert.deepEqual(Object.keys((await sent.json()) as object).sort(), ['email', 'expiresAt', 'sentTo']);
     assert.match(output, /DEVELOPMENT OUTBOX: this email was NOT sent anywhere/);
     // The operator port does not answer on any non-loopback address of this machine; the public port does.
     const outside = Object.values(networkInterfaces()).flat().find((item) => item && !item.internal && item.family === 'IPv4')?.address;
