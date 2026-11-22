@@ -1411,4 +1411,17 @@ test('notifications follow CURRENT membership: someone removed from a company, d
   assert.equal(await h.paymentNotes.scan(), 0);
   assert.equal((await h.stores.notifications.list()).length, everyone);
   assert.ok(second && third);
+
+  // The scan reads only what can be due (waiting, being sent, changed in the last day), through indexes: never every payment there is.
+  const list = h.stores.payments.list.bind(h.stores.payments);
+  const asked: Parameters<typeof list>[0][] = [];
+  h.stores.payments.list = async (where) => {
+    asked.push(where);
+    return list(where);
+  };
+  await h.paymentNotes.scan();
+  await h.paymentNotes.scan(company.id);
+  assert.equal(asked.length, 6);
+  assert.ok(asked.every((where) => where.status !== undefined || where.changedSince !== undefined), JSON.stringify(asked));
+  assert.deepEqual(asked.slice(3).map((where) => where.companyId), [company.id, company.id, company.id]);
 });

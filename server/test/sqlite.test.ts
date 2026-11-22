@@ -440,7 +440,7 @@ test('restart: sessions, locks, pending requests, invitations and the audit log 
 // --- Review of fe9d053 -----------------------------------------------------------------------------------
 
 /** Undoes what the migrations after 5 added (kept up to date with migrations.ts). */
-const AFTER_5 = 'DROP TABLE held_quotes; DROP TABLE rate_alerts; DROP TABLE notifications; DROP TABLE notification_prefs; DROP TABLE company_margins; DROP TABLE fx_revenue; DROP INDEX mail_outbox_to; DROP INDEX mail_outbox_sent_hour; DROP TABLE mail_outbox; DROP TABLE password_resets; DROP TABLE ops_password_resets; DROP TABLE authenticator_resets;';
+const AFTER_5 = 'DROP INDEX held_payments_status_at; DROP TABLE held_quotes; DROP TABLE rate_alerts; DROP TABLE notifications; DROP TABLE notification_prefs; DROP TABLE company_margins; DROP TABLE fx_revenue; DROP INDEX mail_outbox_to; DROP INDEX mail_outbox_sent_hour; DROP TABLE mail_outbox; DROP TABLE password_resets; DROP TABLE ops_password_resets; DROP TABLE authenticator_resets;';
 /** Turns a current database back into one as commit 2ac6785 left it (schema 4): the end of the log signed without the archive boundary, a plain development marker, no signed state. */
 function asSchema4(target: string): void {
   const db = new Db(target);

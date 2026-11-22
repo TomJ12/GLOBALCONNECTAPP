@@ -147,7 +147,16 @@ test('alerts do not fire twice across a crash or a restart; one rate fetch per p
   h.stores.alerts.mutate = original;
   const restarted = new RateAlerts({ stores: h.stores, rates: h.rates, notifier: h.notifier, now: () => h.clock.now, perUser: 20, withProvider: async (company, run) => run(await h.registry.forCompany(company)) });
   const middle = fetches();
+  const listMembers = h.stores.directory.listMembers.bind(h.stores.directory);
+  let memberReads = 0;
+  h.stores.directory.listMembers = async (companyId) => {
+    memberReads += 1;
+    return listMembers(companyId);
+  };
   assert.equal(await restarted.check(), 4);
+  // ...and the company's members are read ONCE for the check, not once per alert.
+  assert.equal(memberReads, 1);
+  h.stores.directory.listMembers = listMembers;
   // Six alerts on two pairs, two people: TWO rate fetches for the whole check.
   assert.equal(fetches() - middle, 2);
   assert.ok(middle - before <= 2);

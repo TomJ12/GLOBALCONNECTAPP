@@ -12,7 +12,7 @@ const { app, admin, auth, opsAuth, held, mail, authenticatorResets, notifier, pa
 await mail.recover();
 void mail.pump();
 setInterval(() => void mail.pump(), 15_000).unref();
-setInterval(() => void mail.sweep(), 60 * 60_000).unref();
+setInterval(() => void mail.sweep().catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'mail sweep failed')), 60 * 60_000).unref();
 // Authenticator resets whose delay has passed are carried out now and every minute.
 const resets = () => authenticatorResets.runDue().catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'authenticator resets failed'));
 await resets();
@@ -32,7 +32,7 @@ setInterval(() => void settle(false).then(() => paymentNotes.scan()), 60_000).un
 void paymentNotes.scan();
 // Rate alerts are checked against each company's client rate; an alert fires once.
 setInterval(() => void alerts.check(), config.alertCheckMs).unref();
-setInterval(() => void notifier.sweep().catch(() => undefined), 60 * 60_000).unref();
+setInterval(() => void notifier.sweep().catch((error: unknown) => app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'notification sweep failed')), 60 * 60_000).unref();
 
 await app.listen({ port: config.port, host: config.host });
 // The operator commands are served on the loopback address ONLY, on their own port.

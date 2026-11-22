@@ -169,5 +169,7 @@ CREATE INDEX mail_outbox_sent_hour ON mail_outbox (json_extract(data, '$.sentHou
 -- Quotes this server is holding for clients (they used to be in memory only).
 CREATE TABLE held_quotes (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 CREATE INDEX held_quotes_company ON held_quotes (json_extract(data, '$.companyId'));
+-- Held payments are looked up by when their status last changed (the notification scan reads only what is recent).
+CREATE INDEX held_payments_status_at ON held_payments (json_extract(data, '$.statusAt'));
 `,
 ];

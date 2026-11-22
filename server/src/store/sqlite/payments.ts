@@ -67,9 +67,11 @@ export class SqlHeldPayments implements HeldPaymentStore {
   async findByKey(companyId: string, idempotencyKey: string): Promise<HeldPaymentRecord | null> {
     return read(this.db.get<{ data: string }>('SELECT data FROM held_payments WHERE key = ?', this.keyOf(companyId, idempotencyKey)));
   }
-  async list(where: { companyId?: string; status?: HeldPaymentStatus }): Promise<HeldPaymentRecord[]> {
+  async list(where: { companyId?: string; status?: HeldPaymentStatus; changedSince?: number }): Promise<HeldPaymentRecord[]> {
     const conditions: string[] = [];
-    const params: string[] = [];
+    const params: (string | number)[] = [];
+    // (An index on when the status last changed: "what is recent" is read without reading everything.)
+    if (where.changedSince !== undefined) (conditions.push("json_extract(data, '$.statusAt') >= ?"), params.push(where.changedSince));
     if (where.companyId !== undefined) (conditions.push("json_extract(data, '$.companyId') = ?"), params.push(where.companyId));
     if (where.status !== undefined) (conditions.push("json_extract(data, '$.status') = ?"), params.push(where.status));
     return this.db

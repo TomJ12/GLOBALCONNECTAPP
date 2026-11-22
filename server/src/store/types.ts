@@ -497,7 +497,8 @@ export interface HeldPaymentStore {
   updateDirect(companyId: string, idempotencyKey: string, change: (current: DirectPaymentRecord) => DirectPaymentRecord | null): Promise<DirectPaymentRecord | null>;
   get(id: string): Promise<HeldPaymentRecord | null>;
   findByKey(companyId: string, idempotencyKey: string): Promise<HeldPaymentRecord | null>;
-  list(where: { companyId?: string; status?: HeldPaymentStatus }): Promise<HeldPaymentRecord[]>;
+  /** `changedSince`: only payments whose status changed at or after that moment. */
+  list(where: { companyId?: string; status?: HeldPaymentStatus; changedSince?: number }): Promise<HeldPaymentRecord[]>;
   /**
    * ATOMIC. Reads the payment and the named people (their accounts and their
    * roles in the payment's company) in ONE transaction and stores what

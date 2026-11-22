@@ -51,7 +51,12 @@ export class PaymentNotifications {
 
   private async look(companyId?: string): Promise<number> {
     const at = this.options.now();
-    const records = (await this.stores.payments.list(companyId ? { companyId } : {})).filter((record) => record.status === 'awaiting_approval' || record.status === 'sending' || at - record.statusAt < RECENT_MS);
+    // ONLY WHAT CAN BE DUE is read, through indexes: payments still waiting or being sent, and those whose status
+    // changed in the last day. Never the whole table.
+    const scope = companyId ? { companyId } : {};
+    const found = new Map<string, HeldPaymentRecord>();
+    for (const record of [...(await this.stores.payments.list({ ...scope, status: 'awaiting_approval' })), ...(await this.stores.payments.list({ ...scope, status: 'sending' })), ...(await this.stores.payments.list({ ...scope, changedSince: at - RECENT_MS }))]) found.set(record.id, record);
+    const records = [...found.values()];
     const members = new Map<string, CompanyMember[]>();
     let made = 0;
     for (const record of records) {
