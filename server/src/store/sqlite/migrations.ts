@@ -162,9 +162,12 @@ CREATE TABLE notifications (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 CREATE INDEX notifications_user ON notifications (json_extract(data, '$.userId'));
 CREATE TABLE notification_prefs (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
 `,
-  // 10: the outbox is read through indexes (who it is to, the hour it was sent) instead of in full.
+  // 10: the outbox is read through indexes (who it is to, the hour it was sent) instead of in full; held quotes are kept.
   `
 CREATE INDEX mail_outbox_to ON mail_outbox (json_extract(data, '$.to'));
 CREATE INDEX mail_outbox_sent_hour ON mail_outbox (json_extract(data, '$.sentHour'));
+-- Quotes this server is holding for clients (they used to be in memory only).
+CREATE TABLE held_quotes (key TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
+CREATE INDEX held_quotes_company ON held_quotes (json_extract(data, '$.companyId'));
 `,
 ];

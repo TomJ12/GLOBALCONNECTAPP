@@ -286,6 +286,8 @@ export function loadConfig(env: Env = process.env): Config {
   const appUrl = (env.APP_URL ?? flyUrl ?? 'http://localhost:8081').replace(/\/+$/, '');
   // When the server also serves the web app (npm run demo), both share one address.
   const opsUrl = (env.OPS_URL ?? (development ? (env.WEB_DIR || env.FLY_APP_NAME ? appUrl : `http://localhost:${port}`) : '')).replace(/\/+$/, '');
+  // Links in emails (activation, password reset) are built from APP_URL: outside development it has no default and must be https.
+  if (strict && (!env.APP_URL || !appUrl.startsWith('https://'))) throw new Error('APP_URL must be set to the https:// address of the client app (activation and password-reset links are built from it; there is no default outside development).');
   if (strict && !opsUrl.startsWith('https://')) throw new Error('OPS_URL must be set to the https:// address of this server (the ops console is served only over https outside development).');
 
   // --- A demo that can be reached from the internet -------------------------------------------
@@ -342,6 +344,11 @@ export function loadConfig(env: Env = process.env): Config {
     if (value !== 'server' && value !== 'provider') throw new Error(`${name} must be "server" (this server applies the margin) or "provider" (the provider's rate already includes it).`);
     return value;
   };
+  const marginAppliedBy = { currencycloud: appliedBy('MARGIN_APPLIED_BY_CURRENCYCLOUD'), equals: appliedBy('MARGIN_APPLIED_BY_EQUALS') };
+  // FAIL SAFE: `provider` is accepted only for a provider whose quotes SAY whether they carry a partner markup, so
+  // that a wrong setting can be caught (rates/service.ts). This provider's answers do not say; with `provider` the
+  // server could not tell a marked-up rate from the wholesale one, so the setting is refused.
+  if (marginAppliedBy.equals === 'provider') throw new Error('MARGIN_APPLIED_BY_EQUALS=provider is refused: this provider\'s quotes do not say whether they carry a partner markup, so the server could not check that clients are not being shown the wholesale rate. Use "server", or add the check to the adapter first.');
   // PLACEHOLDER figure in development (a sample, not Global Connect's pricing). Outside development there is no
   // default: a company without its own configuration would otherwise trade at a margin nobody chose.
   if (strict && env.DEFAULT_MARGIN_BPS === undefined) throw new Error('DEFAULT_MARGIN_BPS must be set: the margin, in basis points, for a company with no margin configuration of its own (0 is allowed, but it has to be said).');
@@ -361,7 +368,7 @@ export function loadConfig(env: Env = process.env): Config {
     alertsPerUser: numberOf('ALERTS_PER_USER', 20, 1, 200),
     paymentExpiryWarningMs: Math.round(numberOf('PAYMENT_EXPIRY_WARNING_HOURS', 6, 0, 24 * 30, false) * 60 * 60_000),
     notificationsPerUserPerHour: numberOf('NOTIFICATIONS_PER_USER_PER_HOUR', 60, 1, 1000),
-    marginAppliedBy: { currencycloud: appliedBy('MARGIN_APPLIED_BY_CURRENCYCLOUD'), equals: appliedBy('MARGIN_APPLIED_BY_EQUALS') },
+    marginAppliedBy,
     defaultMarginBps,
     rateCacheMs: Math.round(rateCacheSeconds * 1000),
     mockMovingRates: env.MOCK_MOVING_RATES !== '0',

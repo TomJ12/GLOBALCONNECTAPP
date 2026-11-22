@@ -219,6 +219,11 @@ export interface Quote {
   createdAt: IsoDateTime;
   expiresAt: IsoDateTime;
   settlementDate: IsoDate | null;
+  /**
+   * SERVER ONLY, never sent to the app: whether the provider's quote already carries a partner markup (its client
+   * figures differ from its own). Absent when the provider's answer does not say.
+   */
+  markup?: 'present' | 'absent';
 }
 
 export type ConversionStatus = 'pending' | 'settled' | 'cancelled';
@@ -237,6 +242,11 @@ export interface Conversion {
   rate: DecimalString;
   settlementDate: IsoDate;
   createdAt: IsoDateTime;
+  /**
+   * True when what was BOOKED is not what was quoted: the figures here are what was booked (what moved on the
+   * account). The customer should be told to get in touch (wording: disclosures.conversionDiffers).
+   */
+  differsFromQuote?: boolean;
 }
 
 export interface BookConversionRequest {

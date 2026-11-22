@@ -16,7 +16,7 @@ import { z } from 'zod';
 
 import { isProviderError, type ProviderError } from '@/api/errors';
 import * as schemas from '@/api/schemas';
-import type { NewBeneficiary, Session, StepUpAction, UserRole } from '@/api/types';
+import type { Conversion, NewBeneficiary, Session, StepUpAction, UserRole } from '@/api/types';
 
 import { AuthService, partyOf, reasonOf, type SessionContext } from '../auth/service';
 import type { Config } from '../config';
@@ -34,13 +34,13 @@ import { isActiveStaff, OpsAuthService } from '../ops/auth';
 import { registerOps } from '../ops/console';
 import { registerDemoGate } from './demoGate';
 import { RateAlerts } from '../alerts/service';
-import { Notifier } from '../notify/notifier';
+import { noteOf, Notifier } from '../notify/notifier';
 import { PaymentNotifications } from '../notify/payments';
 import { MarginError } from '../rates/margin';
-import { ClientRates, type HeldQuote } from '../rates/service';
+import { ClientRates } from '../rates/service';
 import { HeldPayments, type HeldPaymentsDeps } from '../payments/held';
 import type { ProviderAdapter, ProviderRegistry } from '../providers/adapter';
-import type { CompanyRecord, Stores } from '../store/types';
+import type { CompanyRecord, RevenueRecord, Stores } from '../store/types';
 
 export interface AppDeps {
   /** How the outbox is emptied (see MailQueue). Defaults by the kind of mailer. */
@@ -103,6 +103,35 @@ const MAY: Record<StepUpAction, UserRole[]> = {
   'payment.cancel': ['creator', 'admin'],
 };
 
+/**
+ * A provider's own parameter names never reach a client. Field names in an error are the NEUTRAL API's names: a
+ * provider's name is translated where it has an equivalent and dropped where it has none.
+ */
+const PROVIDER_FIELDS: Record<string, string> = {
+  client_sell_amount: 'amount',
+  client_buy_amount: 'amount',
+  quote_id: 'quoteId',
+  buy_currency: 'buyCurrency',
+  sell_currency: 'sellCurrency',
+  fixed_side: 'fixedSide',
+  conversion_date: 'settlementDate',
+  unique_request_id: 'idempotencyKey',
+  beneficiary_id: 'beneficiaryId',
+  bank_account_holder_name: 'name',
+  account_number: 'accountNumber',
+  routing_code_value_1: 'sortCode',
+  bank_country: 'bankCountry',
+  clientAmounts: 'amount',
+  quoteRequestId: 'quoteId',
+  orderId: 'quoteId',
+  sourceCurrency: 'sellCurrency',
+  targetCurrency: 'buyCurrency',
+  accountIdentifier: 'accountNumber',
+  currencyCode: 'currency',
+};
+const NEUTRAL_FIELDS = new Set(['amount', 'quoteId', 'buyCurrency', 'sellCurrency', 'fixedSide', 'settlementDate', 'idempotencyKey', 'beneficiaryId', 'name', 'accountNumber', 'sortCode', 'bankCountry', 'currency', 'iban', 'bic', 'reference', 'reason', 'kind', 'entityType', 'routingNumber', 'email', 'password', 'code', 'targetRate', 'side', 'page']);
+export const neutralFields = (fields: readonly string[]): string[] => [...new Set(fields.map((field) => PROVIDER_FIELDS[field] ?? field).filter((field) => NEUTRAL_FIELDS.has(field)))];
+
 /** Parse with a schema from the shared file; a failure becomes a neutral `validation` error naming the fields. */
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
@@ -113,7 +142,7 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 /** What a provider failure looks like to the app. A provider refusing OUR credentials is our fault, not the customer's session. */
 function fromProviderError(error: ProviderError): ApiError {
   const kind = error.kind === 'unauthorized' || error.kind === 'forbidden' || error.kind === 'rate_limited' ? 'server' : error.kind;
-  return new ApiError(kind, { reason: error.reason, fields: [...error.fields] });
+  return new ApiError(kind, { reason: error.reason, fields: neutralFields(error.fields) });
 }
 
 function bearer(request: FastifyRequest): string | undefined {
@@ -270,7 +299,7 @@ export async function buildApp(deps: AppDeps) {
   });
   const notices = new SecurityNotices(mail, now, (message) => app.log.error({ message }, 'security notice failed'));
   auth.attach(mail, notices);
-  const rates = new ClientRates(deps.stores, config, now);
+  const rates = new ClientRates(deps.stores, config, now, deps.maxHeldQuotes ?? MAX_HELD_QUOTES);
   opsAuth.attach(mail, notices);
   const authenticatorResets = new AuthenticatorResets(deps.stores, auth, mail, notices, config.authenticatorResetDelayMs, now);
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
@@ -484,13 +513,6 @@ export async function buildApp(deps: AppDeps) {
     return parsed.data;
   };
 
-  /** Quotes this server handed out, per company, so a booking can only use a quote that company was really given. PLACEHOLDER: in memory. */
-  const quotes = new Map<string, HeldQuote>();
-  const rememberQuote = (held: HeldQuote): void => {
-    for (const [key, old] of quotes) if (Date.parse(old.client.expiresAt) < now() - 60_000) quotes.delete(key);
-    while (quotes.size >= (deps.maxHeldQuotes ?? MAX_HELD_QUOTES)) quotes.delete(quotes.keys().next().value as string);
-    quotes.set(`${held.companyId}:${held.client.id}`, held);
-  };
   /** A margin problem is the server's, not the client's: they are told the conversion is unavailable, never why. */
   const priced = async <T>(run: () => Promise<T>): Promise<T> => {
     try {
@@ -652,9 +674,8 @@ export async function buildApp(deps: AppDeps) {
         if (input.kind === 'forward' && !provider.capabilities.forwardContracts) {
           throw new ApiError('validation', { reason: 'not_supported', fields: ['kind'] });
         }
-        const held = await priced(async () => rates.quote(context.company, await withProvider(context, () => provider.createQuote(input))));
-        rememberQuote(held);
-        // Only the client's side is returned. `held.provider` stays here.
+        // Kept in the database for THIS person until it runs out. Only the client's side is returned; the provider's stays here.
+        const held = await priced(async () => rates.quote(context.company, context.user.id, provider, await withProvider(context, () => provider.createQuote(input))));
         return held.client;
       });
       api.post('/conversions', async (request) => {
@@ -668,17 +689,39 @@ export async function buildApp(deps: AppDeps) {
           { quote: quoteId, key: keyHash(idempotencyKey) },
           async () => {
             await authorize(request, context, 'conversion.book', { quoteId, idempotencyKey });
-            // Only a quote this server issued to THIS company can be booked: the id alone is not trusted.
-            const held = quotes.get(`${context.company.id}:${quoteId}`);
+            const hash = keyHash(idempotencyKey);
+            const notify = async (record: RevenueRecord | null, conversion: Conversion, changed: boolean): Promise<void> => {
+              if (!changed || !record?.mismatch) return;
+              // Booked, but NOT on the terms the client was quoted: logged, audited (by the record), and the person is told.
+              app.log.error({ conversion: conversion.id }, 'the provider booked a conversion without the client terms it was sent');
+              await notifier.notify(noteOf({ userId: record.userId, companyId: record.companyId, category: 'payments', kind: 'conversion_differs', note: { sellCurrency: record.sellCurrency, buyCurrency: record.buyCurrency, quotedSell: record.clientSellAmount, quotedBuy: record.clientBuyAmount, bookedSell: conversion.sellAmount, bookedBuy: conversion.buyAmount }, dedupe: `conversion:${conversion.id}:differs` }));
+            };
+            // ONE KEY IS ONE BOOKING OF ONE QUOTE. A key that was used before answers from what it did then:
+            const earlier = await rates.recordFor(context.company.id, hash);
+            if (earlier && earlier.quoteId !== quoteId) throw new ApiError('validation', { fields: ['idempotencyKey'] });
+            if (earlier && earlier.status !== 'failed') {
+              // ...the conversion it made, looked up by its key (never booked a second time)...
+              const made = await withProvider(context, (provider) => provider.findConversionByIdempotencyKey(idempotencyKey));
+              if (made) {
+                const closed = await rates.completeBooking(earlier.key, made);
+                await notify(closed.record, made, closed.changed);
+                return rates.present(made, closed.record ?? earlier);
+              }
+              // ...or, if the provider has no conversion under it yet, the same request again below (the provider books a key once).
+            }
+            // THE QUOTE, checked HERE and not left to the provider: issued by this server to this person in this
+            // company, not run out, not used by another booking, and priced by the margin that is still in force.
+            const held = await rates.claimQuote(context.company, context.user.id, quoteId, hash);
             if (!held) throw new ApiError('quote_expired');
             // On record BEFORE the provider is asked, so a booking whose answer is lost is not lost to the books.
-            const record = await rates.beginBooking(held, context.user.id, keyHash(idempotencyKey));
+            const record = await rates.beginBooking(held, context.user.id, hash);
+            if (!record) throw new ApiError('validation', { fields: ['idempotencyKey'] });
             const clientTerms = record.appliedBy === 'server' ? { sellAmount: record.clientSellAmount, buyAmount: record.clientBuyAmount } : undefined;
             try {
               const conversion = await withProvider(context, (provider) => provider.bookConversion({ quote: held.provider, idempotencyKey, clientTerms }));
               const booked = await rates.completeBooking(record.key, conversion);
-              if (booked?.mismatch) app.log.error({ conversion: conversion.id }, 'the provider booked a conversion without the client terms it was sent');
-              return rates.present(conversion, booked ?? record);
+              await notify(booked.record, conversion, booked.changed);
+              return rates.present(conversion, booked.record ?? record);
             } catch (error) {
               // Only a definite refusal means nothing was booked. Anything else (no answer, a server error) leaves the record open.
               if (isProviderError(error) && ['validation', 'quote_expired', 'insufficient_funds', 'forbidden', 'not_found'].includes(error.kind)) await rates.failBooking(record.key);
@@ -694,8 +737,12 @@ export async function buildApp(deps: AppDeps) {
         const conversion = await withProvider(context, (provider) => provider.findConversionByIdempotencyKey(key));
         if (!conversion) return conversion;
         // Found at the provider: if this server's record of it was left open (the answer was lost), it is closed now.
-        const record = (await rates.completeBooking(`${context.company.id}:${keyHash(key)}`, conversion)) ?? (await rates.recordFor(context.company.id, keyHash(key)));
-        return rates.present(conversion, record);
+        const closed = await rates.completeBooking(`${context.company.id}:${keyHash(key)}`, conversion);
+        if (closed.changed && closed.record?.mismatch) {
+          app.log.error({ conversion: conversion.id }, 'the provider booked a conversion without the client terms it was sent');
+          await notifier.notify(noteOf({ userId: closed.record.userId, companyId: closed.record.companyId, category: 'payments', kind: 'conversion_differs', note: { sellCurrency: closed.record.sellCurrency, buyCurrency: closed.record.buyCurrency, quotedSell: closed.record.clientSellAmount, quotedBuy: closed.record.clientBuyAmount, bookedSell: conversion.sellAmount, bookedBuy: conversion.buyAmount }, dedupe: `conversion:${conversion.id}:differs` }));
+        }
+        return rates.present(conversion, closed.record ?? (await rates.recordFor(context.company.id, keyHash(key))));
       });
       api.get('/forwards', async (request) => {
         const context = await companyOf(request);

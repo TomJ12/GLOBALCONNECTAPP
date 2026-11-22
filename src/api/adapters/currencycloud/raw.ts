@@ -115,6 +115,10 @@ export const rawHeldRateQuote = z.object({
   client_buy_amount: decimal,
   client_sell_amount: decimal,
   client_rate: decimal,
+  /** The provider's own side of the quote, when it says: differs from the client's when a partner markup is configured there. */
+  partner_rate: decimal.nullish(),
+  partner_buy_amount: decimal.nullish(),
+  partner_sell_amount: decimal.nullish(),
   currency_pair: z.string().length(6),
   fixed_side: z.enum(['buy', 'sell']),
   created_at: z.string(),

@@ -5,7 +5,7 @@
  * interfaces: no SQL and no SQLite type appears outside that folder, so moving
  * to another database means writing that folder again.
  */
-import type { Beneficiary, StepUpAction, UserRole } from '@/api/types';
+import type { Beneficiary, Quote, StepUpAction, UserRole } from '@/api/types';
 
 import type { MarginConfig } from '../rates/margin';
 
@@ -564,8 +564,17 @@ export interface RevenueRecord {
   kind: 'spot' | 'forward';
   /** Who applied the margin. `provider`: the server added none and does not know the revenue. */
   appliedBy: 'server' | 'provider';
+  /** The pair and direction in the ONE orientation used for every provider (rates/margin.ts `canonicalTrade`). */
   pair: string;
   direction: 'sell' | 'buy';
+  /** The orientation the RATES below are quoted in (base then quote), as the provider's adapter gave it. */
+  quotedAs?: string;
+  /** The margin REALLY applied after all rounding, in basis points to two places (may differ slightly from `marginBps`). */
+  effectiveBps?: string | null;
+  /** What the provider's answer said was booked, when it is not the client's terms (`mismatch`). */
+  bookedRate?: string | null;
+  bookedSellAmount?: string | null;
+  bookedBuyAmount?: string | null;
   sellCurrency: string;
   buyCurrency: string;
   /** The provider's side of the trade. */
@@ -633,7 +642,31 @@ export interface NotificationPrefsRecord {
   updatedAt: number;
 }
 
+/**
+ * A quote this server gave a client, kept until it runs out so that a restart does not strand someone in the middle
+ * of confirming. `provider` (the provider's own side) never leaves the server.
+ */
+export interface HeldQuoteRecord {
+  /** `${companyId}:${quote id}`. */
+  key: string;
+  companyId: string;
+  /** The person it was given to: only they can book it. */
+  userId: string;
+  client: Quote;
+  provider: Quote;
+  appliedBy: 'server' | 'provider';
+  marginBps: number | null;
+  revenue: { amount: string; currency: string } | null;
+  /** Which margin configuration priced it (when that was last changed; 0 for the server default). A quote priced before a change cannot be booked after it. */
+  marginVersion: number;
+  createdAt: number;
+  expiresAt: number;
+  /** The idempotency key (hashed) of the booking that used it. A quote is booked once. */
+  usedBy: string | null;
+}
+
 export interface Stores {
+  quotes: Table<HeldQuoteRecord>;
   alerts: Table<RateAlertRecord>;
   notifications: Table<NotificationRecord>;
   notificationPrefs: Table<NotificationPrefsRecord>;

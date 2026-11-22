@@ -1944,7 +1944,7 @@ test('ops: staff see a person’s notification state (counts and choices), never
   const olu = await staff('olu@globalconnect.example', 'ops');
   const { secret } = await h.activate(AMIRA);
   const amira = (await h.login(AMIRA, secret)).json.token as string;
-  await h.stores.margins.put('co_northfield', { defaultBps: 20, forwardBps: null, overrides: [], tiers: [], companyId: 'co_northfield', updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
+  await h.stores.margins.put('co_northfield', { defaultBps: 20, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP', companyId: 'co_northfield', updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
   for (const targetRate of ['1.2950', '1.4444']) assert.equal((await h.call('POST', '/v1/alerts', { token: amira, body: { base: 'GBP', quote: 'USD', side: 'sell', targetRate } })).status, 200);
   assert.equal(await h.alerts.check(), 1);
   await h.call('POST', '/v1/notifications/preferences', { token: amira, body: { email: { rates: false, approvals: true, payments: true } } });

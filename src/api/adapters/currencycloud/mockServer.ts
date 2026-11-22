@@ -82,6 +82,8 @@ export interface MockServerOptions {
   idNamespace?: string;
   /** The sample rates move over time (see mockRateWalk.ts). Off unless asked for: tests rely on fixed rates. */
   movingRates?: boolean;
+  /** Models a partner markup configured AT THE PROVIDER: the client's side of every quote is this many basis points worse than the provider's own. Default none. */
+  partnerMarkupBps?: number;
 }
 
 function one(params: TransportParams | undefined, key: string): string | undefined {
@@ -142,12 +144,14 @@ export class MockCurrencycloudServer implements Transport {
   private readonly random: () => number;
   private readonly idNamespace: string;
   private readonly movingRates: boolean;
+  private readonly partnerMarkupBps: number;
   private state: State;
 
   constructor(options: MockServerOptions) {
     this.idNamespace = options.idNamespace ?? '';
     this.getControls = options.getControls;
     this.movingRates = options.movingRates ?? false;
+    this.partnerMarkupBps = options.partnerMarkupBps ?? 0;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
     this.state = this.seed();
@@ -487,15 +491,21 @@ export class MockCurrencycloudServer implements Transport {
     }
     const quoteId = this.nextId('quote');
     const expiresAtMs = this.now() + this.getControls().quoteTtlSeconds * 1000;
+    // With a partner markup configured at the provider, the CLIENT's side is worse than the provider's own.
+    const markup = new Big(this.partnerMarkupBps).div(10_000);
+    const sellsBase = sell === base;
+    const clientRate = this.partnerMarkupBps > 0 ? rate.times(sellsBase ? new Big(1).minus(markup) : new Big(1).plus(markup)).round(6, sellsBase ? Big.roundDown : Big.roundUp) : rate;
+    const clientBuy = this.partnerMarkupBps > 0 && fixedSide === 'sell' ? (sellsBase ? fixed.times(clientRate) : fixed.div(clientRate)).round(currencyDecimals(buy), Big.roundDown) : buyAmount;
+    const clientSell = this.partnerMarkupBps > 0 && fixedSide === 'buy' ? (sellsBase ? fixed.div(clientRate) : fixed.times(clientRate)).round(currencyDecimals(sell), Big.roundUp) : sellAmount;
     const body: Json = {
       quote_id: quoteId,
       buy_currency: buy,
       sell_currency: sell,
-      client_buy_amount: money(buyAmount, buy),
-      client_sell_amount: money(sellAmount, sell),
+      client_buy_amount: money(clientBuy, buy),
+      client_sell_amount: money(clientSell, sell),
       partner_buy_amount: money(buyAmount, buy),
       partner_sell_amount: money(sellAmount, sell),
-      client_rate: rate.toFixed(4),
+      client_rate: this.partnerMarkupBps > 0 ? clientRate.toFixed(6) : rate.toFixed(4),
       partner_rate: rate.toFixed(4),
       core_rate: rate.toFixed(4),
       mid_market_rate: rate.toFixed(4),
@@ -569,8 +579,8 @@ export class MockCurrencycloudServer implements Transport {
       buy_currency: buy,
       sell_currency: sell,
       fixed_side: quote.fixed_side,
-      partner_buy_amount: quote.client_buy_amount,
-      partner_sell_amount: quote.client_sell_amount,
+      partner_buy_amount: quote.partner_buy_amount ?? quote.client_buy_amount,
+      partner_sell_amount: quote.partner_sell_amount ?? quote.client_sell_amount,
       client_buy_amount: money(buyAmount, buy),
       client_sell_amount: money(sellAmount, sell),
       mid_market_rate: quote.client_rate,

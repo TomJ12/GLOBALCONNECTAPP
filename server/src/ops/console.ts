@@ -51,7 +51,7 @@ import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type Approvals
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { h, Html, layout, qrSvg, when } from './html';
 import { currencyDecimals } from '@/lib/money';
-import { checkMarginConfig, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
+import { checkMarginConfig, DEFAULT_TIER_CURRENCY, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
 import { DELIVERY_WORDS, mailedDetail } from '../mail/queue';
 import { marginConfigOf, type ClientRates } from '../rates/service';
 import type { Notifier } from '../notify/notifier';
@@ -1173,7 +1173,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               'Change payment approvals',
               { request: true },
             )}</div>
-<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount; otherwise the default. A change needs a second staff member, an ops admin, who types their password again.</p>`, 'Change FX margin', { request: true })}</div>
+<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount (the trade’s size in the tier currency, converted at the provider’s rate); otherwise the default. A client is shown a rate for each direction and can estimate a midpoint from those, as from any two-way price; no field names the margin. A change needs a second staff member, an ops admin, who types their password again.</p>`, 'Change FX margin', { request: true })}</div>
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
                 ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company', { request: true })
@@ -1302,7 +1302,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         h`<label>Default margin, in basis points (100 = 1%) <input name="defaultBps" inputmode="numeric" required maxlength="5" value="${String(current.defaultBps)}"></label>
 <label>Forward contracts, in basis points (leave empty to price forwards as spot) <input name="forwardBps" inputmode="numeric" maxlength="5" value="${current.forwardBps === null ? '' : String(current.forwardBps)}"></label>
 <label>Overrides for a currency pair and direction, one per line: pair, then sell, buy or both (what the client does with the pair’s FIRST currency), then basis points. Example: GBPUSD sell 40 <textarea name="overrides" rows="3" maxlength="2000">${current.overrides.map((item) => `${item.pair} ${item.direction} ${item.bps}`).join('\n')}</textarea></label>
-<label>Tiers by amount, one per line: from this amount (in the pair’s first currency), then basis points. Larger amounts, smaller margin. Example: 50000 35 <textarea name="tiers" rows="3" maxlength="1000">${current.tiers.map((item) => `${item.fromAmount} ${item.bps}`).join('\n')}</textarea></label>
+<label>Tiers by amount, one per line: from this amount, then basis points. Larger amounts, smaller margin. Example: 50000 35 <textarea name="tiers" rows="3" maxlength="1000">${current.tiers.map((item) => `${item.fromAmount} ${item.bps}`).join('\n')}</textarea></label>
+<label>The ONE currency tier amounts are in, for every pair (a trade’s size is converted to it at the provider’s rate before a tier is chosen) <input name="tierCurrency" required maxlength="3" value="${current.tierCurrency}"></label>
 <label><input type="checkbox" name="allowHigh" value="yes"> Allow a margin above ${String(MARGIN_USUAL_MAX_BPS)} basis points (${String(MARGIN_USUAL_MAX_BPS / 100)}%) in this request</label>`;
       const marginOfForm = (input: Form): { config: MarginConfig; allowHigh: boolean } => {
         const bps = (value: string, what: string): number => {
@@ -1325,6 +1326,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not a tier. Write the amount it starts from, then basis points: 50000 35`);
             return { fromAmount: match[1] ?? '', bps: bps(match[2] ?? '', `The margin from ${match[1] ?? ''}`) };
           }),
+          tierCurrency: (text(input, 'tierCurrency') || DEFAULT_TIER_CURRENCY).toUpperCase(),
         };
         try {
           return { config: checkMarginConfig(wanted, allowHigh), allowHigh };
@@ -1420,12 +1422,15 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         // Totals by company, month and currency. Only conversions that are booked and whose margin this server applied have a figure.
         const totals = new Map<string, { company: string; month: string; currency: string; count: number; total: Big }>();
         for (const row of rows) {
-          if (row.status !== 'booked' || row.revenueAmount === null || row.revenueCurrency === null) continue;
+          // A conversion the provider booked WITHOUT the client's terms earned nothing that can be counted here: it is
+          // left out of the totals and listed by itself below, with what was quoted and what was booked.
+          if (row.status !== 'booked' || row.mismatch || row.revenueAmount === null || row.revenueCurrency === null) continue;
           const month = new Date(row.bookedAt ?? row.createdAt).toISOString().slice(0, 7);
           const key = `${row.companyId}:${month}:${row.revenueCurrency}`;
           const entry = totals.get(key) ?? { company: companies.get(row.companyId) ?? row.companyId, month, currency: row.revenueCurrency, count: 0, total: new Big(0) };
           totals.set(key, { ...entry, count: entry.count + 1, total: entry.total.plus(row.revenueAmount) });
         }
+        const mismatched = rows.filter((row) => row.status === 'booked' && row.mismatch);
         const query = new URLSearchParams(Object.entries(filters).filter(([, value]) => value !== '')).toString();
         return send(
           reply,
@@ -1436,9 +1441,12 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
 <form method="get" action="/ops/revenue"><label>Company <select name="company"><option value="">All</option>${[...companies].map(([id, name]) => h`<option value="${id}"${id === filters.company ? h` selected` : ''}>${name}</option>`)}</select></label><label>From (YYYY-MM-DD) <input name="from" value="${filters.from}" maxlength="10"></label><label>To (YYYY-MM-DD) <input name="to" value="${filters.to}" maxlength="10"></label><button type="submit">Show</button></form>
 <p><a href="/ops/revenue.csv${query ? `?${query}` : ''}">Download these conversions as CSV</a></p></div>
 <div class="card"><h2>Totals by company and month</h2><table><tr><th>Company</th><th>Month</th><th>Conversions</th><th>Revenue</th></tr>${[...totals.values()].map((item) => h`<tr><td>${item.company}</td><td>${item.month}</td><td>${String(item.count)}</td><td>${item.currency} ${item.total.toFixed(currencyDecimals(item.currency))}</td></tr>`)}</table>${totals.size === 0 && h`<p class="muted">Nothing booked in this period.</p>`}</div>
+${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s terms: not in the totals</h2><p class="warn">The provider’s answer for these did not carry the client’s side of the trade it was sent. What moved on the client’s account is the BOOKED figure; the client has been shown that, told that it differs from the quote, and asked to get in touch. The revenue worked out at quote time was not earned and is not counted above. Each needs a person to look.</p><table><tr><th>When</th><th>Company</th><th>Quoted to the client</th><th>Booked at the provider</th><th>Quote-time revenue (NOT counted)</th></tr>${mismatched.map(
+              (row) => h`<tr><td>${when(row.bookedAt ?? row.createdAt)}</td><td><a href="/ops/companies/${row.companyId}">${companies.get(row.companyId) ?? row.companyId}</a></td><td>sell ${row.sellCurrency} ${row.clientSellAmount}, buy ${row.buyCurrency} ${row.clientBuyAmount} at ${row.clientRate}</td><td>sell ${row.sellCurrency} ${row.bookedSellAmount ?? '?'}, buy ${row.buyCurrency} ${row.bookedBuyAmount ?? '?'} at ${row.bookedRate ?? '?'}</td><td>${row.revenueCurrency ?? ''} ${row.revenueAmount ?? ''}</td></tr>`,
+            )}</table></div>` : ''}
 <div class="card"><h2>Conversions</h2><table><tr><th>When</th><th>Company</th><th>Trade</th><th>Provider rate</th><th>Client rate</th><th>Margin</th><th>Revenue</th><th>Status</th></tr>${rows.slice(0, 200).map(
               (row) =>
-                h`<tr><td>${when(row.bookedAt ?? row.createdAt)}</td><td><a href="/ops/companies/${row.companyId}">${companies.get(row.companyId) ?? row.companyId}</a></td><td>${row.kind === 'forward' ? 'Forward: ' : ''}sold ${row.sellCurrency} ${row.clientSellAmount}, bought ${row.buyCurrency} ${row.clientBuyAmount}</td><td>${row.providerRate}</td><td>${row.clientRate}</td><td>${row.marginBps === null ? 'by the provider' : `${row.marginBps} bp`}</td><td>${row.revenueAmount === null ? 'not known here' : `${row.revenueCurrency ?? ''} ${row.revenueAmount}`}</td><td>${row.status === 'booked' ? (row.mismatch ? h`<span class="tag bad">Booked: CHECK, the provider did not confirm the client’s terms</span>` : 'Booked') : h`<span class="tag bad">Not confirmed by the provider</span>`}</td></tr>`,
+                h`<tr><td>${when(row.bookedAt ?? row.createdAt)}</td><td><a href="/ops/companies/${row.companyId}">${companies.get(row.companyId) ?? row.companyId}</a></td><td>${row.kind === 'forward' ? 'Forward: ' : ''}sold ${row.sellCurrency} ${row.clientSellAmount}, bought ${row.buyCurrency} ${row.clientBuyAmount}</td><td>${row.providerRate}</td><td>${row.clientRate}</td><td>${row.marginBps === null ? 'by the provider' : `${row.marginBps} bp${row.effectiveBps ? ` (${row.effectiveBps} after rounding)` : ''}`}</td><td>${row.revenueAmount === null ? 'not known here' : row.mismatch ? 'not counted' : `${row.revenueCurrency ?? ''} ${row.revenueAmount}`}</td><td>${row.status === 'booked' ? (row.mismatch ? h`<span class="tag bad">Booked: CHECK, the provider did not confirm the client’s terms</span>` : 'Booked') : h`<span class="tag bad">Not confirmed by the provider</span>`}</td></tr>`,
             )}</table>${rows.length === 0 && h`<p class="muted">No conversions in this period.</p>`}${rows.length > 200 && h`<p class="muted">Showing the latest 200 of ${String(rows.length)}. The CSV has them all.</p>`}</div>`,
           ),
         );
@@ -1451,9 +1459,9 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           const safe = /^[=+\-@\t\r]/.test(textValue) && !/^-?\d+(\.\d+)?$/.test(textValue) ? `'${textValue}` : textValue;
           return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
         };
-        const header = ['booked_at', 'company_id', 'company', 'conversion_id', 'status', 'kind', 'pair', 'direction', 'sell_currency', 'buy_currency', 'provider_rate', 'client_rate', 'provider_sell_amount', 'provider_buy_amount', 'client_sell_amount', 'client_buy_amount', 'margin_bps', 'margin_applied_by', 'revenue_amount', 'revenue_currency', 'needs_checking'];
+        const header = ['booked_at', 'company_id', 'company', 'conversion_id', 'status', 'kind', 'pair', 'direction', 'sell_currency', 'buy_currency', 'provider_rate', 'client_rate', 'provider_sell_amount', 'provider_buy_amount', 'client_sell_amount', 'client_buy_amount', 'margin_bps', 'effective_margin_bps', 'margin_applied_by', 'revenue_amount', 'revenue_currency', 'counted_in_totals', 'booked_sell_amount', 'booked_buy_amount', 'needs_checking'];
         const lines = rows.map((row) =>
-          [new Date(row.bookedAt ?? row.createdAt).toISOString(), row.companyId, companies.get(row.companyId) ?? '', row.conversionId, row.status, row.kind, row.pair, row.direction, row.sellCurrency, row.buyCurrency, row.providerRate, row.clientRate, row.providerSellAmount, row.providerBuyAmount, row.clientSellAmount, row.clientBuyAmount, row.marginBps, row.appliedBy, row.revenueAmount, row.revenueCurrency, row.mismatch || row.status !== 'booked' ? 'yes' : 'no'].map(cell).join(','),
+          [new Date(row.bookedAt ?? row.createdAt).toISOString(), row.companyId, companies.get(row.companyId) ?? '', row.conversionId, row.status, row.kind, row.pair, row.direction, row.sellCurrency, row.buyCurrency, row.providerRate, row.clientRate, row.providerSellAmount, row.providerBuyAmount, row.clientSellAmount, row.clientBuyAmount, row.marginBps, row.effectiveBps ?? null, row.appliedBy, row.revenueAmount, row.revenueCurrency, row.status === 'booked' && !row.mismatch && row.revenueAmount !== null ? 'yes' : 'no', row.bookedSellAmount ?? null, row.bookedBuyAmount ?? null, row.mismatch || row.status !== 'booked' ? 'yes' : 'no'].map(cell).join(','),
         );
         await append(opsParty(ctx.user), 'ops.revenue.export', 'success', null, request.ip, { rows: String(rows.length), company: filters.company || 'all', from: filters.from || '-', to: filters.to || '-' });
         return reply.status(200).type('text/csv; charset=utf-8').header('Content-Disposition', 'attachment; filename="global-connect-revenue.csv"').send(`${[header.join(','), ...lines].join('\r\n')}\r\n`);

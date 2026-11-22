@@ -297,6 +297,10 @@ export function mapQuote(raw: RawHeldRateQuote, request: QuoteRequest): Quote {
     createdAt: raw.created_at,
     expiresAt: raw.expires_at,
     settlementDate: request.kind === 'forward' ? (request.settlementDate ?? null) : null,
+    // Server only: does the provider's quote already carry a partner markup? (Its client figures differ from its own.)
+    ...(raw.partner_rate && raw.partner_buy_amount && raw.partner_sell_amount
+      ? { markup: new Big(raw.partner_rate).eq(raw.client_rate) && new Big(raw.partner_buy_amount).eq(raw.client_buy_amount) && new Big(raw.partner_sell_amount).eq(raw.client_sell_amount) ? ('absent' as const) : ('present' as const) }
+      : {}),
   };
 }
 

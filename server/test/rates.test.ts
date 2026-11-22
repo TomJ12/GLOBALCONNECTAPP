@@ -27,7 +27,7 @@ async function signedIn(email: string): Promise<{ token: string }> {
   return { token: reply.json.token };
 }
 const setMargin = (companyId: string, config: Partial<MarginConfig>) =>
-  h.stores.margins.put(companyId, { defaultBps: 50, forwardBps: null, overrides: [], tiers: [], ...config, companyId, updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
+  h.stores.margins.put(companyId, { defaultBps: 50, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP', ...config, companyId, updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
 const get = async (token: string, url: string) => {
   const reply = await h.call('GET', url, { token });
   assert.equal(reply.status, 200, `${url}: ${JSON.stringify(reply.json)}`);

@@ -31,7 +31,7 @@ async function signedIn2(email: string): Promise<string> {
   assert.equal(reply.status, 200);
   return reply.json.token as string;
 }
-const setMargin = (companyId: string, defaultBps: number) => h.stores.margins.put(companyId, { defaultBps, forwardBps: null, overrides: [], tiers: [], companyId, updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
+const setMargin = (companyId: string, defaultBps: number) => h.stores.margins.put(companyId, { defaultBps, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP', companyId, updatedAt: h.clock.now, updatedBy: 'test@globalconnect.example', approvedBy: null });
 const newAlert = (token: string, body: Record<string, unknown>) => h.call('POST', '/v1/alerts', { token, body: { base: 'GBP', quote: 'USD', side: 'sell', targetRate: '1.2950', ...body } });
 const alertsOf = async (token: string) => (await h.call('GET', '/v1/alerts', { token })).json.items as { id: string; status: string; triggeredRate: string | null; triggeredAt: string | null; side: string; targetRate: string }[];
 const notesOf = async (token: string) => (await h.call('GET', '/v1/notifications', { token })).json as { unread: number; items: { id: string; title: string; body: string; category: string; read: boolean }[] };

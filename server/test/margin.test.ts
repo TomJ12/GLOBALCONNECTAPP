@@ -4,9 +4,9 @@ import { test } from 'node:test';
 
 import Big from 'big.js';
 
-import { baseAmountOf, checkMarginConfig, describeMargin, clientRate, clientTermsOf, directionOf, MarginError, marginBps, workedExample, type MarginConfig, type ProviderTerms } from '../src/rates/margin';
+import { canonicalTrade, checkMarginConfig, describeMargin, clientRate, clientTermsOf, directionOf, effectiveBps, indicativePair, indicativeRate, MarginError, marginBps, rateDecimals, tierAmountOf, workedExample, type MarginConfig, type ProviderTerms } from '../src/rates/margin';
 
-const config = (extra: Partial<MarginConfig> = {}): MarginConfig => ({ defaultBps: 50, forwardBps: null, overrides: [], tiers: [], ...extra });
+const config = (extra: Partial<MarginConfig> = {}): MarginConfig => ({ defaultBps: 50, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP', ...extra });
 const sellGbp = (amount: string, rate = '1.2500'): ProviderTerms => ({ sellCurrency: 'GBP', buyCurrency: 'USD', sellAmount: amount, buyAmount: new Big(amount).times(rate).round(2, Big.roundDown).toFixed(2), fixedSide: 'sell', rateBase: 'GBP', rateQuote: 'USD', rate });
 
 test('the margin works against the client in both directions, and the rate is rounded against them', () => {
@@ -41,7 +41,7 @@ test('amounts: the fixed side is exactly what was asked; the other side is round
   assert.deepEqual(clientTermsOf({ ...buysGbp, fixedSide: 'sell' }, 50), { direction: 'buy', rate: '1.256250', sellAmount: '12500.00', buyAmount: '9950.24', revenue: { amount: '49.76', currency: 'GBP' } });
   // A currency with no minor unit rounds to whole units, against the client.
   const toYen: ProviderTerms = { sellCurrency: 'GBP', buyCurrency: 'JPY', sellAmount: '33.33', buyAmount: '6333', fixedSide: 'sell', rateBase: 'GBP', rateQuote: 'JPY', rate: '190.0111' };
-  assert.deepEqual(clientTermsOf(toYen, 37), { direction: 'sell', rate: '189.308058', sellAmount: '33.33', buyAmount: '6309', revenue: { amount: '24', currency: 'JPY' } });
+  assert.deepEqual(clientTermsOf(toYen, 37), { direction: 'sell', rate: '189.3080', sellAmount: '33.33', buyAmount: '6309', revenue: { amount: '24', currency: 'JPY' } });
 
   // Over many amounts and margins: the client never does better than the provider's terms, the fixed side never moves, revenue is never negative.
   for (const amount of ['0.01', '0.07', '1.00', '3.33', '99.99', '1234.56', '10000.00', '999999.99']) {
@@ -74,12 +74,11 @@ test('amounts: the fixed side is exactly what was asked; the other side is round
   assert.throws(() => clientTermsOf(sellGbp('0.01', '0.9000'), 300), /too small to convert/);
   // A quote that is not in the pair it claims is refused.
   assert.throws(() => directionOf({ sellCurrency: 'GBP', buyCurrency: 'EUR', rateBase: 'GBP', rateQuote: 'USD' }), MarginError);
-  assert.equal(baseAmountOf(buysGbp), '10000.00');
 });
 
 test('which margin applies: forwards, then a pair override, then the tier for the amount, then the default', () => {
   const full = config({ defaultBps: 60, forwardBps: 90, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }, { pair: 'EURUSD', direction: 'both', bps: 35 }], tiers: [{ fromAmount: '50000', bps: 45 }, { fromAmount: '250000', bps: 30 }] });
-  const at = (pair: string, direction: 'sell' | 'buy', baseAmount: string | null = null, kind: 'spot' | 'forward' = 'spot') => marginBps(full, { pair, direction, kind, baseAmount });
+  const at = (pair: string, direction: 'sell' | 'buy', baseAmount: string | null = null, kind: 'spot' | 'forward' = 'spot') => marginBps(full, { pair, direction, kind, tierAmount: baseAmount });
   assert.equal(at('GBPEUR', 'sell'), 60);
   assert.equal(at('GBPUSD', 'sell'), 40, 'override for that direction');
   assert.equal(at('GBPUSD', 'buy'), 60, 'not for the other direction');
@@ -93,7 +92,9 @@ test('which margin applies: forwards, then a pair override, then the tier for th
 });
 
 test('bounds: never negative, never absurd, high only when the request says so; tiers get smaller as amounts get larger', () => {
-  assert.deepEqual(checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'both', bps: 20 }], tiers: [{ fromAmount: '50000.00', bps: 40 }] }), false), { defaultBps: 50, forwardBps: null, overrides: [{ pair: 'GBPUSD', direction: 'both', bps: 20 }], tiers: [{ fromAmount: '50000', bps: 40 }] });
+  assert.deepEqual(checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'both', bps: 20 }], tiers: [{ fromAmount: '50000.00', bps: 40 }] }), false), { defaultBps: 50, forwardBps: null, overrides: [{ pair: 'GBPUSD', direction: 'both', bps: 20 }], tiers: [{ fromAmount: '50000', bps: 40 }], tierCurrency: 'GBP' });
+  assert.equal(checkMarginConfig(config({ tierCurrency: 'EUR' }), false).tierCurrency, 'EUR');
+  for (const tierCurrency of ['gbp', 'POUNDS', '', '<b>']) assert.throws(() => checkMarginConfig(config({ tierCurrency }), false), /three-letter currency code/);
   for (const bad of [config({ defaultBps: -1 }), config({ forwardBps: -5 }), config({ overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: -1 }] }), config({ tiers: [{ fromAmount: '100', bps: -1 }] })]) {
     for (const allowHigh of [false, true]) assert.throws(() => checkMarginConfig(bad, allowHigh), /cannot be negative/);
   }
@@ -118,5 +119,75 @@ test('the worked example for staff says what a change does to a concrete trade',
   );
   assert.equal(workedExample(config({ defaultBps: 50 }), config({ defaultBps: 20 }), '1.2500', 'GBPUSD', '10000', 'buy'), 'buying GBP 10,000 with USD: the client rate changes from 1.256250 to 1.252500, so they pay USD 12525.00 instead of USD 12562.50');
   assert.equal(workedExample(config({ defaultBps: 50 }), config({ defaultBps: 50, forwardBps: 100 }), '1.2500', 'GBPUSD', '10000', 'sell', 'forward'), 'a forward selling GBP 10,000 for USD: the client rate changes from 1.243750 to 1.237500, so they receive USD 12375.00 instead of USD 12437.50');
-  assert.equal(describeMargin(config({ forwardBps: 90, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }], tiers: [{ fromAmount: '50000', bps: 45 }] })), 'default 50 bp; forwards 90 bp; GBPUSD sell 40 bp; from 50000: 45 bp');
+  assert.equal(describeMargin(config({ forwardBps: 90, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }], tiers: [{ fromAmount: '50000', bps: 45 }] })), 'default 50 bp; forwards 90 bp; GBPUSD sell 40 bp; from GBP 50000: 45 bp');
+});
+
+test('a client rate keeps seven significant figures whatever its size, so rounding never adds a margin of its own; the margin really applied is worked out', () => {
+  // Around 1: six places, as before. A yen rate: four. A tiny rate: nine. Always against the client.
+  assert.deepEqual([clientRate('1.2500', 'sell', 50), clientRate('195.0325', 'sell', 50), clientRate('0.005128205', 'sell', 50), clientRate('0.005128205', 'buy', 50)], ['1.243750', '194.0573', '0.005102563', '0.005153847']);
+  for (const [rate, bps] of [['0.005128205', 50], ['0.000071', 30], ['195.0325', 120], ['1.2500', 1], ['15234.5', 80]] as const) {
+    for (const direction of ['sell', 'buy'] as const) {
+      const exact = new Big(rate).times(new Big(10_000)[direction === 'sell' ? 'minus' : 'plus'](bps)).div(10_000);
+      const got = new Big(clientRate(rate, direction, bps));
+      assert.ok(direction === 'sell' ? got.lte(exact) : got.gte(exact), `${rate} ${direction}: against the client`);
+      // ...by less than one part in a million: under a hundredth of a basis point. (At six fixed places a rate of 0.005 lost up to 2 bp.)
+      assert.ok(got.minus(exact).abs().div(exact).lt('0.000001'), `${rate} ${direction} ${bps}: ${got.toString()} vs ${exact.toString()}`);
+    }
+  }
+  assert.deepEqual([rateDecimals('1.2935'), rateDecimals('195.03'), rateDecimals('0.0051'), rateDecimals('15234.5'), rateDecimals('1.2935', 5), rateDecimals('195.03', 5), rateDecimals('0.0051', 5)], [6, 4, 9, 2, 4, 2, 7]);
+  // What was really applied, after rounding of the rate and of the amount: on a small amount it is not the configured figure, and it is on record.
+  const provider: ProviderTerms = { sellCurrency: 'GBP', buyCurrency: 'USD', sellAmount: '3.33', buyAmount: '4.16', fixedSide: 'sell', rateBase: 'GBP', rateQuote: 'USD', rate: '1.2500' };
+  const client = clientTermsOf(provider, 50);
+  assert.deepEqual([client.buyAmount, effectiveBps(provider, client)], ['4.14', '48.08']);
+  assert.equal(effectiveBps(sellGbp('10000.00'), clientTermsOf(sellGbp('10000.00'), 50)), '50.00');
+});
+
+test('tiers are measured in ONE currency: the size of a trade is converted to it, whichever way round the pair is quoted', () => {
+  const tiered = config({ defaultBps: 200, tiers: [{ fromAmount: '50000', bps: 10 }], tierCurrency: 'GBP' });
+  const margin = (tierAmount: string | null) => marginBps(tiered, { pair: 'GBPJPY', direction: 'buy', kind: 'spot', tierAmount });
+  // Selling 60,000 YEN (about GBP 306) is not a 50,000 trade...
+  const yen = { sellCurrency: 'JPY', buyCurrency: 'GBP', sellAmount: '60000', buyAmount: '306.12' };
+  assert.equal(tierAmountOf(yen, 'GBP'), '306.12');
+  assert.equal(margin(tierAmountOf(yen, 'GBP')), 200);
+  // ...selling GBP 60,000 is, in either direction and whichever currency the adapter calls the base.
+  assert.equal(margin(tierAmountOf({ sellCurrency: 'GBP', buyCurrency: 'JPY', sellAmount: '60000.00', buyAmount: '11700000' }, 'GBP')), 10);
+  assert.equal(margin(tierAmountOf({ sellCurrency: 'JPY', buyCurrency: 'GBP', sellAmount: '11700000', buyAmount: '60000.00' }, 'GBP')), 10);
+  // The boundary, to the penny.
+  assert.deepEqual([margin('49999.99'), margin('50000.00'), margin('50000')], [200, 10, 10]);
+  // Neither currency is the tier currency: converted with the provider's rate for the sell currency; without one, NO tier (never to the client's advantage).
+  const eurUsd = { sellCurrency: 'EUR', buyCurrency: 'USD', sellAmount: '60000.00', buyAmount: '66000.00' };
+  assert.equal(tierAmountOf(eurUsd, 'GBP', '0.8475'), '50850.00');
+  assert.equal(margin(tierAmountOf(eurUsd, 'GBP', '0.8475')), 10);
+  assert.equal(margin(tierAmountOf({ ...eurUsd, sellAmount: '58000.00' }, 'GBP', '0.8475')), 200);
+  assert.equal(tierAmountOf(eurUsd, 'GBP', null), null);
+  assert.equal(margin(null), 200);
+  // ONE orientation for every pair, whatever an adapter calls its base.
+  assert.deepEqual([canonicalTrade('USDGBP', 'sell'), canonicalTrade('GBPUSD', 'buy'), canonicalTrade('JPYGBP', 'sell'), canonicalTrade('USDEUR', 'buy'), canonicalTrade('AEDJPY', 'sell'), canonicalTrade('JPYAED', 'sell')], [{ pair: 'GBPUSD', direction: 'buy' }, { pair: 'GBPUSD', direction: 'buy' }, { pair: 'GBPJPY', direction: 'buy' }, { pair: 'EURUSD', direction: 'sell' }, { pair: 'AEDJPY', direction: 'sell' }, { pair: 'AEDJPY', direction: 'buy' }]);
+});
+
+test('indicative rates are given to display precision, against the client in each direction, and are never an exact image of the provider rate and the margin', () => {
+  // Five significant figures: what the app shows. Selling: down. Buying: up.
+  assert.deepEqual([indicativeRate('1.30247', 'sell', 50), indicativeRate('1.30247', 'buy', 50)], ['1.2959', '1.3090']);
+  assert.deepEqual([indicativeRate('195.0325', 'sell', 50), indicativeRate('195.0325', 'buy', 50), indicativeRate('0.005128205', 'sell', 50), indicativeRate('0.005128205', 'buy', 50)], ['194.05', '196.01', '0.0051025', '0.0051539']);
+  assert.deepEqual(indicativePair('1.30247', 50, 50), { sell: '1.2959', buy: '1.3090' });
+  // When the client's rates sit exactly on displayable figures (1.3000 with 50 bp: 1.2935 and 1.3065), or so nearly that the
+  // rounding moved them by less than a quarter of a step, the SELL figure is shown one step lower.
+  assert.deepEqual(indicativePair('1.3000', 50, 50), { sell: '1.2934', buy: '1.3065' });
+  assert.deepEqual(indicativePair('1.2997', 20, 20), { sell: '1.2970', buy: '1.3023' });
+  for (const rate of ['1.3000', '1.30247', '1.1800', '0.7692', '195.00', '0.005128', '1.2997', '1.3001', '4.7743', '1.2999', '1.3004', '0.8475']) {
+    for (const [sellBps, buyBps] of [[0, 0], [20, 20], [50, 50], [100, 100], [120, 120], [250, 250], [20, 50], [1, 1], [33, 33]] as const) {
+      const shown = indicativePair(rate, sellBps, buyBps);
+      const [sell, buy] = [new Big(shown.sell), new Big(shown.buy)];
+      const exactSell = new Big(rate).times(new Big(10_000).minus(sellBps)).div(10_000);
+      const exactBuy = new Big(rate).times(new Big(10_000).plus(buyBps)).div(10_000);
+      // Never better than a held quote would be, and within two display steps of it.
+      const step = new Big(10).pow(-rateDecimals(exactSell, 5));
+      assert.ok(sell.lte(exactSell) && buy.gte(exactBuy), `${rate} ${sellBps}`);
+      assert.ok(exactSell.minus(sell).lte(step.times(2)) && buy.minus(exactBuy).lte(step), `${rate} ${sellBps}`);
+      // Together at least a quarter of a step beyond the exact figures...
+      assert.ok(exactSell.minus(sell).plus(buy.minus(exactBuy)).gte(step.div(4)), `${rate} ${sellBps}`);
+      // ...so the margin cannot be read off them: (buy - sell) / (buy + sell) is not the configured margin at six places.
+      if (sellBps === buyBps) assert.notEqual(buy.minus(sell).div(buy.plus(sell)).round(6, Big.roundHalfUp).toFixed(6), new Big(sellBps).div(10_000).toFixed(6), `${rate} at ${sellBps} bp gives the margin away: ${shown.sell} / ${shown.buy}`);
+    }
+  }
 });

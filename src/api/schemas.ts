@@ -140,6 +140,7 @@ export const quote: z.ZodType<Quote> = z.object({
   settlementDate: isoDate.nullable(),
 });
 export const conversion: z.ZodType<Conversion> = z.object({
+  differsFromQuote: z.boolean().optional(),
   id: text,
   reference: text,
   kind,

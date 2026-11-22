@@ -16,8 +16,9 @@
  * indicative rate, the held quote and the booked conversion because all three
  * come from the functions below:
  *
- *   - a client rate is kept to RATE_DECIMALS places, rounded DOWN when the
- *     client sells the base and UP when they buy it;
+ *   - a client rate is kept to RATE_SIGNIFICANT significant figures (so that
+ *     rounding costs the same tiny fraction whether the rate is 195 or 0.005),
+ *     rounded DOWN when the client sells the base and UP when they buy it;
  *   - an amount the client RECEIVES is rounded DOWN to the currency's minor
  *     unit, an amount the client PAYS is rounded UP;
  *   - and whatever the arithmetic says, the client never gets better terms
@@ -29,7 +30,16 @@ import Big from 'big.js';
 
 import { currencyDecimals } from '@/lib/money';
 
-export const RATE_DECIMALS = 6;
+/** A client rate has this many significant figures: 1.293500, 195.0325, 0.005128205. Rounding moves it by less than one part in a million. */
+export const RATE_SIGNIFICANT = 7;
+/** An INDICATIVE rate is shown to this many significant figures (1.2935, 195.03, 0.0051282): what the app displays. */
+export const INDICATIVE_SIGNIFICANT = 5;
+/** How many decimal places give `significant` significant figures of this rate. */
+export function rateDecimals(rate: Big.BigSource, significant = RATE_SIGNIFICANT): number {
+  const value = new Big(rate);
+  if (!value.gt(0)) throw new MarginError('The rate is not a positive number.');
+  return Math.min(14, Math.max(0, significant - 1 - value.e));
+}
 /** A margin above this needs an explicit "yes, this high" in the request. 300 bp = 3%. */
 export const MARGIN_USUAL_MAX_BPS = 300;
 /** Never accepted, whatever the request says. 2000 bp = 20%. */
@@ -45,7 +55,7 @@ export interface MarginOverride {
   bps: number;
 }
 export interface MarginTier {
-  /** In units of the pair's base currency: this tier applies from this amount up. */
+  /** In units of the configuration's `tierCurrency`: this tier applies from this amount up. */
   fromAmount: string;
   bps: number;
 }
@@ -57,7 +67,13 @@ export interface MarginConfig {
   overrides: MarginOverride[];
   /** Larger amounts, smaller margin. Ascending by amount; each no higher than the one before. */
   tiers: MarginTier[];
+  /**
+   * THE ONE CURRENCY tier amounts are in, for every pair and whichever way a provider quotes it (default GBP). A
+   * trade's size is converted to it at the provider's rate before a tier is chosen: 60,000 yen is not 60,000 pounds.
+   */
+  tierCurrency: string;
 }
+export const DEFAULT_TIER_CURRENCY = 'GBP';
 
 export class MarginError extends Error {}
 
@@ -66,7 +82,19 @@ export class MarginError extends Error {}
  * either way covers both, so a rate asked for "the other way round" can never slip past it.
  */
 const flip = (direction: Direction): Direction => (direction === 'sell' ? 'buy' : 'sell');
-const canonical = (pair: string, direction: Direction): string => (pair.slice(0, 3) < pair.slice(3) ? `${pair}:${direction}` : `${pair.slice(3)}${pair.slice(0, 3)}:${flip(direction)}`);
+/** ONE orientation per pair, whatever a provider's adapter calls its base: the market's usual order, then alphabetical. */
+const CONVENTION = ['EUR', 'GBP', 'AUD', 'NZD', 'USD', 'CAD', 'CHF'];
+const rank = (currency: string): string => `${String(CONVENTION.indexOf(currency) === -1 ? CONVENTION.length : CONVENTION.indexOf(currency)).padStart(2, '0')}${currency}`;
+export const isCanonical = (base: string, quote: string): boolean => rank(base) < rank(quote);
+/** The pair and direction in that one orientation: selling USD in "USDGBP" is buying GBP in GBPUSD. */
+export function canonicalTrade(pair: string, direction: Direction): { pair: string; direction: Direction } {
+  const [base, quote] = [pair.slice(0, 3), pair.slice(3)];
+  return isCanonical(base, quote) ? { pair, direction } : { pair: `${quote}${base}`, direction: flip(direction) };
+}
+const canonical = (pair: string, direction: Direction): string => {
+  const trade = canonicalTrade(pair, direction);
+  return `${trade.pair}:${trade.direction}`;
+};
 
 const isBps = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value);
 
@@ -107,7 +135,9 @@ export function checkMarginConfig(config: MarginConfig, allowHigh: boolean): Mar
     return { fromAmount: amount.toString(), bps: value };
   });
   if (tiers.length > 10) throw new MarginError('At most 10 tiers.');
-  return { defaultBps, forwardBps, overrides, tiers };
+  const tierCurrency = config.tierCurrency ?? DEFAULT_TIER_CURRENCY;
+  if (typeof tierCurrency !== 'string' || !/^[A-Z]{3}$/.test(tierCurrency)) throw new MarginError('The currency tiers are measured in must be a three-letter currency code, like GBP.');
+  return { defaultBps, forwardBps, overrides, tiers, tierCurrency };
 }
 
 /**
@@ -115,16 +145,18 @@ export function checkMarginConfig(config: MarginConfig, allowHigh: boolean): Mar
  * forward margin if one is set; otherwise an override for this pair and
  * direction (in either spelling of the pair); otherwise the tier for the
  * amount; otherwise the default.
- * `baseAmount` is the trade's size in the pair's base currency; without one
- * (an indicative rate, which is for no particular amount) no tier applies.
+ * `tierAmount` is the trade's size IN THE CONFIGURATION'S TIER CURRENCY (see
+ * `tierAmountOf`); without one (an indicative rate, which is for no particular
+ * amount, or a size that could not be converted) no tier applies, which is
+ * never to the client's advantage.
  */
-export function marginBps(config: MarginConfig, trade: { pair: string; direction: Direction; kind: 'spot' | 'forward'; baseAmount?: string | null }): number {
+export function marginBps(config: MarginConfig, trade: { pair: string; direction: Direction; kind: 'spot' | 'forward'; tierAmount?: string | null }): number {
   if (trade.kind === 'forward' && config.forwardBps !== null) return config.forwardBps;
   const wanted = canonical(trade.pair, trade.direction);
   const override = config.overrides.find((item) => (item.direction === 'both' ? (['sell', 'buy'] as const) : [item.direction]).some((direction) => canonical(item.pair, direction) === wanted));
   if (override) return override.bps;
-  if (trade.baseAmount) {
-    const amount = new Big(trade.baseAmount);
+  if (trade.tierAmount) {
+    const amount = new Big(trade.tierAmount);
     const tier = [...config.tiers].reverse().find((item) => amount.gte(item.fromAmount));
     if (tier) return tier.bps;
   }
@@ -136,9 +168,49 @@ export function clientRate(providerRate: string, direction: Direction, bps: numb
   const rate = new Big(providerRate);
   if (!rate.gt(0)) throw new MarginError('The provider rate is not a positive number.');
   const factor = new Big(10_000)[direction === 'sell' ? 'minus' : 'plus'](bps).div(10_000);
-  const result = rate.times(factor).round(RATE_DECIMALS, direction === 'sell' ? Big.roundDown : Big.roundUp);
+  const exact = rate.times(factor);
+  if (!exact.gt(0)) throw new MarginError('The client rate would not be positive.');
+  const places = rateDecimals(exact);
+  const result = exact.round(places, direction === 'sell' ? Big.roundDown : Big.roundUp);
   if (!result.gt(0)) throw new MarginError('The client rate would not be positive.');
-  return result.toFixed(RATE_DECIMALS);
+  return result.toFixed(places);
+}
+
+/**
+ * AN INDICATIVE RATE for one direction: the client's rate, to the precision the app displays
+ * (INDICATIVE_SIGNIFICANT figures), rounded AGAINST them. A held quote, for a particular amount and direction, has
+ * the client's rate in full; an indicative rate is never better than that.
+ */
+export function indicativeRate(providerRate: string, direction: Direction, bps: number): string {
+  const rate = new Big(providerRate);
+  if (!rate.gt(0)) throw new MarginError('The provider rate is not a positive number.');
+  const exact = rate.times(new Big(10_000)[direction === 'sell' ? 'minus' : 'plus'](bps).div(10_000));
+  const places = rateDecimals(exact, INDICATIVE_SIGNIFICANT);
+  const shown = exact.round(places, direction === 'sell' ? Big.roundDown : Big.roundUp);
+  if (!shown.gt(0)) throw new MarginError('The indicative rate would not be positive.');
+  return shown.toFixed(places);
+}
+
+/**
+ * THE TWO INDICATIVE RATES a client is shown for a pair. Each is rounded against the client by itself, as above.
+ * A two-way price always lets anyone estimate a midpoint and a spread; what this adds is that the estimate is never
+ * EXACT: if the two roundings together moved the figures by less than a quarter of a display step (for instance when
+ * the client's rates happen to sit exactly on displayable figures), the SELL figure is shown one step lower. The
+ * two figures are therefore always at least a quarter of a step further apart than the provider's rate and the
+ * margin alone would put them: the spread read off them is never the margin to six places.
+ */
+export function indicativePair(providerRate: string, sellBps: number, buyBps: number): { sell: string; buy: string } {
+  const rate = new Big(providerRate);
+  const exactSell = rate.times(new Big(10_000).minus(sellBps).div(10_000));
+  const exactBuy = rate.times(new Big(10_000).plus(buyBps).div(10_000));
+  const sell = new Big(indicativeRate(providerRate, 'sell', sellBps));
+  const buy = new Big(indicativeRate(providerRate, 'buy', buyBps));
+  const places = rateDecimals(exactSell, INDICATIVE_SIGNIFICANT);
+  const step = new Big(10).pow(-places);
+  const moved = exactSell.minus(sell).plus(buy.minus(exactBuy));
+  const shown = moved.lt(step.div(4)) ? sell.minus(step) : sell;
+  if (!shown.gt(0)) throw new MarginError('The indicative rate would not be positive.');
+  return { sell: shown.toFixed(places), buy: buy.toFixed(rateDecimals(exactBuy, INDICATIVE_SIGNIFICANT)) };
 }
 
 /** The parts of a provider's quote the margin is applied to. */
@@ -169,9 +241,23 @@ export function directionOf(terms: Pick<ProviderTerms, 'sellCurrency' | 'buyCurr
   throw new MarginError('The quote is not in the pair it says it is in.');
 }
 
-/** The size of a trade in the pair's base currency (what tiers are measured in). */
-export function baseAmountOf(terms: ProviderTerms): string {
-  return directionOf(terms) === 'sell' ? terms.sellAmount : terms.buyAmount;
+/**
+ * The size of a trade in the currency tiers are measured in, or null if it cannot be worked out here. When that
+ * currency is one of the two being traded the amount is simply that side's; otherwise `toTierCurrency` is the
+ * provider's rate for 1 unit of the SELL currency in the tier currency.
+ */
+export function tierAmountOf(terms: Pick<ProviderTerms, 'sellCurrency' | 'buyCurrency' | 'sellAmount' | 'buyAmount'>, tierCurrency: string, toTierCurrency: string | null = null): string | null {
+  if (terms.sellCurrency === tierCurrency) return terms.sellAmount;
+  if (terms.buyCurrency === tierCurrency) return terms.buyAmount;
+  if (toTierCurrency === null || !new Big(toTierCurrency).gt(0)) return null;
+  return new Big(terms.sellAmount).times(toTierCurrency).round(2, Big.roundDown).toFixed(2);
+}
+
+/** The margin that was REALLY applied to a trade, after all rounding, in basis points to two places: what is kept, over what the provider gave or took on that side. */
+export function effectiveBps(provider: Pick<ProviderTerms, 'sellAmount' | 'buyAmount' | 'fixedSide'>, client: Pick<ClientTerms, 'sellAmount' | 'buyAmount'>): string {
+  const [theirs, ours] = provider.fixedSide === 'sell' ? [new Big(provider.buyAmount), new Big(client.buyAmount)] : [new Big(provider.sellAmount), new Big(client.sellAmount)];
+  if (!theirs.gt(0)) return '0.00';
+  return theirs.minus(ours).abs().div(theirs).times(10_000).round(2, Big.roundHalfUp).toFixed(2);
 }
 
 /**
@@ -184,7 +270,7 @@ export function clientTermsOf(provider: ProviderTerms, bps: number): ClientTerms
   const direction = directionOf(provider);
   const sellDp = currencyDecimals(provider.sellCurrency);
   const buyDp = currencyDecimals(provider.buyCurrency);
-  if (bps === 0) return { direction, rate: new Big(provider.rate).toFixed(RATE_DECIMALS), sellAmount: provider.sellAmount, buyAmount: provider.buyAmount, revenue: { amount: new Big(0).toFixed(provider.fixedSide === 'sell' ? buyDp : sellDp), currency: provider.fixedSide === 'sell' ? provider.buyCurrency : provider.sellCurrency } };
+  if (bps === 0) return { direction, rate: new Big(provider.rate).toFixed(rateDecimals(provider.rate)), sellAmount: provider.sellAmount, buyAmount: provider.buyAmount, revenue: { amount: new Big(0).toFixed(provider.fixedSide === 'sell' ? buyDp : sellDp), currency: provider.fixedSide === 'sell' ? provider.buyCurrency : provider.sellCurrency } };
   const rate = new Big(clientRate(provider.rate, direction, bps));
   if (provider.fixedSide === 'sell') {
     // The client pays exactly what they said; what they RECEIVE is rounded down, and never more than the provider would give.
@@ -193,14 +279,14 @@ export function clientTermsOf(provider: ProviderTerms, bps: number): ClientTerms
     const limit = new Big(provider.buyAmount);
     const buy = worked.gt(limit) ? limit : worked;
     if (!buy.gt(0)) throw new MarginError('The amount is too small to convert.');
-    return { direction, rate: rate.toFixed(RATE_DECIMALS), sellAmount: provider.sellAmount, buyAmount: buy.toFixed(buyDp), revenue: { amount: limit.minus(buy).toFixed(buyDp), currency: provider.buyCurrency } };
+    return { direction, rate: rate.toFixed(rateDecimals(rate)), sellAmount: provider.sellAmount, buyAmount: buy.toFixed(buyDp), revenue: { amount: limit.minus(buy).toFixed(buyDp), currency: provider.buyCurrency } };
   }
   // The client receives exactly what they said; what they PAY is rounded up, and never less than the provider would take.
   const buy = new Big(provider.buyAmount);
   const worked = (direction === 'buy' ? buy.times(rate) : buy.div(rate)).round(sellDp, Big.roundUp);
   const limit = new Big(provider.sellAmount);
   const sell = worked.lt(limit) ? limit : worked;
-  return { direction, rate: rate.toFixed(RATE_DECIMALS), sellAmount: sell.toFixed(sellDp), buyAmount: provider.buyAmount, revenue: { amount: sell.minus(limit).toFixed(sellDp), currency: provider.sellCurrency } };
+  return { direction, rate: rate.toFixed(rateDecimals(rate)), sellAmount: sell.toFixed(sellDp), buyAmount: provider.buyAmount, revenue: { amount: sell.minus(limit).toFixed(sellDp), currency: provider.sellCurrency } };
 }
 
 /** One line of a margin configuration in words, for staff and the audit log. */
@@ -209,7 +295,7 @@ export function describeMargin(config: MarginConfig): string {
     `default ${config.defaultBps} bp`,
     config.forwardBps === null ? 'forwards as spot' : `forwards ${config.forwardBps} bp`,
     ...config.overrides.map((item) => `${item.pair} ${item.direction} ${item.bps} bp`),
-    ...config.tiers.map((item) => `from ${item.fromAmount}: ${item.bps} bp`),
+    ...config.tiers.map((item) => `from ${config.tierCurrency ?? DEFAULT_TIER_CURRENCY} ${item.fromAmount}: ${item.bps} bp`),
   ].join('; ');
 }
 
@@ -221,7 +307,8 @@ export function workedExample(before: MarginConfig, after: MarginConfig, provide
   const [base, quote] = [pair.slice(0, 3), pair.slice(3)];
   const other = new Big(amount).times(providerRate).round(currencyDecimals(quote), direction === 'sell' ? Big.roundDown : Big.roundUp).toFixed(currencyDecimals(quote));
   const terms: ProviderTerms = direction === 'sell' ? { sellCurrency: base, buyCurrency: quote, sellAmount: amount, buyAmount: other, fixedSide: 'sell', rateBase: base, rateQuote: quote, rate: providerRate } : { sellCurrency: quote, buyCurrency: base, sellAmount: other, buyAmount: amount, fixedSide: 'buy', rateBase: base, rateQuote: quote, rate: providerRate };
-  const side = (config: MarginConfig) => clientTermsOf(terms, marginBps(config, { pair, direction, kind, baseAmount: amount }));
+  // The trade's size in each configuration's own tier currency (the example pair has it on one side, or no tier applies).
+  const side = (config: MarginConfig) => clientTermsOf(terms, marginBps(config, { pair, direction, kind, tierAmount: tierAmountOf(terms, config.tierCurrency ?? DEFAULT_TIER_CURRENCY) }));
   const [old, next] = [side(before), side(after)];
   const figure = new Intl.NumberFormat('en-GB').format(Number(amount));
   const what = kind === 'forward' ? 'a forward ' : '';

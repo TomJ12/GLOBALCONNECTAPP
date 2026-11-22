@@ -14,6 +14,7 @@ import type {
   AttemptRecord,
   CompanyRecord,
   LoginChallengeRecord,
+  HeldQuoteRecord,
   MailRecord,
   MarginRecord,
   NotificationPrefsRecord,
@@ -264,11 +265,12 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const authenticatorResets = new SqlTable<AuthenticatorResetRecord>(db, 'authenticator_resets', { indexed: ['userId', 'status'], audit });
   const providerKeys = new SqlTable<ProviderKeyRecord>(db, 'provider_keys');
   const mail = new SqlTable<MailRecord>(db, 'mail_outbox', { indexed: ['status', 'to', 'sentHour'], secret: { field: 'body', keys } });
+  const quotes = new SqlTable<HeldQuoteRecord>(db, 'held_quotes', { indexed: ['companyId'] });
   const alerts = new SqlTable<RateAlertRecord>(db, 'rate_alerts', { indexed: ['userId', 'status'], audit });
   const notifications = new SqlTable<NotificationRecord>(db, 'notifications', { indexed: ['userId'], secret: { field: 'body', keys }, audit });
   const notificationPrefs = new SqlTable<NotificationPrefsRecord>(db, 'notification_prefs', { audit });
   const margins = new SqlTable<MarginRecord>(db, 'company_margins', { audit });
-  const revenue = new SqlTable<RevenueRecord>(db, 'fx_revenue', { indexed: ['companyId', 'conversionId'] });
+  const revenue = new SqlTable<RevenueRecord>(db, 'fx_revenue', { indexed: ['companyId', 'conversionId'], audit });
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
   if (options.seed && !db.get('SELECT 1 FROM users LIMIT 1') && !db.get('SELECT 1 FROM companies LIMIT 1')) {
     const { seed } = options;
@@ -282,6 +284,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const IDLE_COUNTER_MS = 2 * 60 * 60_000;
   return {
     db,
+    quotes,
     alerts,
     notifications,
     notificationPrefs,

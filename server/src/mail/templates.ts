@@ -111,6 +111,14 @@ export const NOTIFICATIONS = {
   }),
   // A security notice, shown in the app as well as emailed. The same words as the email (SECURITY_NOTICES).
   security_notice: (data: { kind: SecurityNotice; at: number; until?: number }): NoteText => ({ title: 'Security notice about your account', lines: [...SECURITY_NOTICES[data.kind](data), `Time: ${utc(data.at)}.`, NOT_YOU] }),
+  // A conversion the provider booked on terms other than the ones the client was quoted. What to do is a PLACEHOLDER (MAIL_CONTACT).
+  conversion_differs: (data: { sellCurrency: string; buyCurrency: string; quotedSell: string; quotedBuy: string; bookedSell: string; bookedBuy: string }): NoteText => ({
+    title: 'A conversion was not booked as quoted',
+    lines: [
+      `You were quoted ${typed(data.sellCurrency, 3)} ${typed(data.quotedSell, 24)} for ${typed(data.buyCurrency, 3)} ${typed(data.quotedBuy, 24)}. What was booked is ${typed(data.sellCurrency, 3)} ${typed(data.bookedSell, 24)} for ${typed(data.buyCurrency, 3)} ${typed(data.bookedBuy, 24)}: that is what moved on the account.`,
+      `Please contact Global Connect before converting again: ${MAIL_CONTACT}`,
+    ],
+  }),
   payment_approved: (data: PaymentNote): NoteText => ({ title: 'Your payment was approved', lines: [`Your payment of ${payment(data)} has all the approvals it needs and is being sent for processing.`] }),
   payment_rejected: (data: PaymentNote): NoteText => ({
     title: 'Your payment was rejected',
@@ -136,7 +144,7 @@ export type NotificationData<K extends NotificationKind> = Parameters<(typeof NO
 export const notificationText = (kind: NotificationKind, data: unknown): NoteText => (NOTIFICATIONS[kind] as (input: unknown) => NoteText)(data);
 /** The subject of a notification email: which kind of thing it is, and nothing about it. */
 const NOTIFICATION_SUBJECT = (kind: NotificationKind): string =>
-  kind === 'security_notice' ? 'Security notice for your Global Connect account' : kind === 'rate_alert' ? 'A rate alert on your Global Connect account' : kind === 'payment_awaiting' || kind === 'payment_expiring' ? 'A payment is waiting for your approval in Global Connect' : 'An update on a payment you created in Global Connect';
+  kind === 'security_notice' ? 'Security notice for your Global Connect account' : kind === 'rate_alert' ? 'A rate alert on your Global Connect account' : kind === 'conversion_differs' ? 'A conversion in Global Connect needs your attention' : kind === 'payment_awaiting' || kind === 'payment_expiring' ? 'A payment is waiting for your approval in Global Connect' : 'An update on a payment you created in Global Connect';
 
 export const TEMPLATES = {
   'activation.client': (data: { name: string; link: string; expiresAt: number }): Draft => ({
