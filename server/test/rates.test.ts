@@ -303,12 +303,26 @@ test('a provider that books WITHOUT the client’s terms: the client is shown wh
   const open = (await revenue()).find((item) => item.quoteId === second.id);
   assert.deepEqual([open?.status, open?.conversionId, open?.clientBuyAmount], ['booking', null, '258.70']);
   h.providerA.request = original;
-  // Asked again with the same key and quote: answered from the conversion that WAS made (found by its key), not booked again.
-  const retried = await book(amira.token, second.id, 'rates-key-m-0002');
-  assert.deepEqual([retried.status, retried.json.rate, retried.json.buyAmount, retried.json.differsFromQuote], [200, '1.293500', '258.70', undefined]);
+  // Looked up by its key: the conversion WAS made, and this server's record of it is closed now.
+  const found = await get(amira.token, '/v1/conversions/by-key/rates-key-m-0002');
+  assert.deepEqual([found.rate, found.buyAmount, found.differsFromQuote], ['1.293500', '258.70', undefined]);
   const closed = (await revenue()).find((item) => item.quoteId === second.id);
-  assert.deepEqual([closed?.status, closed?.conversionId, closed?.mismatch], ['booked', retried.json.id, false]);
-  assert.deepEqual(await get(amira.token, '/v1/conversions/by-key/rates-key-m-0002'), retried.json);
+  assert.deepEqual([closed?.status, closed?.conversionId, closed?.mismatch], ['booked', found.id, false]);
+  // Asked for again with the same key and quote: answered from that conversion, not booked again.
+  const retried = await book(amira.token, second.id, 'rates-key-m-0002');
+  assert.deepEqual([retried.status, retried.json], [200, found]);
+  // A second lost answer, this time simply retried: the retry finds the conversion by its key and closes the record itself.
+  h.providerA.request = async (request) => {
+    const reply = await original(request);
+    if (request.path === '/v2/conversions/create') throw new TypeError('Network request failed');
+    return reply;
+  };
+  const again = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '300.00' });
+  assert.equal((await book(amira.token, again.id, 'rates-key-m-0004')).status >= 500, true);
+  h.providerA.request = original;
+  const second2 = await book(amira.token, again.id, 'rates-key-m-0004');
+  assert.deepEqual([second2.status, second2.json.buyAmount], [200, '388.05']);
+  assert.deepEqual((await revenue()).filter((item) => item.quoteId === again.id).map((item) => item.status), ['booked']);
 
   // A definite refusal: nothing was booked, and the record says so.
   const third = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '99999999.00' });
