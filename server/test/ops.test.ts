@@ -1791,8 +1791,21 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.equal((await admin.browser.get('/ops/users')).status, 200);
   assert.match((await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'password1234' })).body, /password/i);
   // With a code: the password changes, only the password; every session of theirs ends; the new password signs in.
+  // (A confirmation page open in the session they have now: its token must not outlive that session.)
+  const heldToken = confirmTokenOf((await admin.browser.post('/ops/users/usr_ben/disable')).body) as string;
+  assert.ok(heldToken);
   const done = await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'a completely new staff password' });
   assert.deepEqual([done.status, done.location], [303, '/ops/login?done=password_reset']);
+  // The session is gone and so is what its confirmation token could do: in the old session, and carried into a new one.
+  assert.equal((await h.stores.ops.sessions.count({ userId: admin.id })), 0);
+  assert.equal((await admin.browser.post('/ops/users/usr_ben/disable', { _confirm: heldToken })).status, 401);
+  const again = fresh();
+  assert.equal((await signIn(again, admin.email, admin.secret, 'a completely new staff password')).status, 303);
+  await again.get('/ops/users');
+  const carried = await again.post('/ops/users/usr_ben/disable', { _confirm: heldToken });
+  assert.equal(carried.status, 409);
+  assert.match(carried.body, /That confirmation has expired, or what it would do has changed/);
+  assert.equal((await h.stores.directory.getUser('usr_ben'))?.disabledAt ?? null, null);
   const after = await h.stores.ops.users.get(admin.id);
   assert.notEqual(after?.passwordHash, before?.passwordHash);
   assert.deepEqual([after?.totpSecret, after?.recoveryCodeHashes, after?.role], [before?.totpSecret, before?.recoveryCodeHashes, before?.role]);
