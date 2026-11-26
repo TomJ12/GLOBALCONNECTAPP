@@ -36,6 +36,8 @@ export interface SelfServiceClient {
   beginPasswordReset(resetCode: string): Promise<{ minLength: number }>;
   /** The link, a code from the authenticator app (or a recovery code), and the new password. */
   completePasswordReset(code: string, method: CodeMethod, password: string): Promise<void>;
+  /** "This was not me": cancels the reset of the authenticator that the emailed link names. Always resolves the same way. */
+  cancelAuthenticatorReset(token: string): Promise<void>;
   changePassword(currentPassword: string, code: string, newPassword: string): Promise<void>;
   /** New recovery codes, to be shown once. The old ones stop working. */
   regenerateRecoveryCodes(code: string): Promise<string[]>;

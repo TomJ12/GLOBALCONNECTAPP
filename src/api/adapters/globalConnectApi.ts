@@ -239,6 +239,9 @@ export class GlobalConnectApi implements ProviderClient, AuthClient {
       await this.call(schemas.ok, 'POST', '/auth/password-reset/complete', { body: { resetCode: this.resetCode ?? '', code: code.trim(), method, password }, anonymous: true });
       this.resetCode = null;
     },
+    cancelAuthenticatorReset: async (token) => {
+      await this.call(schemas.ok, 'POST', '/auth/authenticator-reset/cancel', { body: { token }, anonymous: true });
+    },
     changePassword: async (currentPassword, code, newPassword) => {
       await this.call(schemas.ok, 'POST', '/account/password', { body: { currentPassword, code: code.trim(), newPassword } });
     },

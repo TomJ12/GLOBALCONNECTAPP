@@ -12,9 +12,12 @@
  *     approval: while the warning is still queued or deferred nothing is due,
  *     and if the mail server refuses it for good it is queued again and the
  *     reset goes on waiting (the ops console shows that);
- *  3. if the client signs in successfully during the delay (password and
- *     code), the reset is cancelled, automatically, and that is audited: the
- *     person who really has the credentials evidently did not lose them;
+ *  3. if the server accepts a code from the client's authenticator during
+ *     the delay (signing in, a step-up, a password change or reset, new
+ *     recovery codes), the reset is cancelled, automatically, and that is
+ *     audited: whoever holds the authenticator evidently did not lose it.
+ *     The warning email also carries a "this was not me" link that cancels
+ *     this one reset and does nothing else (for someone who cannot sign in);
  *  4. any ops admin can cancel it during the delay;
  *  5. only when the delay has passed are the credentials cleared and the new
  *     activation link emailed. The reset is first CLAIMED (waiting ->

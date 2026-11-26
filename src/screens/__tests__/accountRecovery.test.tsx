@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 import { getAuthClient } from '@/api';
 import type { SelfServiceClient } from '@/api/auth';
 import { ProviderError } from '@/api/errors';
+import { CANCEL_RESET_DONE, CancelResetScreen } from '@/screens/CancelResetScreen';
 import { NO_SECOND_FACTOR, RESET_MAYBE_DONE, RESET_REQUESTED, ResetPasswordScreen } from '@/screens/ResetPasswordScreen';
 import { SecurityScreen } from '@/screens/SecurityScreen';
 import { SettingsScreen } from '@/screens/SettingsScreen';
@@ -18,6 +19,7 @@ function selfService(overrides: Partial<SelfServiceClient> = {}): jest.Mocked<Se
     requestPasswordReset: jest.fn(async () => undefined),
     beginPasswordReset: jest.fn(async () => ({ minLength: 12 })),
     completePasswordReset: jest.fn(async () => undefined),
+    cancelAuthenticatorReset: jest.fn(async () => undefined),
     changePassword: jest.fn(async () => undefined),
     regenerateRecoveryCodes: jest.fn(async () => ['AAAAA-BBBBB-CCCCC-DDDDD', 'EEEEE-FFFFF-GGGGG-HHHHH']),
     listSessions: jest.fn(async () => [
@@ -195,5 +197,40 @@ describe('security settings', () => {
     await waitFor(() => expect(service.endSession).toHaveBeenCalledWith('ref-this'));
     await waitFor(() => expect(useSession.getState().session).toBeNull());
     expect(expoRouter.router.replace).toHaveBeenCalledWith('/sign-in');
+  });
+});
+
+describe('“This was not me”: the link in the warning before an authenticator reset', () => {
+  it('reads the token from the fragment only, wipes the address bar at once, does nothing until the button is pressed, and says the same whatever the link was', async () => {
+    const service = selfService();
+    const link = openedFromLink('/cancel-reset', '#token=ar_0123456789abcdef.c2lnbmF0dXJl');
+    try {
+      await renderScreen(<CancelResetScreen />);
+      // The token left the address bar before anything was sent, and nothing has been sent: opening the link cancels nothing.
+      expect(link.replaceState).toHaveBeenCalledWith(null, '', '/cancel-reset');
+      expect(service.cancelAuthenticatorReset).not.toHaveBeenCalled();
+      expect(screen.getByText(/This only cancels the reset: it does not sign you in and changes nothing else\./)).toBeOnTheScreen();
+      await fireEvent.press(screen.getByTestId('cancel-reset-confirm'));
+      expect(await screen.findByText(CANCEL_RESET_DONE)).toBeOnTheScreen();
+      expect(service.cancelAuthenticatorReset).toHaveBeenCalledTimes(1);
+      expect(service.cancelAuthenticatorReset).toHaveBeenCalledWith('ar_0123456789abcdef.c2lnbmF0dXJl');
+      expect(CANCEL_RESET_DONE).toMatch(/^If a reset of the authenticator was waiting/);
+      expect(useSession.getState().session).toBeNull();
+    } finally {
+      link.restore();
+    }
+  });
+
+  it('without the link (or with the token in the query string, which is never read) there is nothing to press', async () => {
+    const service = selfService();
+    const query = openedFromLink('/cancel-reset', '', '?token=ar_0123456789abcdef.c2lnbmF0dXJl');
+    try {
+      await renderScreen(<CancelResetScreen />);
+      expect(screen.queryByTestId('cancel-reset-confirm')).toBeNull();
+      expect(screen.getByText(/This page works only from that link\./)).toBeOnTheScreen();
+      expect(service.cancelAuthenticatorReset).not.toHaveBeenCalled();
+    } finally {
+      query.restore();
+    }
   });
 });

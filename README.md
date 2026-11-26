@@ -543,9 +543,25 @@ the invitation still being the same one).
    always the same, after the same work as a sign-in attempt, and it is given before
    anything else is done, so it says nothing about whether the address has an account.
 2. If the account exists, is activated and is enabled, a link is emailed to it:
-   single-use, valid 30 minutes, with its code in the URL fragment (as for activation,
-   so it is in no request log). A new link kills the old one. At most 3 links an hour
-   per account; each source is limited like any sign-in route.
+   single-use, with its code in the URL fragment (as for activation, so it is in no
+   request log). It is valid for 30 minutes **from the moment the mail server accepts
+   the email**, and the email names that time (written in when it is sent, not when it
+   was queued). An email that cannot be sent within 30 minutes of the request is not
+   sent at all: it is marked failed ("not sent in time") and shows on the ops Mail page.
+   **Anyone can ask for a link for anyone's address, so asking takes nothing from the
+   owner** (`server/src/auth/resetLedger.ts`): a new link does **not** kill an older
+   one (a few can be live; each works once; all die when one is used or the password
+   is changed), and requests are counted per source network as well as per account:
+   2 an hour from one network for one account; 3 an hour and 8 a day from all networks
+   the account has never signed in from, together; 5 an hour and 20 a day for the
+   account from anywhere, which is also the most reset emails it can be made to
+   receive. A network the account has signed in from before is not counted against
+   the strangers' share, so strangers cannot use up what the owner, asking from where
+   they usually are, is entitled to. **What this does not solve:** an owner asking
+   from a network they have never used shares the strangers' allowance, and someone
+   with several networks can use it up for the hour (the links still go only to the
+   owner's mailbox). Each source is also limited like any sign-in route. The same
+   rules apply to staff reset links.
 3. The page the link opens asks for a **current code from the authenticator app, or an
    unused recovery code**, and the new password (same policy as activation). Wrong
    codes count toward the same lock as wrong sign-in codes, and five of them withdraw
@@ -1371,7 +1387,16 @@ the verification really happened. So, for a **client**, an approved reset **wait
 
 1. A **warning** is queued for the client at once, by email and in the app's
    notification list: a reset has been approved, the earliest it can take effect, and
-   that signing in now cancels it.
+   that signing in now cancels it. In the email that time is written in when the email
+   is **sent** (the delay runs from then); the app's copy, made at approval, names the
+   earliest it could be. The email also carries a **"this was not me" link**: it opens
+   a page of the app that, once the person presses the button, cancels **that** reset
+   and does nothing else. It is signed by the server, names one reset, is not a
+   credential and opens no session; the answer is the same whatever the link was, so
+   it tells nobody whether a reset exists. It is for the person who cannot sign in:
+   locked out by somebody else's wrong passwords, or away from every network they
+   have used. (Someone who can read the mailbox can press it too, and so delay a reset
+   the owner wants; staff see who cancelled, and can approve another.)
 2. **Nothing changes** for `AUTHENTICATOR_RESET_DELAY_HOURS` (default 24; at least 1
    outside development; the confirmation page tells staff how long), **counted from
    the moment the mail server accepted the warning**, not from the approval. While the
@@ -1379,10 +1404,12 @@ the verification really happened. So, for a **client**, an approved reset **wait
    for good it is queued afresh and the reset goes on waiting. The console shows, on
    the person's page and under Approvals, whether the warning has been delivered. The
    client's current password, authenticator and recovery codes go on working.
-3. If the client **signs in successfully** during the delay (password and code), the
-   reset is cancelled automatically and that is audited
-   (`system.client.reset_authenticator.cancelled`, by "signed in"): whoever has the
-   credentials evidently did not lose them. Wrong guesses cancel nothing.
+3. If the server **accepts a code from the client's authenticator** during the delay,
+   for anything (signing in, a step-up for a payment, changing or resetting the
+   password, making new recovery codes), the reset is cancelled automatically and that
+   is audited (`system.client.reset_authenticator.cancelled`): whoever holds the
+   authenticator evidently did not lose it. So does a completed sign-in with a
+   recovery code, and the "this was not me" link. Wrong guesses cancel nothing.
 4. **Any ops admin can cancel it** during the delay (one is enough: cancelling is the
    safe direction), from the Approvals page or the person's page; confirmed and audited.
 5. Only when the delay has passed are the credentials cleared and the activation link
@@ -1571,7 +1598,17 @@ supplies the company details and regulatory wording an email must carry.
 (table `mail_outbox`); it is sent from there, so a slow or broken mail server neither
 blocks nor fails the request. A message that cannot be sent is tried again after 1
 minute, 5, 15, 60 and 180 minutes (6 attempts), then marked failed, audited
-(`system.mail.failed`) and shown on the ops console's **Mail** page. One logical message
+(`system.mail.failed`) and shown on the ops console's **Mail** page. **Links are wanted
+now and go stale**, so activation and reset emails are tried again much sooner (after
+20 and 40 seconds, then 1.5, 3 and 6 minutes) and carry a **deadline**: a reset email
+is not sent more than 30 minutes after it was asked for, nor an activation email after
+its link has run out; such a message is marked failed ("not sent in time") instead of
+arriving dead. A **permanent refusal** of the message by the mail server (a 5xx reply
+to the recipient or the message: no such mailbox, rejected by policy) is failed **at
+once**, not retried for hours; a 4xx reply, a timeout, or a refusal that is about the
+server's own set-up (signing in to the mail server) is tried again. A time in an email
+that depends on when it is sent ("this link works until...", "not before...") is
+written in at the moment of sending. One logical message
 has one key and is queued once however often the code that wants it sent runs. Each
 attempt is claimed in a transaction before it is made, so two passes never send the
 same message at once. The body, which may hold a single-use link, is stored encrypted

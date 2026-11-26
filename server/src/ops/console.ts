@@ -1718,7 +1718,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
             warnings: [
               `Removes their password, authenticator and recovery codes, ends ${sessions === 1 ? 'their 1 active session' : `their ${sessions} active sessions`}, and emails a new activation link to ${maskEmail(user.email)}. Whoever reads that mailbox gets the account.`,
               config.authenticatorResetDelayMs > 0
-                ? `Once approved, a warning is emailed to the client and shown to them in the app. NOTHING changes until ${delayText} after the mail server has ACCEPTED that warning (if the warning cannot be delivered, the reset waits): their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it. Only then are the credentials cleared and the link sent.`
+                ? `Once approved, a warning is emailed to the client and shown to them in the app. NOTHING changes until ${delayText} after the mail server has ACCEPTED that warning (if the warning cannot be delivered, the reset waits): their current credentials go on working, and the reset is cancelled if a code from their authenticator is accepted (signing in, a step-up, a password change), if they use the “this was not me” link in the warning email, or if an ops admin cancels it. Only then are the credentials cleared and the link sent.`
                 : 'THE DELAY IS SWITCHED OFF (AUTHENTICATOR_RESET_DELAY_HOURS=0, development only): the reset happens as soon as it is approved.',
               `How their identity was verified: “${identityVerification}”. Check this before approving.`,
             ],

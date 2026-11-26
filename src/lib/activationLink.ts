@@ -34,6 +34,16 @@ export function clearFragment(): void {
 }
 
 /**
+ * The token of a "this was not me" link (`/cancel-reset#token=…`), read from the fragment and the address bar
+ * wiped at once, like a code. It can only cancel one reset of an authenticator; it is still not left lying about.
+ */
+export function takeTokenFromAddressBar(): string {
+  const token = /(?:^#|&)token=([A-Za-z0-9_.-]+)/.exec(currentFragment())?.[1] ?? '';
+  clearFragment();
+  return token;
+}
+
+/**
  * READ AND CLEARED IN ONE STEP: the code is taken from the address bar and the address bar is wiped at once,
  * before anything is sent anywhere, whether or not the code turns out to be good.
  */
