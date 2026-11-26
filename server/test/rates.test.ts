@@ -238,6 +238,14 @@ test('where the margin is applied is a setting per provider: with "provider" the
     assert.deepEqual([reply.status, reply.json], [502, { error: { kind: 'server' } }]);
   }
   assert.equal((await h.stores.quotes.list()).length, 0);
+  // EVERY way a rate reaches a client is closed, not only those two: the trend line, a new alert, and an alert
+  // that already exists (it does not fire: its notification and email would have quoted the wholesale rate).
+  for (const reply of [await h.call('GET', '/v1/rates/GBP/USD/history', { token: wholesale.token }), await h.call('POST', '/v1/alerts', { token: wholesale.token, body: { base: 'GBP', quote: 'USD', side: 'sell', targetRate: '1.2' } })]) {
+    assert.deepEqual([reply.status, reply.json], [502, { error: { kind: 'server' } }]);
+  }
+  await h.stores.alerts.put('alr_already', { id: 'alr_already', userId: 'usr_amira', companyId: 'co_northfield', base: 'GBP', quote: 'USD', side: 'sell', targetRate: '1.2', status: 'active', createdAt: h.clock.now, armedAt: h.clock.now, arming: 'a1', triggeredAt: null, triggeredRate: null });
+  assert.equal(await h.alerts.check(), 0);
+  assert.deepEqual([(await h.stores.alerts.get('alr_already'))?.status, (await h.stores.notifications.list({ userId: 'usr_amira' })).length, h.outbox.sent.filter((message) => /rate/i.test(message.subject)).length], ['active', 0, 0]);
   assert.ok(h.logs.some((line) => /is \\"provider\\", but the provider's quote carries no partner markup/.test(line)));
   assert.ok(h.bodies.every((body) => !/1\.3000|"1\.3"/.test(body)), 'the wholesale rate was never sent');
   await h.close();
@@ -387,6 +395,19 @@ test('a quote is checked BY THIS SERVER when it is booked: this person’s, in t
   const repriced = await fresh();
   assert.equal(repriced.rate, '1.261000');
   assert.equal((await book(amira.token, repriced.id, 'l5-key-000007')).status, 200);
+  assert.equal(bookings, 2);
+  // ...and the same when the change is committed at the very moment the booking begins (after it was received, before it claims its quote).
+  quote = await fresh();
+  const quotes = h.stores.quotes;
+  const claim = quotes.mutate.bind(quotes);
+  quotes.mutate = async (...args: Parameters<typeof claim>) => {
+    quotes.mutate = claim;
+    h?.clock.advance(5);
+    await setMargin('co_northfield', { defaultBps: 310 });
+    return claim(...args);
+  };
+  expired(await book(amira.token, quote.id, 'l5-key-000009'));
+  quotes.mutate = claim;
   assert.equal(bookings, 2);
 
   // What has run out is cleared away; the table does not only grow.

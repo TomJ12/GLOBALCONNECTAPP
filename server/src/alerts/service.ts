@@ -95,7 +95,7 @@ export class RateAlerts {
     if (input.side !== 'sell' && input.side !== 'buy') throw new ApiError('validation', { fields: ['side'] });
     if (!TARGET.test(input.targetRate) || !new Big(input.targetRate).gt(0)) throw new ApiError('validation', { fields: ['targetRate'] });
     // The pair must be one this company can be given a rate for.
-    await this.deps.withProvider(company, (provider) => this.deps.rates.providerRate(company, provider, base, quote));
+    await this.deps.withProvider(company, (provider) => this.deps.rates.indicative(company, provider, base, quote));
     const write = async (): Promise<AlertView> => {
       const at = this.deps.now();
       const record: RateAlertRecord = { id: `alr_${randomToken().slice(0, 16)}`, userId: user.id, companyId: company.id, base, quote, side: input.side, targetRate: new Big(input.targetRate).toFixed(), status: 'active', createdAt: at, armedAt: at, arming: randomToken().slice(0, 12), triggeredAt: null, triggeredRate: null };
@@ -187,12 +187,9 @@ export class RateAlerts {
       const raw = await fetched.get(pairKey);
       if (!raw) continue;
       if (!margins.has(company.id)) margins.set(company.id, (await rates.marginOf(company.id)).config);
-      let mine: RatePair;
-      try {
-        mine = rates.indicativeFrom(company, raw, margins.get(company.id) as MarginConfig);
-      } catch {
-        continue;
-      }
+      // The client's rate, through the one door every such rate takes (it refuses when the margin is not where the setting says).
+      const mine = await this.deps.withProvider(company, (provider) => rates.indicative(company, provider, alert.base, alert.quote, { raw, config: margins.get(company.id) as MarginConfig })).catch(() => null);
+      if (!mine) continue;
       const rate = alert.side === 'sell' ? mine.rate : (mine.buyRate ?? mine.rate);
       const reached = alert.side === 'sell' ? new Big(rate).gte(alert.targetRate) : new Big(rate).lte(alert.targetRate);
       if (!reached) continue;

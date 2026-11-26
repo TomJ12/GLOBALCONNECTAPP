@@ -103,14 +103,22 @@ export class ClientRates {
     this.assertMarkup(company, await provider.createQuote({ kind: 'spot', sellCurrency: base, buyCurrency: quote, fixedSide: 'sell', amount: '1000.00' }));
   }
 
-  /** What the client is shown for a pair: their rate selling the base, their rate buying it. Indicative, at display precision. */
-  async indicative(company: CompanyRecord, provider: RateSource, base: string, quote: string): Promise<RatePair> {
+  /**
+   * THE ONE WAY a rate that is not a held quote leaves this server: the rate page, the trend line, and what a
+   * rate alert is compared with and quotes in its notification all come through `indicative` or `history`, and
+   * both check FIRST that the margin is really where the setting says it is (`ensureMarkup`). `fromProvider`
+   * below, which turns a provider's rate into the client's, is private for that reason.
+   *
+   * What the client is shown for a pair: their rate selling the base, their rate buying it. Indicative, at
+   * display precision. (`given`: a provider rate or margin configuration the caller has already read.)
+   */
+  async indicative(company: CompanyRecord, provider: RateSource, base: string, quote: string, given: { raw?: RatePair; config?: MarginConfig } = {}): Promise<RatePair> {
     await this.ensureMarkup(company, provider, base, quote);
-    const raw = await this.providerRate(company, provider, base, quote);
-    return this.indicativeFrom(company, raw, (await this.marginOf(company.id)).config);
+    const raw = given.raw ?? (await this.providerRate(company, provider, base, quote));
+    return this.fromProvider(company, raw, given.config ?? (await this.marginOf(company.id)).config);
   }
 
-  indicativeFrom(company: Pick<CompanyRecord, 'providerKey'>, raw: RatePair, config: MarginConfig): RatePair {
+  private fromProvider(company: Pick<CompanyRecord, 'providerKey'>, raw: RatePair, config: MarginConfig): RatePair {
     if (this.appliedBy(company) === 'provider') return { base: raw.base, quote: raw.quote, rate: raw.rate, buyRate: raw.buyRate ?? raw.rate, indicative: true, asOf: raw.asOf };
     const pair = `${raw.base}${raw.quote}`;
     const shown = indicativePair(raw.rate, marginBps(config, { pair, direction: 'sell', kind: 'spot' }), marginBps(config, { pair, direction: 'buy', kind: 'spot' }));
@@ -118,7 +126,9 @@ export class ClientRates {
   }
 
   /** The trend line is the client's indicative SELL rate over time: the same series the headline rate belongs to. */
-  async history(company: CompanyRecord, raw: RateHistory): Promise<RateHistory> {
+  async history(company: CompanyRecord, provider: RateSource & Pick<ProviderAdapter, 'getRateHistory'>, base: string, quote: string): Promise<RateHistory> {
+    await this.ensureMarkup(company, provider, base, quote);
+    const raw = await provider.getRateHistory(base, quote);
     if (this.appliedBy(company) === 'provider') return { base: raw.base, quote: raw.quote, points: raw.points.map((point) => ({ at: point.at, rate: point.rate })) };
     const bps = marginBps((await this.marginOf(company.id)).config, { pair: `${raw.base}${raw.quote}`, direction: 'sell', kind: 'spot' });
     return { base: raw.base, quote: raw.quote, points: raw.points.map((point) => ({ at: point.at, rate: indicativeRate(point.rate, 'sell', bps) })) };
@@ -161,19 +171,22 @@ export class ClientRates {
    * other booking (the same booking asking again is fine).
    */
   async claimQuote(company: Pick<CompanyRecord, 'id'>, userId: string, quoteId: string, keyHash: string): Promise<HeldQuote | null> {
-    const { version } = await this.marginOf(company.id);
     const at = this.now();
     let claimed: HeldQuote | null = null;
     await this.stores.quotes.mutate(`${company.id}:${quoteId}`, (current) => {
       claimed = null;
       if (!current || current.companyId !== company.id || current.userId !== userId) return undefined;
       if (current.expiresAt <= at) return undefined;
-      if (current.appliedBy === 'server' && current.marginVersion !== version) return undefined;
       if (current.usedBy !== null && current.usedBy !== keyHash) return undefined;
       claimed = { ...current, usedBy: keyHash };
       return claimed;
     });
-    return claimed;
+    // The margin is read AFTER the claim is committed, never before it: a change that was committed before this
+    // booking claimed its quote is always seen here, and the quote is refused. (Read before the claim, a change
+    // landing between the two went unnoticed.) A change committed after this point comes after the booking began.
+    const taken = claimed as HeldQuote | null;
+    if (taken && taken.appliedBy === 'server' && taken.marginVersion !== (await this.marginOf(company.id)).version) return null;
+    return taken;
   }
 
   /**

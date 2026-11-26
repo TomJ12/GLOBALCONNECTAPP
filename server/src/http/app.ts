@@ -640,7 +640,7 @@ export async function buildApp(deps: AppDeps) {
       api.get('/rates/:base/:quote/history', async (request) => {
         const context = await companyOf(request);
         const [base, quote] = pairOf(request);
-        return priced(async () => rates.history(context.company, await withProvider(context, (provider) => provider.getRateHistory(base, quote))));
+        return priced(() => withProvider(context, (provider) => rates.history(context.company, provider, base, quote)));
       });
 
       /**
