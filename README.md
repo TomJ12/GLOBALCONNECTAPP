@@ -1050,9 +1050,14 @@ applied to every piece of typed text that goes into a notification, an email or 
 payment's own "rejected by" line: it is put on one line and anything a mail client or
 an app would turn into a link is **visibly broken**, not silently removed
 (`https://pay.example` becomes `https[:]//pay[.]example`, `www.pay.example` becomes
-`www[.]pay[.]example`, `a@pay.example` becomes `a[@]pay[.]example`), repeated until
-nothing changes so that nesting one scheme inside another cannot put a working link
-back together. It is escaped in the HTML part of an email and shown in the app as
+`www[.]pay[.]example`, `a@pay.example` becomes `a[@]pay[.]example`, any `word:`
+followed by something such as `skype:name` becomes `skype[:]name`, and a numeric
+address with a path such as `192.168.1.10/login` has its dots broken too). Before
+matching, look-alike characters are folded to their plain form (Unicode NFKC, so a
+full-width or one-dot-leader "dot" is a dot) and invisible characters (zero-width,
+direction controls) are removed. Every replacement only inserts brackets, so one pass
+is enough and nesting one scheme inside another cannot put a link back together; a
+test checks that a second pass changes nothing. It is escaped in the HTML part of an email and shown in the app as
 plain text with link detection off. The audit log stores what was typed as data, and
 the ops console escapes everything it prints. The notification's email is written to
 the outbox **before** the notification is recorded as made, so nothing that goes

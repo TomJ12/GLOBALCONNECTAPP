@@ -108,6 +108,38 @@ test('templates: every message has a harmless subject, the same lines as text an
   assert.equal(plainText('Wrong invoice: GBP 125.00, not 152.00. Ask Abel (ext. 4) on 12/11.'), 'Wrong invoice: GBP 125.00, not 152.00. Ask Abel (ext. 4) on 12/11.');
   assert.equal(plainText('https:/a:///gc-payments.example/login'), 'https[:]/a[:]///gc-payments[.]example/login');
   assert.equal(plainText('x'.repeat(500)).length, 200);
+  // What used to get through: a numeric address with a path, schemes that need no slashes and were not on a list,
+  // and look-alike or invisible characters that a client folds into a real host name.
+  const residue: [string, string][] = [
+    ['192.168.1.10/login', '192[.]168[.]1[.]10/login'],
+    ['http://10.0.0.1:8080/x', 'http[:]//10[.]0[.]0[.]1:8080/x'],
+    ['skype:bob', 'skype[:]bob'],
+    ['facetime:bob', 'facetime[:]bob'],
+    ['bitcoin:1abc', 'bitcoin[:]1abc'],
+    ['magnet:?xt=1', 'magnet[:]?xt=1'],
+    ['geo:51.5,0', 'geo[:]51.5,0'],
+    ['evil\uFF0Ecom', 'evil[.]com'],
+    ['evil\u2024com', 'evil[.]com'],
+    ['evil\u3002com', 'evil[.]com'],
+    ['evil\u200B.com', 'evil[.]com'],
+    ['ht\u00ADtp://evil.com', 'http[:]//evil[.]com'],
+    ['\u202Emoc.live\u202C', 'moc[.]live'],
+    ['\uFF57\uFF57\uFF57\uFF0E\uFF45\uFF56\uFF49\uFF4C\uFF0E\uFF43\uFF4F\uFF4D', 'www[.]evil[.]com'],
+    // ...while ordinary writing is left as it was typed.
+    ['at 10:30, ratio 3:2, Re: invoice 12, Hotel: Ibis, note: 125.00 each. Thanks', 'at 10:30, ratio 3:2, Re: invoice 12, Hotel: Ibis, note: 125.00 each. Thanks'],
+  ];
+  for (const [typedText, safe] of residue) assert.equal(plainText(typedText), safe, JSON.stringify(typedText));
+  // ONE pass does it, and doing it again changes nothing: checked over pieces put together every which way.
+  const pieces = ['http', 'https', 's', ':', '/', '//', '\\', '.', '@', 'a', 'b', 'www', 'com', ' ', '[', ']', '[:]', '[.]', 'mailto', 'tel', 'skype', '-', '1', '10', ':]', '[@]', '\u200B', '\uFF0E', '\uFF1A', '\uFF20'];
+  let seed = 12345;
+  const next = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let n = 0; n < 20_000; n += 1) {
+    let made = '';
+    for (let part = 1 + Math.floor(next() * 9); part > 0; part -= 1) made += pieces[Math.floor(next() * pieces.length)];
+    const safe = plainText(made, 2000);
+    assert.equal(plainText(safe, 2000), safe, JSON.stringify(made));
+    assert.doesNotMatch(safe, /[\p{L}\p{N}]\.\p{L}|[a-z]:[^\s\]]|:[/\\]|@[\p{L}\p{N}]|\d\.\d+[/\\]|[\u200B\uFF0E\uFF1A\uFF20]/iu, JSON.stringify([made, safe]));
+  }
   assert.doesNotMatch(rejected.text, /https?:/);
   assert.doesNotMatch(rejected.html, /<script|<b>/);
   assert.match(rejected.html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
