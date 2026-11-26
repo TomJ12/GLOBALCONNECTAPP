@@ -22,6 +22,8 @@
  *     moment and not after, so "cancelled, nothing changed" is never said
  *     about credentials that were then cleared.
  */
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
 import { sha256 } from '../crypto';
 import type { MailQueue } from '../mail/queue';
 import { activationMail } from '../mail/templates';
@@ -41,7 +43,38 @@ export class AuthenticatorResets {
     private readonly notices: SecurityNotices,
     private readonly delayMs: number,
     private readonly now: () => number,
+    /** For the "this was not me" link in the warning: the server's secret (to sign it) and the app's address (to point at). */
+    private readonly link: { secret: string; appUrl: string } | null = null,
   ) {}
+
+  /**
+   * THE "THIS WAS NOT ME" LINK in the warning email. A person who cannot sign in (locked out by somebody else's
+   * wrong passwords, or away from every network they have used) can still object. The token names ONE reset and is
+   * signed by this server; it can do one thing, cancel that reset while it is still waiting, and nothing else: it
+   * is not a credential and opens no session. It is only ever in the email to the account's own address.
+   */
+  private cancelToken(item: Pick<AuthenticatorResetRecord, 'id' | 'userId'>): string {
+    const signature = createHmac('sha256', this.link?.secret ?? '').update(`authenticator-reset-cancel:${item.id}:${item.userId}`).digest('base64url');
+    return `${item.id}.${signature}`;
+  }
+
+  /**
+   * Cancels the reset a "this was not me" link names, if the token is genuine and the reset is still waiting.
+   * The caller answers the same whatever this returns: the answer tells nobody whether a reset exists.
+   */
+  async cancelByLink(token: string, source: string): Promise<boolean> {
+    if (!this.link) return false;
+    const [id = '', signature = ''] = token.split('.');
+    const item = /^ar_[a-f0-9]{16}$/.test(id) && token.split('.').length === 2 ? await this.stores.auth.authenticatorResets.get(id) : null;
+    if (!item) return false;
+    const [given, expected] = [Buffer.from(signature), Buffer.from(this.cancelToken(item).slice(id.length + 1))];
+    if (given.length !== expected.length || !timingSafeEqual(given, expected)) return false;
+    if (item.status !== 'waiting') return false;
+    const user = await this.stores.directory.getUser(item.userId);
+    const cancelled = await this.close(item, 'cancelled', 'the link in the warning email', source, user);
+    if (cancelled && user) await this.notices.send({ id: user.id, email: user.email, name: user.name }, 'client', 'authenticator_reset_cancelled');
+    return cancelled;
+  }
 
   /** One reset per approval request, however often the approval is carried out. The warning is queued at once; the delay starts when it has been sent. */
   async schedule(user: UserRecord, request: { id: string; requestedBy: string; approvedBy: string }, source: string): Promise<AuthenticatorResetRecord> {
@@ -85,7 +118,18 @@ export class AuthenticatorResets {
       // Development only (the configuration refuses 0 elsewhere): no delay, so no warning to wait for.
       return (await table.mutate(item.id, (current) => (current && current.status === 'waiting' && (current.warnedAt ?? null) === null ? { ...current, warnedAt: at } : undefined))) ?? item;
     }
-    const delivery = (await this.mail.delivery(this.warningKey(item))) ?? (await this.notices.send({ id: user.id, email: user.email, name: user.name }, 'client', 'authenticator_reset_requested', { until: at + this.delayMs }, { key: this.warningKey(item) }));
+    // A warning that was refused is queued afresh, but not every minute: a little later each time, up to an hour apart.
+    if ((item.warningRetryAt ?? 0) > at && (await this.mail.delivery(this.warningKey(item))) === null) return item;
+    // The email names the time the reset becomes possible, worked out when the email is SENT (the delay runs from then).
+    const delivery =
+      (await this.mail.delivery(this.warningKey(item))) ??
+      (await this.notices.send(
+        { id: user.id, email: user.email, name: user.name },
+        'client',
+        'authenticator_reset_requested',
+        { until: at + this.delayMs, delayMs: this.delayMs, ...(this.link ? { cancelLink: `${this.link.appUrl}/cancel-reset#token=${this.cancelToken(item)}` } : {}) },
+        { key: this.warningKey(item) },
+      ));
     if (delivery?.state === 'sent' && delivery.sentAt !== null) {
       const sentAt = delivery.sentAt;
       return (
@@ -101,7 +145,7 @@ export class AuthenticatorResets {
       return (
         (await table.mutate(
           item.id,
-          (current) => (current && current.status === 'waiting' && (current.warnedAt ?? null) === null && (current.warningTries ?? 0) === (item.warningTries ?? 0) ? { ...current, warningTries: (current.warningTries ?? 0) + 1 } : undefined),
+          (current) => (current && current.status === 'waiting' && (current.warnedAt ?? null) === null && (current.warningTries ?? 0) === (item.warningTries ?? 0) ? { ...current, warningTries: (current.warningTries ?? 0) + 1, warningRetryAt: at + Math.min(60, 5 * ((current.warningTries ?? 0) + 1)) * 60_000 } : undefined),
           (saved) => (saved ? { at, actor: SYSTEM, target: clientParty(user), action: 'system.client.reset_authenticator.warning_failed', outcome: 'failure', source: '', detail: { reset: item.id, tries: String(saved.warningTries ?? 0) } } : null),
         )) ?? item
       );

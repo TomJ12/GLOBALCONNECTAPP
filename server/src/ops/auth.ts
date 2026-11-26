@@ -11,9 +11,9 @@
  * As in the client service, security state is only ever changed through the
  * store's atomic operations.
  */
-import { claimResetLink, endResetLinks, isLiveResetLink } from '../auth/resetLedger';
+import { claimResetLink, endResetLinks, isLiveResetLink, resetLinkSent } from '../auth/resetLedger';
 import type { Config } from '../config';
-import { PASSWORD_RESET_TTL_MS, reasonOf, RESET_REQUESTS_PER_HOUR, secondsToNextCode, SEEN_WRITE_MS, type Invitation } from '../auth/service';
+import { PASSWORD_RESET_TTL_MS, reasonOf, RESET_SEND_WITHIN_MS, secondsToNextCode, SEEN_WRITE_MS, type Invitation } from '../auth/service';
 import type { MailQueue } from '../mail/queue';
 import { mailOf, type SecurityNotice } from '../mail/templates';
 import type { SecurityNotices } from '../notify/security';
@@ -39,6 +39,7 @@ import { ApiError } from '../errors';
 import type { AuditParty, OpsRole, OpsSessionRecord, OpsUserRecord, Stores } from '../store/types';
 
 const ISSUER = 'Global Connect Ops';
+const RESET_REF = 'reset.staff:';
 const RECOVERY_CODE_COUNT = 10;
 const MAX_CHALLENGE_ATTEMPTS = 5;
 
@@ -307,6 +308,8 @@ export class OpsAuthService {
   private notices: SecurityNotices | null = null;
   attach(mail: MailQueue, notices: SecurityNotices): void {
     this.mail = mail;
+    // A staff reset link is good for half an hour from the moment its email was accepted.
+    mail.onSent(RESET_REF, (ref, sentAt) => resetLinkSent(this.ops.passwordResets, ref.slice(RESET_REF.length), sentAt, PASSWORD_RESET_TTL_MS));
     this.notices = notices;
   }
   private async notice(user: OpsUserRecord, kind: SecurityNotice): Promise<void> {
@@ -334,15 +337,19 @@ export class OpsAuthService {
     }
     const resetCode = randomCode(4);
     const codeKey = sha256(normaliseCode(resetCode));
-    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
-    // The limit and "one live link" in ONE transaction (auth/resetLedger.ts).
-    if (!(await claimResetLink(this.ops.passwordResets, user.id, codeKey, this.now(), RESET_REQUESTS_PER_HOUR, PASSWORD_RESET_TTL_MS))) {
-      await this.log('ops.password_reset.request', 'failure', opsParty(user), source, { reason: 'rate_limited' });
+    const at = this.now();
+    // The same rules as for clients (auth/resetLedger.ts): limits per source network and per account, a new link
+    // does not kill an older one, and the link is good for half an hour from when its email is accepted.
+    const refused = await claimResetLink(this.ops.passwordResets, user.id, codeKey, at, { source, known: isKnownSource(user, source) }, RESET_SEND_WITHIN_MS + PASSWORD_RESET_TTL_MS);
+    if (refused) {
+      await this.log('ops.password_reset.request', 'failure', opsParty(user), source, { reason: 'rate_limited', limit: refused });
       return;
     }
-    await this.ops.passwordResets.put(codeKey, { userId: user.id, expiresAt, attempts: 0 });
-    const delivery = await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.staff', data: { name: user.name, link: `${this.config.opsUrl}/ops/reset#code=${resetCode}`, expiresAt }, key: `reset:staff:${sha256(resetCode)}`, category: 'security' }));
-    await this.log('ops.password_reset.request', delivery?.state === 'failed' ? 'failure' : 'success', opsParty(user), source, { expires: new Date(expiresAt).toISOString(), email: delivery?.state ?? 'none' });
+    await this.ops.passwordResets.put(codeKey, { userId: user.id, expiresAt: at + PASSWORD_RESET_TTL_MS, attempts: 0 });
+    const delivery = await this.mail?.enqueue(
+      mailOf({ to: user.email, template: 'reset.staff', data: { name: user.name, link: `${this.config.opsUrl}/ops/reset#code=${resetCode}`, validForMs: PASSWORD_RESET_TTL_MS }, key: `reset:staff:${sha256(resetCode)}`, category: 'security', deadline: at + RESET_SEND_WITHIN_MS, ref: `${RESET_REF}${codeKey}` }),
+    );
+    await this.log('ops.password_reset.request', delivery?.state === 'failed' ? 'failure' : 'success', opsParty(user), source, { validForMinutes: String(PASSWORD_RESET_TTL_MS / 60_000), email: delivery?.state ?? 'none' });
   }
 
   private async passwordReset(resetCode: string) {

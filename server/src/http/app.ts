@@ -301,7 +301,7 @@ export async function buildApp(deps: AppDeps) {
   auth.attach(mail, notices);
   const rates = new ClientRates(deps.stores, config, now, deps.maxHeldQuotes ?? MAX_HELD_QUOTES);
   opsAuth.attach(mail, notices);
-  const authenticatorResets = new AuthenticatorResets(deps.stores, auth, mail, notices, config.authenticatorResetDelayMs, now);
+  const authenticatorResets = new AuthenticatorResets(deps.stores, auth, mail, notices, config.authenticatorResetDelayMs, now, { secret: config.serverSecret, appUrl: config.appUrl });
   const stepUpActions: StepUpAction[] = config.stepUpConversions ? [...BASE_STEP_UP, 'conversion.book'] : BASE_STEP_UP;
 
   const app = Fastify({
@@ -600,6 +600,12 @@ export async function buildApp(deps: AppDeps) {
       api.post('/auth/password-reset/complete', { preHandler: limitAttempts }, async (request) => {
         const method = (request.body as { method?: unknown } | null)?.method === 'recovery' ? 'recovery' : 'totp';
         await auth.passwordResetComplete(field(request.body, 'resetCode', text(64)), field(request.body, 'code', text(32)), method, field(request.body, 'password', text(1000)), request.ip);
+        return { ok: true };
+      });
+      // "This was not me": the link in the warning before an authenticator reset. It can only CANCEL that reset;
+      // it signs nobody in. The answer is the same whether or not it cancelled anything (the owner gets a notice).
+      api.post('/auth/authenticator-reset/cancel', { preHandler: limitAttempts }, async (request) => {
+        await authenticatorResets.cancelByLink(field(request.body, 'token', text(200)), request.ip);
         return { ok: true };
       });
 

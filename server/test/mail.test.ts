@@ -4,7 +4,7 @@ import { afterEach, test } from 'node:test';
 
 import { loadConfig } from '../src/config';
 import { ConsoleOutbox } from '../src/mailer';
-import { LINKS_PER_RECIPIENT, MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue, SECURITY_PER_RECIPIENT } from '../src/mail/queue';
+import { isPermanentFailure, LINK_BACKOFF_MS, LINKS_PER_RECIPIENT, MAIL_BACKOFF_MS, MAIL_MAX_ATTEMPTS, MailQueue, SECURITY_PER_RECIPIENT } from '../src/mail/queue';
 import { SmtpMailer, failureCode } from '../src/mail/smtp';
 import { activationMail, mailOf, MAIL_FOOTER, NOTIFICATIONS, notificationText, render, SECURITY_NOTICES, TEMPLATES, type NotificationKind, type TemplateName } from '../src/mail/templates';
 import { createRuntime } from '../src/startup';
@@ -33,9 +33,10 @@ const noteFor = (kind: NotificationKind): unknown => (kind === 'rate_alert' ? AL
 const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'activation.client': { name: 'Amira Shah', link: LINK, expiresAt: 0 },
   'activation.staff': { name: 'Amira Shah', link: `${OPS}/ops/activate#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
-  'reset.client': { name: 'Amira Shah', link: `${APP}/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
-  'reset.staff': { name: 'Amira Shah', link: `${OPS}/ops/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, expiresAt: 0 },
+  'reset.client': { name: 'Amira Shah', link: `${APP}/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, validForMs: 30 * 60_000 },
+  'reset.staff': { name: 'Amira Shah', link: `${OPS}/ops/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, validForMs: 30 * 60_000 },
   'security.notice': { name: 'Amira Shah', audience: 'client', kind: 'password_changed', at: 0 },
+  'security.reset_warning': { name: 'Amira Shah', at: 0, delayMs: 24 * 60 * 60_000, cancelLink: `${APP}/cancel-reset#token=ar_0123456789abcdef.c2lnbmF0dXJl` },
   notification: { name: 'Amira Shah', kind: 'payment_awaiting', note: PAYMENT_NOTE },
   'notification.digest': {},
 };
@@ -52,14 +53,16 @@ function queueOf(transport: ConstructorParameters<typeof MailQueue>[0]['transpor
   const harnessed = h as Harness;
   return new MailQueue({ table: harnessed.stores.mail, audit: harnessed.stores.audit, transport, now: () => harnessed.clock.now, links: [APP, OPS], domain: 'globalconnect.example', perRecipientPerHour: 5, globalPerHour: 12, delivery: 'background', ...extra });
 }
-const request = (n: number, to = 'amira@northfield.example') => activationMail({ activationLink: `${LINK}${n}`, expiresAt: 0 }, to, 'Amira Shah', 'client');
+const request = (n: number, to = 'amira@northfield.example') => activationMail({ activationLink: `${LINK}${n}`, expiresAt: ((h as Harness | undefined)?.clock.now ?? 0) + 7 * 24 * 60 * 60_000 }, to, 'Amira Shah', 'client');
 const rows = async () => (h as Harness).stores.mail.list();
 
 test('templates: every message has a harmless subject, the same lines as text and as simple HTML, the placeholder footer, and links only to this server', () => {
   for (const [name, sample] of VARIANTS) {
     const mail = render(name, sample as never, [APP, OPS]);
-    // Only an activation or a reset email carries a link; a notice never does.
-    assert.equal(/https?:/.test(mail.text), name.startsWith('activation.') || name.startsWith('reset.'), name);
+    // Only an activation or a reset email carries a link; a notice never does, except the warning before an
+    // authenticator reset, whose one link ("this was not me") can only cancel that reset.
+    assert.equal(/https?:/.test(mail.text), name.startsWith('activation.') || name.startsWith('reset.') || name === 'security.reset_warning', name);
+    if (name === 'security.reset_warning') assert.deepEqual(mail.text.match(/https?:\S+/g), [`${APP}/cancel-reset#token=ar_0123456789abcdef.c2lnbmF0dXJl`]);
     // Subject: the brand, and nothing about the person, the money or the secret.
     assert.match(mail.subject, /Global Connect/, name);
     assert.doesNotMatch(mail.subject, /Amira|Harbour|125|GBP|ABCDE|code|https?:|[\r\n]/, name);
@@ -233,7 +236,10 @@ test('outbox: the request only writes; a mail-server hiccup loses nothing and se
   assert.equal((await rows()).length, 1);
   // Not before its time...
   await queue.pump();
-  h.clock.advance(MAIL_BACKOFF_MS[0] as number - 1000);
+  // (Links are tried again sooner than other mail, and all their attempts fit well inside the time a link may wait.)
+  assert.ok((LINK_BACKOFF_MS[0] as number) < (MAIL_BACKOFF_MS[0] as number) && LINK_BACKOFF_MS.reduce((sum, wait) => sum + wait, 0) < 15 * 60_000 && LINK_BACKOFF_MS.length === MAIL_BACKOFF_MS.length);
+  assert.deepEqual(['EENVELOPE 550', 'EMESSAGE 554', 'EENVELOPE 451', 'EAUTH 535', 'ETIMEDOUT', 'ERROR'].map(isPermanentFailure), [true, true, false, false, false, false]);
+  h.clock.advance(LINK_BACKOFF_MS[0] as number - 1000);
   await queue.pump();
   assert.equal(smtp.deliveries, 1);
   // ...and then once, however many passes run at that moment.
@@ -251,7 +257,7 @@ test('outbox: the request only writes; a mail-server hiccup loses nothing and se
   await queue.enqueue(request(2));
   await queue.pump();
   smtp.fault = null;
-  h.clock.advance(MAIL_BACKOFF_MS[0] as number);
+  h.clock.advance(LINK_BACKOFF_MS[0] as number);
   await queue.pump();
   const twice = smtp.received.slice(1).map((item) => /^Message-ID: (.*)\r$/m.exec(item.data)?.[1]);
   assert.equal(twice.length, 2);

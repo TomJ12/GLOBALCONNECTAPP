@@ -58,17 +58,23 @@ export class SecurityNotices {
    * stands (sent, queued, deferred...), or null if it could not even be queued: a caller for whom the notice
    * MATTERS (the warning before an authenticator reset) must look at it.
    */
-  async send(person: NoticePerson, audience: 'client' | 'staff', kind: SecurityNotice, extra: { until?: number } = {}, options: { key?: string } = {}): Promise<Delivery | null> {
+  async send(person: NoticePerson, audience: 'client' | 'staff', kind: SecurityNotice, extra: { until?: number; delayMs?: number; cancelLink?: string } = {}, options: { key?: string } = {}): Promise<Delivery | null> {
     const at = this.now();
     const key = this.keyOf(person, audience, kind, at, options.key);
     let delivery: Delivery | null = null;
     try {
-      delivery = await this.mail.enqueue(mailOf({ to: person.email, template: 'security.notice', data: { name: person.name, audience, kind, at, ...extra }, key, category: 'security' }));
+      const { cancelLink, delayMs, until } = extra;
+      delivery = await this.mail.enqueue(
+        // (The warning before an authenticator reset is the one notice with a link: "this was not me", which only cancels.)
+        cancelLink !== undefined && delayMs !== undefined
+          ? mailOf({ to: person.email, template: 'security.reset_warning', data: { name: person.name, at, delayMs, cancelLink }, key, category: 'security' })
+          : mailOf({ to: person.email, template: 'security.notice', data: { name: person.name, audience, kind, at, ...(until !== undefined ? { until } : {}), ...(delayMs !== undefined ? { delayMs } : {}) }, key, category: 'security' }),
+      );
     } catch (error) {
       this.onError(error instanceof Error ? error.message : 'security notice failed');
     }
     // A client also sees it in the app, whatever happens to the email.
-    if (audience === 'client' && this.inApp) await this.inApp(person, kind, { at, ...extra }, key).catch((error: unknown) => this.onError(error instanceof Error ? error.message : 'security notice in the app failed'));
+    if (audience === 'client' && this.inApp) await this.inApp(person, kind, { at, ...(extra.until !== undefined ? { until: extra.until } : {}) }, key).catch((error: unknown) => this.onError(error instanceof Error ? error.message : 'security notice in the app failed'));
     return delivery;
   }
 }

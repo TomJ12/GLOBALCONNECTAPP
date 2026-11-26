@@ -1644,7 +1644,8 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
   assert.equal(noticesTo(AMIRA).length, 1);
   assert.match(noticesTo(AMIRA)[0] ?? '', new RegExp(`It has NOT happened yet\\. It will not happen before ${due} UTC\\. After that your current password, authenticator and recovery codes will stop working`));
   assert.match(noticesTo(AMIRA)[0] ?? '', /sign in now with your current password and authenticator code \(that cancels the reset\)/);
-  assert.doesNotMatch(noticesTo(AMIRA)[0] ?? '', /https?:/);
+  // Its one link is "this was not me", which can only cancel this reset (recovery.test.ts).
+  assert.deepEqual((noticesTo(AMIRA)[0] ?? '').match(/https?:\S+/g)?.map((link) => link.replace(/#token=.*/, '#token=')), ['https://app.globalconnect.example/cancel-reset#token='.replace('https://app.globalconnect.example', h.config.appUrl)]);
   // Staff see it waiting, with when it takes effect; an ops admin is offered Cancel, an ops user is not.
   assert.match((await second.browser.get('/ops/approvals')).body, /Authenticator resets waiting out their delay[^]*Amira Shah[^]*Cancel reset/);
   assert.match((await olu.browser.get('/ops/users/usr_amira')).body, /Authenticator reset waiting[^]*Nothing has changed yet/);
@@ -1762,18 +1763,18 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
     await browser.get(url);
     return browser.post(url, form);
   };
-  // A second request for the same person: the NEW link is the one live link; the earlier one is dead. At most three an hour.
+  // A second request for the same person: the earlier link STILL works (anyone can ask, so asking kills nothing).
+  // From one network, two links an hour for one account; a third request makes none.
   const firstLink = resetLink(admin.email);
   await ask(admin.email);
   const link = resetLink(admin.email);
   assert.ok(link && firstLink && link !== firstLink);
-  assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /That reset link is not valid any more/);
+  assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /Choose a new password/);
   await ask(admin.email);
-  await ask(admin.email);
-  assert.equal(h.outbox.sent.filter((message) => message.to === admin.email && /ops\/reset#code=/.test(message.text)).length, 3, 'the fourth request in the hour made no link');
+  assert.equal(h.outbox.sent.filter((message) => message.to === admin.email && /ops\/reset#code=/.test(message.text)).length, 2, 'the third request in the hour from this network made no link');
   const live = resetLink(admin.email);
-  assert.match((await opened('/ops/reset', { resetCode: link })).body, /That reset link is not valid any more/, 'the second link died when the third was made');
-  assert.equal((await audit('ops.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').length, 1);
+  assert.equal(live, link);
+  assert.deepEqual((await audit('ops.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').map((entry) => entry.detail.limit), ['source']);
   // No page ever shows the link or the code.
   for (const reply of pages) assert.doesNotMatch(reply.body, LINK_OR_CODE);
 
@@ -1796,6 +1797,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.ok(heldToken);
   const done = await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'a completely new staff password' });
   assert.deepEqual([done.status, done.location], [303, '/ops/login?done=password_reset']);
+  assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /That reset link is not valid any more/, 'a reset ends every link that was live');
   // The session is gone and so is what its confirmation token could do: in the old session, and carried into a new one.
   assert.equal((await h.stores.ops.sessions.count({ userId: admin.id })), 0);
   assert.equal((await admin.browser.post('/ops/users/usr_ben/disable', { _confirm: heldToken })).status, 401);

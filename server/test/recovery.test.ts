@@ -2,7 +2,9 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { agentFamily, PASSWORD_RESET_TTL_MS, RESET_REQUESTS_PER_HOUR } from '../src/auth/service';
+import { agentFamily, PASSWORD_RESET_TTL_MS, RESET_SEND_WITHIN_MS } from '../src/auth/service';
+import { RESET_LIMITS } from '../src/auth/resetLedger';
+import { networkOf } from '../src/net';
 import { loadConfig } from '../src/config';
 import { AMIRA, BEN, DANA, harness, PASSWORD, type Harness } from './helpers';
 
@@ -50,6 +52,7 @@ test('forgotten password: the same answer for every address; a link only to an a
   assert.deepEqual((await audit('client.password_reset.request')).filter((entry) => entry.outcome === 'success').map((entry) => entry.actor.label), [AMIRA, AMIRA]);
 
   // The answer is given without waiting for any of that: with the outbox stuck, the reply still comes, the same.
+  h.clock.advance(61 * 60_000);
   const realMutate = h.stores.mail.mutate.bind(h.stores.mail);
   let release!: () => void;
   const stuck = new Promise<void>((resolve) => (release = resolve));
@@ -137,42 +140,143 @@ test('forgotten password: a recovery code works in place of the authenticator an
   assert.equal((await h.login(DANA, dana.secret)).status, 200);
 });
 
-test('forgotten password: a new link kills the old one; a link lasts 30 minutes; at most three an hour; a disabled or reset account has none', async () => {
-  h = await harness();
+test('forgotten password: ANYONE can ask, so asking takes nothing from the owner: a new link does not kill an older one, the limits are per network and per account, strangers cannot use up the owner’s share or flood the mailbox', async () => {
+  h = await harness({ trustProxy: 1 });
   const amira = await h.activate(AMIRA);
-  await request(AMIRA);
-  const first = resetCodeOf(AMIRA);
-  await request(AMIRA);
-  const second = resetCodeOf(AMIRA);
-  assert.notEqual(first, second);
-  assert.equal(reasonOf(await complete(first, h.freshCode(amira.secret))), 'reset_invalid');
-  assert.equal((await h.call('POST', '/v1/auth/password-reset/start', { body: { resetCode: second } })).status, 200);
-  // Half an hour, to the second.
-  assert.equal(PASSWORD_RESET_TTL_MS, 30 * 60_000);
-  h.clock.advance(PASSWORD_RESET_TTL_MS - 31_000);
-  assert.equal((await h.call('POST', '/v1/auth/password-reset/start', { body: { resetCode: second } })).status, 200);
-  h.clock.advance(31_000);
-  assert.equal(reasonOf(await complete(second, h.code(amira.secret))), 'reset_invalid');
-  // Asking again and again sends three links in an hour and then nothing, with the same answer throughout.
+  const HOME = '198.51.100.7';
+  await h.stores.directory.updateUser('usr_amira', (user) => ({ ...user, knownSources: [networkOf(HOME)] }));
+  const from = (address: string) => ({ 'x-forwarded-for': address });
   const sent = () => mailsTo(AMIRA, RESET).length;
-  const start = sent();
-  assert.equal(RESET_REQUESTS_PER_HOUR, 3);
-  for (let n = 0; n < 5; n += 1) assert.deepEqual((await request(AMIRA)).json, { ok: true });
-  assert.equal(sent() - start, 1, 'two were sent earlier in this hour');
-  assert.ok((await audit('client.password_reset.request')).some((entry) => entry.outcome === 'failure' && entry.detail.reason === 'rate_limited'));
+  const codes = () => mailsTo(AMIRA, RESET).map((message) => /\/reset#code=([A-Z2-7-]+)/.exec(message.text)?.[1] as string);
+  const starts = async (code: string) => (await h.call('POST', '/v1/auth/password-reset/start', { body: { resetCode: code } })).status;
+  const refusals = async () => (await audit('client.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').map((entry) => entry.detail.limit).reverse();
+  assert.deepEqual(RESET_LIMITS, { perSource: 2, unknown: 3, unknownPerDay: 8, account: 5, accountPerDay: 20 });
+
+  // She asks, from where she usually is. Then SOMEBODY ELSE asks for her address, twice, from a network she has never used.
+  assert.deepEqual((await request(AMIRA, from(HOME))).json, { ok: true });
+  const hers = codes()[0] as string;
+  for (let n = 0; n < 2; n += 1) assert.deepEqual((await request(AMIRA, from('203.0.113.9'))).json, { ok: true });
+  assert.equal(sent(), 3);
+  // HER LINK STILL WORKS (it used to be killed by the next request), and so do the others: they all went to her mailbox.
+  assert.deepEqual([await starts(hers), await starts(codes()[1] as string), await starts(codes()[2] as string)], [200, 200, 200]);
+  // That network gets no more for her this hour; the answer is the same and nothing is sent.
+  assert.deepEqual((await request(AMIRA, from('203.0.113.10'))).json, { ok: true });
+  assert.equal(sent(), 3);
+  assert.deepEqual(await refusals(), ['source']);
+  // Other networks she has never used share what is left for strangers (three an hour in all)...
+  await request(AMIRA, from('203.0.114.1'));
+  assert.equal(sent(), 4);
+  for (const address of ['203.0.115.1', '203.0.116.1', '203.0.117.1']) await request(AMIRA, from(address));
+  assert.equal(sent(), 4);
+  assert.deepEqual(await refusals(), ['source', 'unknown_sources', 'unknown_sources', 'unknown_sources']);
+  // ...and CANNOT use up hers: from where she usually is, she is still sent a link (it used to be refused silently).
+  await request(AMIRA, from(HOME));
+  assert.equal(sent(), 5);
+  // Five is the most this account's mailbox gets in an hour, from anywhere.
+  await request(AMIRA, from(HOME));
+  assert.equal(sent(), 5);
+  assert.deepEqual((await refusals()).slice(-1), ['source']);
+  // Hour after hour of it: strangers get eight in a day, and then nothing until the day has passed. She still gets hers.
+  for (let hour = 1; hour <= 4; hour += 1) {
+    h.clock.advance(61 * 60_000);
+    for (let n = 0; n < 4; n += 1) await request(AMIRA, from(`203.0.${120 + hour}.${n + 1}`));
+  }
+  assert.equal(sent(), 5 + 5, 'three strangers’ requests were sent earlier, so five more in the day');
+  await request(AMIRA, from(HOME));
+  assert.equal(sent(), 11);
+
+  // A link works ONCE, and a reset ends EVERY link that was live.
+  await request(AMIRA, from(HOME));
+  assert.equal(sent(), 12);
+  const live = codes().slice(-2);
+  assert.deepEqual([await starts(live[0] as string), await starts(live[1] as string)], [200, 200]);
+  assert.equal((await complete(live[1] as string, h.freshCode(amira.secret))).status, 200);
+  assert.deepEqual([await starts(live[0] as string), await starts(live[1] as string)], [400, 400]);
+  assert.equal(reasonOf(await complete(live[0] as string, h.freshCode(amira.secret), 'another new password 22')), 'reset_invalid');
+
+  // Half an hour, to the second (here the email is accepted at once; a delayed one is in the next test).
   h.clock.advance(61 * 60_000);
-  await request(AMIRA);
-  assert.equal(sent() - start, 2);
+  await request(AMIRA, from(HOME));
+  const last = codes().at(-1) as string;
+  assert.equal(PASSWORD_RESET_TTL_MS, 30 * 60_000);
+  assert.match(mailsTo(AMIRA, RESET).at(-1)?.text ?? '', new RegExp(`The link works once, until ${new Date(h.clock.now + PASSWORD_RESET_TTL_MS).toISOString().slice(0, 16).replace('T', ' ')} UTC\\.`));
+  h.clock.advance(PASSWORD_RESET_TTL_MS - 1000);
+  assert.equal(await starts(last), 200);
+  h.clock.advance(1000);
+  assert.equal(reasonOf(await complete(last, h.code(amira.secret))), 'reset_invalid');
   // Disabled after the link was sent: the link is dead.
-  const live = resetCodeOf(AMIRA);
+  h.clock.advance(61 * 60_000);
+  await request(AMIRA, from(HOME));
   await h.stores.directory.updateUser('usr_amira', (user) => ({ ...user, disabledAt: h.clock.now }));
-  assert.equal(reasonOf(await complete(live, h.freshCode(amira.secret))), 'reset_invalid');
+  assert.equal(reasonOf(await complete(codes().at(-1) as string, h.freshCode(amira.secret))), 'reset_invalid');
   // Each source is limited like any sign-in route.
   await h.close();
   h = await harness({ authRequestsPerMinute: 3 });
   const statuses = [];
   for (let n = 0; n < 5; n += 1) statuses.push((await request(`x${n}@nowhere.example`)).status);
   assert.deepEqual(statuses, [200, 200, 200, 429, 429]);
+});
+
+test('a reset link is good for half an hour FROM WHEN ITS EMAIL IS ACCEPTED, and the email says that time; one that cannot be sent in time is not sent at all and is on record; a permanent refusal fails at once', async () => {
+  h = await harness();
+  const amira = await h.activate(AMIRA);
+  const send = h.outbox.send.bind(h.outbox);
+  let fault: { code: string; responseCode?: number } | null = { code: 'ETIMEDOUT' };
+  h.outbox.send = async (message) => {
+    if (fault) throw Object.assign(new Error('mail server'), fault);
+    return send(message);
+  };
+  const row = async () => (await h.stores.mail.list()).filter((item) => item.template === 'reset.client').at(-1);
+  const utc = (at: number) => `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+
+  // The mail server is down for twelve minutes. Links are tried again soon and often (not after 1, 5, 15, 60 minutes).
+  const asked = h.clock.now;
+  await request(AMIRA);
+  assert.deepEqual([(await row())?.status, (await row())?.deadline], ['queued', asked + RESET_SEND_WITHIN_MS]);
+  for (let minute = 0; minute < 12; minute += 1) {
+    h.clock.advance(60_000);
+    await h.mail.pump();
+  }
+  assert.deepEqual([(await row())?.status, (await row())?.attempts], ['queued', 5]);
+  fault = null;
+  h.clock.advance(60_000);
+  await h.mail.pump();
+  const sentAt = h.clock.now;
+  assert.equal((await row())?.status, 'sent');
+  // The email names the time counted from NOW, and the link really works until then: it did not arrive half dead.
+  const mail = mailsTo(AMIRA, RESET).at(-1);
+  assert.match(mail?.text ?? '', new RegExp(`The link works once, until ${utc(sentAt + PASSWORD_RESET_TTL_MS)}\\.`));
+  assert.doesNotMatch(`${mail?.text}${mail?.html}`, /\u0001|sent\+/);
+  const code = resetCodeOf(AMIRA);
+  h.clock.advance(PASSWORD_RESET_TTL_MS - 60_000);
+  assert.ok(h.clock.now > asked + PASSWORD_RESET_TTL_MS, 'past what it would have been counted from the request');
+  assert.equal((await h.call('POST', '/v1/auth/password-reset/start', { body: { resetCode: code } })).status, 200);
+  assert.equal((await complete(code, h.freshCode(amira.secret))).status, 200);
+
+  // Down for longer than a reset link may wait: it is NOT sent late. It is failed, audited, and on the Mail page.
+  fault = { code: 'ETIMEDOUT' };
+  h.clock.advance(61 * 60_000);
+  const before = h.outbox.sent.length;
+  await request(AMIRA);
+  h.clock.advance(RESET_SEND_WITHIN_MS + 1000);
+  fault = null;
+  await h.mail.pump();
+  assert.deepEqual([(await row())?.status, (await row())?.lastError, (await row())?.body, h.outbox.sent.length], ['failed', 'not sent in time', null, before]);
+  assert.equal((await audit('system.mail.failed')).filter((entry) => entry.detail.error === 'not sent in time').length, 1);
+  assert.ok((await h.mail.summary()).problems.some((item) => item.state === 'failed' && item.lastError === 'not sent in time'));
+
+  // A PERMANENT refusal (550: no such mailbox) is not tried again for hours: it has failed, at once, and is on record.
+  fault = { code: 'EENVELOPE', responseCode: 550 };
+  h.clock.advance(61 * 60_000);
+  await request(AMIRA);
+  assert.deepEqual([(await row())?.status, (await row())?.attempts, (await row())?.lastError], ['failed', 1, 'EENVELOPE 550']);
+  // ...while a temporary one (451) and a refusal that is about the server's own set-up (535 at sign-in) are tried again.
+  for (const temporary of [{ code: 'EENVELOPE', responseCode: 451 }, { code: 'EAUTH', responseCode: 535 }]) {
+    fault = temporary;
+    h.clock.advance(61 * 60_000);
+    await request(AMIRA);
+    assert.deepEqual([(await row())?.status, (await row())?.attempts], ['queued', 1], temporary.code);
+  }
 });
 
 test('security settings: change password needs the current password AND a code; recovery codes are regenerated with a code; sessions are listed by device family and can be ended', async () => {
@@ -358,6 +462,10 @@ test('the delay before an authenticator reset starts only when the mail server h
   const sentAt = h.clock.now;
   assert.equal(await h.authenticatorResets.runDue(), 0);
   assert.deepEqual([(await resetOf(reset.id)).warnedAt, (await resetOf(reset.id)).dueAt], [sentAt, sentAt + 24 * HOUR]);
+  // The email was written thirty hours ago but names the time counted from when it was SENT (it used to name the earlier one).
+  const warning = mailsTo(DANA, NOTICE).find((message) => /It has NOT happened yet/.test(message.text));
+  assert.match(warning?.text ?? '', new RegExp(`It will not happen before ${new Date(sentAt + 24 * HOUR).toISOString().slice(0, 16).replace('T', ' ')} UTC\\.`));
+  assert.doesNotMatch(`${warning?.text}${warning?.html}`, /\u0001/);
   assert.equal((await audit('system.client.reset_authenticator.warned')).length, 1);
   assert.deepEqual((await h.authenticatorResets.waitingWithWarning()).map((item) => item.warning), ['sent']);
   h.clock.advance(24 * HOUR - 1000);
@@ -380,6 +488,10 @@ test('the delay before an authenticator reset starts only when the mail server h
   assert.deepEqual([(await resetOf(second.id)).warningTries, (await resetOf(second.id)).warnedAt, (await userOf('usr_amira')).totpSecret], [1, null, amira.secret]);
   assert.equal((await audit('system.client.reset_authenticator.warning_failed')).length, 1);
   failing = false;
+  // (A fresh warning is not queued every minute after a refusal: a few minutes later, then longer.)
+  assert.equal(await h.authenticatorResets.runDue(), 0);
+  assert.equal((await resetOf(second.id)).warnedAt, null);
+  h.clock.advance(5 * 60_000);
   assert.equal(await h.authenticatorResets.runDue(), 0);
   assert.equal((await resetOf(second.id)).warnedAt, h.clock.now);
   assert.equal((await userOf('usr_amira')).totpSecret, amira.secret);
@@ -444,16 +556,56 @@ test('an authenticator reset is claimed before anything is cleared (a sign-in ca
   assert.equal((await resetOf(fourth.id)).status, 'waiting');
 });
 
-test('reset links asked for at the same moment: never more than the hourly limit, and exactly one live link', async () => {
+test('reset links asked for at the same moment: never more than the limit for one source, and every link that was sent works', async () => {
   h = await harness({}, undefined, { storeLatency: true });
   await h.activate(AMIRA);
   const replies = await Promise.all(Array.from({ length: 15 }, () => h.call('POST', '/v1/auth/password-reset/request', { body: { email: AMIRA } })));
   await h.auth.settle();
   assert.ok(replies.every((reply) => reply.status === 200));
   const codes = h.outbox.sent.filter((message) => message.to === AMIRA && RESET.test(message.subject)).map((message) => /\/reset#code=([A-Z2-7-]+)/.exec(message.text)?.[1] as string);
-  assert.equal(codes.length, RESET_REQUESTS_PER_HOUR);
+  assert.equal(codes.length, RESET_LIMITS.perSource);
   const usable = [];
   for (const code of codes) usable.push((await h.call('POST', '/v1/auth/password-reset/start', { body: { resetCode: code } })).status);
-  assert.deepEqual(usable.sort(), [200, 400, 400]);
-  assert.equal((await audit('client.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').length, 12);
+  assert.deepEqual(usable, [200, 200]);
+  assert.equal((await audit('client.password_reset.request')).filter((entry) => entry.detail.reason === 'rate_limited').length, 13);
+});
+
+test('“this was not me”: the warning before an authenticator reset carries a link that CANCELS that reset and does nothing else; it works when the person cannot sign in; it tells nobody anything', async () => {
+  h = await harness({ authenticatorResetDelayMs: 24 * HOUR });
+  const dana = await h.activate(DANA);
+  const cancel = (token: string) => h.call('POST', '/v1/auth/authenticator-reset/cancel', { body: { token } });
+  const tokenIn = (email: string) => /\/cancel-reset#token=([A-Za-z0-9_.-]+)/.exec(mailsTo(email, NOTICE).filter((message) => /It has NOT happened yet/.test(message.text)).at(-1)?.text ?? '')?.[1] as string;
+  const reset = await schedule('usr_dana', 'req_1');
+  const token = tokenIn(DANA);
+  assert.match(token, /^ar_[a-f0-9]{16}\.[A-Za-z0-9_-]{43}$/);
+  assert.match(mailsTo(DANA, NOTICE).at(-1)?.text ?? '', /open this link and confirm\. It cancels the reset and does nothing else; it cannot be used to sign in\./);
+
+  // (Nothing here needs her to sign in: the route asks for no password, code or session, so a locked sign-in cannot stop it.)
+  // Tokens that are not genuine (a guess, another reset's id with this signature, a cut one): the SAME answer, and nothing happens.
+  const [id, signature] = token.split('.') as [string, string];
+  for (const bad of ['x', `${id}.${'A'.repeat(43)}`, `ar_0123456789abcdef.${signature}`, `${id}.${signature.slice(0, 20)}`, `${token}.more`]) {
+    assert.deepEqual([(await cancel(bad)).status, (await cancel(bad)).json], [200, { ok: true }], bad);
+  }
+  assert.equal((await resetOf(reset.id)).status, 'waiting');
+  // The real one: cancelled, audited, and she is told. The answer is the same as for a guess, and it is not a session.
+  const done = await cancel(token);
+  assert.deepEqual([done.status, done.json], [200, { ok: true }]);
+  assert.deepEqual([(await resetOf(reset.id)).status, (await resetOf(reset.id)).closedBy], ['cancelled', 'the link in the warning email']);
+  assert.equal((await audit('system.client.reset_authenticator.cancelled')).length, 1);
+  assert.equal(mailsTo(DANA, NOTICE).filter((message) => /was cancelled\. Nothing was changed/.test(message.text)).length, 1);
+  assert.equal((await h.stores.auth.sessions.count({ userId: 'usr_dana' })), 0);
+  assert.equal((await userOf('usr_dana')).totpSecret, dana.secret);
+  // Used again, or kept for later: it cancels nothing more. A LATER reset (one she may have asked for herself) has its own link.
+  const later = await schedule('usr_dana', 'req_2');
+  assert.deepEqual((await cancel(token)).json, { ok: true });
+  assert.equal((await resetOf(later.id)).status, 'waiting');
+  assert.equal((await audit('system.client.reset_authenticator.cancelled')).length, 1);
+  assert.notEqual(tokenIn(DANA), token);
+  // A reset that has been carried out cannot be "cancelled" afterwards.
+  h.clock.advance(24 * HOUR + 1000);
+  assert.equal(await h.authenticatorResets.runDue(), 1);
+  assert.deepEqual((await cancel(tokenIn(DANA))).json, { ok: true });
+  assert.equal((await resetOf(later.id)).status, 'done');
+  // The token and the link are in no audit entry and no log line.
+  assert.doesNotMatch(JSON.stringify(await h.stores.audit.query({ limit: 10_000 })) + h.logs.join('\n'), new RegExp(signature));
 });

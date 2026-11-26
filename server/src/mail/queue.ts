@@ -43,7 +43,7 @@ import { randomToken, sha256 } from '../crypto';
 import type { MailMessage, Mailer } from '../mailer';
 import type { AuditLog, MailRecord, Table } from '../store/types';
 import { failureCode } from './smtp';
-import { mailOf, render, type MailRequest, type TemplateName } from './templates';
+import { mailOf, render, stampSendTime, type MailRequest, type TemplateName } from './templates';
 
 export interface MailQueueOptions {
   table: Table<MailRecord>;
@@ -69,6 +69,17 @@ const HOUR = 60 * 60_000;
 /** Wait before the 2nd, 3rd, ... attempt. After the last one the message has failed. */
 export const MAIL_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000, HOUR, 3 * HOUR];
 export const MAIL_MAX_ATTEMPTS = MAIL_BACKOFF_MS.length + 1;
+/**
+ * LINKS are wanted now and go stale: they are tried again much sooner (all six attempts within about eleven
+ * minutes), and a link message carries a deadline after which it is not sent at all.
+ */
+export const LINK_BACKOFF_MS = [20_000, 40_000, 90_000, 3 * 60_000, 6 * 60_000];
+/**
+ * A PERMANENT refusal of this message by the mail server (a 5xx reply to the recipient or to the message itself:
+ * "no such mailbox", "rejected by policy"). Trying again cannot help, so it has failed at once. A 5xx to anything
+ * else (signing in to the mail server, say) is about the server's set-up, not this message, and is tried again.
+ */
+export const isPermanentFailure = (failure: string): boolean => /^(EENVELOPE|EMESSAGE) 5\d\d$/.test(failure);
 /** An attempt that has been "sending" this long without a result was cut off. */
 const STUCK_MS = 2 * 60_000;
 /** A deferred message is looked at again this often. */
@@ -106,13 +117,22 @@ export const DELIVERY_WORDS: Record<MailState, string> = {
   sent: 'sent',
   queued: 'queued: it is in the outbox and will be sent shortly',
   deferred: 'deferred: this address or the server has had its hourly allowance of this kind of email, so it will be sent when the allowance frees',
-  failed: 'NOT sent: the mail server refused it too many times',
+  failed: 'NOT sent: the mail server refused it, or it could not be sent in time',
   digest: 'folded into a digest',
 };
 
 export class MailQueue {
   private running: Promise<void> | null = null;
   private again = false;
+  private readonly sentHooks: { prefix: string; run: (ref: string, sentAt: number) => Promise<void> }[] = [];
+
+  /**
+   * Whoever queued a message with a `ref` that starts with `prefix` is told the moment the mail server has
+   * accepted it (a link's validity runs from then). Called once per message; an error in it is logged, not thrown.
+   */
+  onSent(prefix: string, run: (ref: string, sentAt: number) => Promise<void>): void {
+    this.sentHooks.push({ prefix, run });
+  }
   constructor(private readonly options: MailQueueOptions) {}
 
   private keyOf(key: string): string {
@@ -168,6 +188,8 @@ export class MailQueue {
         sentHour: null,
         deferred: null,
         lastError: rendered ? null : 'could not be rendered',
+        ...(request.deadline !== undefined ? { deadline: request.deadline } : {}),
+        ...(request.ref !== undefined ? { ref: request.ref } : {}),
       };
     });
     if (created && !rendered) await audit.append({ at, actor: SYSTEM, target: null, action: 'system.mail.failed', outcome: 'failure', source: '', detail: { template: request.template, category: request.category, attempts: '0', error: 'render' } });
@@ -235,6 +257,12 @@ export class MailQueue {
     const sent = await this.sentLastHour(at);
     for (const { row: candidate, kind } of due) {
       const rowKey = candidate.key;
+      // PAST ITS DEADLINE (a link that would arrive dead or far too late): not sent. On record as failed, and on the Mail page.
+      if (candidate.deadline !== undefined && candidate.deadline !== null && at > candidate.deadline && candidate.status === 'queued') {
+        const late = await table.mutate(rowKey, (current) => (current && current.id === candidate.id && current.status === 'queued' ? { ...current, status: 'failed', body: null, deferred: null, lastError: 'not sent in time' } : undefined));
+        if (late?.status === 'failed') await audit.append({ at, actor: SYSTEM, target: null, action: 'system.mail.failed', outcome: 'failure', source: '', detail: { mail: candidate.id, template: candidate.template, category: candidate.category, attempts: String(candidate.attempts), error: 'not sent in time' } });
+        continue;
+      }
       // THE ALLOWANCE of this message's own class. Over it, the message waits; it is not dropped.
       const allowance = this.allowance(kind);
       const recipientKey = `${kind}\n${candidate.to}`;
@@ -264,7 +292,8 @@ export class MailQueue {
       let failure: string | null = null;
       try {
         const rendered = JSON.parse(claimed.body ?? '') as { subject: string; text: string; html: string };
-        const message: MailMessage = { to: claimed.to, subject: rendered.subject, text: rendered.text, html: rendered.html, messageId: `<${claimed.id}@${this.options.domain}>` };
+        // Times that run from the sending ("this link works until...") are written in now.
+        const message: MailMessage = { to: claimed.to, subject: rendered.subject, text: stampSendTime(rendered.text, at), html: stampSendTime(rendered.html, at), messageId: `<${claimed.id}@${this.options.domain}>` };
         await transport.send(message);
       } catch (error) {
         failure = failureCode(error);
@@ -272,15 +301,20 @@ export class MailQueue {
       const done = now();
       if (failure === null) {
         await table.mutate(rowKey, (current) => (current && current.id === claimed.id ? { ...current, status: 'sent', sentAt: done, sentHour: Math.floor(done / HOUR), body: null, lastError: null } : undefined));
+        // (`at`, the moment the times in the message were written, is what its issuer is told: nothing it promised runs out early.)
+        for (const hook of this.sentHooks) {
+          if (claimed.ref?.startsWith(hook.prefix)) await hook.run(claimed.ref, at).catch((error: unknown) => this.options.onError?.(error instanceof Error ? error.message : 'mail sent hook failed'));
+        }
         continue;
       }
       // Not sent: it does not count against the allowance.
       sent.global.set(kind, (sent.global.get(kind) ?? 1) - 1);
       sent.byRecipient.set(recipientKey, (sent.byRecipient.get(recipientKey) ?? 1) - 1);
-      const final = claimed.attempts >= MAIL_MAX_ATTEMPTS;
+      const final = claimed.attempts >= MAIL_MAX_ATTEMPTS || isPermanentFailure(failure);
+      const backoff = kind === 'links' ? LINK_BACKOFF_MS : MAIL_BACKOFF_MS;
       await table.mutate(rowKey, (current) =>
         current && current.id === claimed.id
-          ? { ...current, status: final ? 'failed' : 'queued', nextAttemptAt: done + (MAIL_BACKOFF_MS[claimed.attempts - 1] ?? 0), lastError: failure, body: final ? null : current.body }
+          ? { ...current, status: final ? 'failed' : 'queued', nextAttemptAt: done + (backoff[claimed.attempts - 1] ?? 0), lastError: failure, body: final ? null : current.body }
           : undefined,
       );
       if (final) await audit.append({ at: done, actor: SYSTEM, target: null, action: 'system.mail.failed', outcome: 'failure', source: '', detail: { mail: claimed.id, template: claimed.template, category: claimed.category, attempts: String(claimed.attempts), error: failure } });

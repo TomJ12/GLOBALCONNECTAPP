@@ -131,7 +131,13 @@ export interface PasswordResetRecord {
   expiresAt: number;
   /** Wrong second factors entered with this link. At five the link is withdrawn. */
   attempts: number;
-  /** Only on a person's LEDGER row (auth/resetLedger.ts): when links were asked for in the last hour, and which link is live. */
+  /**
+   * Only on a person's LEDGER row (auth/resetLedger.ts): who asked for links (when, from which network, and whether
+   * the account had signed in from there before), and which links are live. `requests` and `current` are how
+   * earlier versions wrote the same row; they are still read.
+   */
+  asked?: { at: number; network: string; known: boolean }[];
+  live?: { key: string; until: number }[];
   requests?: number[];
   current?: string | null;
 }
@@ -163,6 +169,8 @@ export interface AuthenticatorResetRecord {
   warnedAt?: number | null;
   /** How many times the warning has had to be queued again because the mail server refused it for good. */
   warningTries?: number;
+  /** After a warning was refused: when the next one may be queued. */
+  warningRetryAt?: number | null;
   closedAt: number | null;
   /** Who or what cancelled it: a staff email, or "signed in". */
   closedBy: string | null;
@@ -536,6 +544,10 @@ export interface MailRecord {
   sentAt: number | null;
   /** A short code only (an error code, a reply code, or which limit): never anything from the message. */
   lastError: string | null;
+  /** Not to be sent after this time: it becomes `failed` ("not sent in time") instead. Links carry one. */
+  deadline?: number | null;
+  /** What the message carries, for its issuer to be told when it was sent. A name and a hash: never a code or a link. */
+  ref?: string | null;
 }
 
 /**

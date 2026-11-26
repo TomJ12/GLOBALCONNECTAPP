@@ -39,7 +39,7 @@ import { ApiError } from '../errors';
 import type { AuditParty, CompanyRecord, SessionRecord, Stores, UserRecord } from '../store/types';
 import { isKnownSource, Lockout, withKnownSource, type Attempt, type LockScope } from './lockout';
 import type { MailQueue } from '../mail/queue';
-import { claimResetLink, endResetLinks, isLiveResetLink } from './resetLedger';
+import { claimResetLink, endResetLinks, isLiveResetLink, resetLinkSent } from './resetLedger';
 import { mailOf, type SecurityNotice } from '../mail/templates';
 import type { SecurityNotices } from '../notify/security';
 
@@ -48,8 +48,9 @@ const RECOVERY_CODE_COUNT = 10;
 const MAX_CHALLENGE_ATTEMPTS = 5;
 /** A password-reset link works once, for half an hour. */
 export const PASSWORD_RESET_TTL_MS = 30 * 60_000;
-/** Reset links emailed to one account per hour. Asking more often changes nothing and sends nothing. */
-export const RESET_REQUESTS_PER_HOUR = 3;
+/** A reset email that the mail server has not accepted this long after it was asked for is not sent any more. */
+export const RESET_SEND_WITHIN_MS = 30 * 60_000;
+const RESET_REF = 'reset.client:';
 const ROUGH_MS = 15 * 60_000;
 
 /** "Chrome on Windows": the family of browser or app and of system, from what the client said about itself. Never the string itself. */
@@ -107,6 +108,8 @@ export class AuthService {
   private notices: SecurityNotices | null = null;
   attach(mail: MailQueue, notices: SecurityNotices): void {
     this.mail = mail;
+    // A reset link is good for half an hour from the moment its email was accepted by the mail server.
+    mail.onSent(RESET_REF, (ref, sentAt) => resetLinkSent(this.stores.auth.passwordResets, ref.slice(RESET_REF.length), sentAt, PASSWORD_RESET_TTL_MS));
     this.notices = notices;
   }
   private async notice(user: UserRecord, kind: SecurityNotice, extra: { until?: number } = {}): Promise<void> {
@@ -493,8 +496,9 @@ export class AuthService {
    * Always the same answer, after the same work as a sign-in attempt, whether
    * or not the address belongs to an account: what follows happens after the
    * answer has gone. If the account exists, is activated and is enabled, a
-   * single-use link is emailed to it; an earlier link stops working. At most
-   * RESET_REQUESTS_PER_HOUR links an hour for one account.
+   * single-use link is emailed to it. An earlier link goes on working until it
+   * is used or runs out: anyone can ask, so asking takes nothing away. How many
+   * may be asked for, per network and per account, is in auth/resetLedger.ts.
    */
   async requestPasswordReset(email: string, source = ''): Promise<void> {
     const address = email.trim().toLowerCase();
@@ -509,19 +513,23 @@ export class AuthService {
     }
     const resetCode = randomCode(4);
     const codeKey = sha256(normaliseCode(resetCode));
-    const expiresAt = this.now() + PASSWORD_RESET_TTL_MS;
-    // The limit and "one live link" in ONE transaction: a new link kills the old one, and requests arriving
-    // together cannot both pass the limit or leave two usable links (auth/resetLedger.ts).
-    if (!(await claimResetLink(this.stores.auth.passwordResets, user.id, codeKey, this.now(), RESET_REQUESTS_PER_HOUR, PASSWORD_RESET_TTL_MS))) {
-      await this.record('client.password_reset.request', 'failure', partyOf(user), source, { reason: 'rate_limited' });
+    const at = this.now();
+    // The limits (per source network, per account) and the list of live links, in ONE transaction. A new link does
+    // not kill an older one: anybody can ask, so asking must not take anything from the owner (auth/resetLedger.ts).
+    const refused = await claimResetLink(this.stores.auth.passwordResets, user.id, codeKey, at, { source, known: isKnownSource(user, source) }, RESET_SEND_WITHIN_MS + PASSWORD_RESET_TTL_MS);
+    if (refused) {
+      await this.record('client.password_reset.request', 'failure', partyOf(user), source, { reason: 'rate_limited', limit: refused });
       return;
     }
-    await this.stores.auth.passwordResets.put(codeKey, { userId: user.id, expiresAt, attempts: 0 });
+    await this.stores.auth.passwordResets.put(codeKey, { userId: user.id, expiresAt: at + PASSWORD_RESET_TTL_MS, attempts: 0 });
     // The code is in the link's fragment, which browsers do not send to servers: it is in no request log.
-    // The answer to the person is the same whatever happens here; if the email is deferred by its hourly
-    // allowance it stays in the outbox and is sent when the allowance frees. What became of it is on record.
-    const delivery = await this.mail?.enqueue(mailOf({ to: user.email, template: 'reset.client', data: { name: user.name, link: `${this.config.appUrl}/reset#code=${resetCode}`, expiresAt }, key: `reset:${sha256(resetCode)}`, category: 'security' }));
-    await this.record('client.password_reset.request', delivery?.state === 'failed' ? 'failure' : 'success', partyOf(user), source, { expires: new Date(expiresAt).toISOString(), email: delivery?.state ?? 'none' });
+    // The answer to the person is the same whatever happens here. THE LINK IS GOOD FOR HALF AN HOUR FROM THE
+    // MOMENT THE MAIL SERVER ACCEPTS THE EMAIL (`resetLinkSent`, below), and the email says that time; an email
+    // that cannot be sent within RESET_SEND_WITHIN_MS is not sent at all, and is on the Mail page as failed.
+    const delivery = await this.mail?.enqueue(
+      mailOf({ to: user.email, template: 'reset.client', data: { name: user.name, link: `${this.config.appUrl}/reset#code=${resetCode}`, validForMs: PASSWORD_RESET_TTL_MS }, key: `reset:${sha256(resetCode)}`, category: 'security', deadline: at + RESET_SEND_WITHIN_MS, ref: `${RESET_REF}${codeKey}` }),
+    );
+    await this.record('client.password_reset.request', delivery?.state === 'failed' ? 'failure' : 'success', partyOf(user), source, { validForMinutes: String(PASSWORD_RESET_TTL_MS / 60_000), email: delivery?.state ?? 'none' });
   }
 
   private async passwordReset(resetCode: string) {

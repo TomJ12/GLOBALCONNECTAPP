@@ -32,6 +32,14 @@ interface Draft {
 }
 
 const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+/**
+ * A TIME THAT DEPENDS ON WHEN THE EMAIL IS SENT ("this link works until...", "not before..."). An email can wait in
+ * the outbox (the mail server is down, an allowance is used up), so such a time is not written when the message is
+ * queued: the template leaves this mark, and the queue writes the time in at the moment it hands the message to the
+ * mail server (`stampSendTime`). The mark is made of a control character, which no name or typed text can contain.
+ */
+export const afterSend = (ms: number): string => `\u0001sent+${Math.max(0, Math.round(ms))}\u0001`;
+export const stampSendTime = (text: string, sentAt: number): string => text.replace(/\u0001sent\+(\d+)\u0001/g, (_mark, ms: string) => utc(sentAt + Number(ms)));
 /** A name or other free text can never start a new line of a message. */
 const safe = (value: string): string => singleLine(value).slice(0, 200);
 const NOT_YOU = `If this was not you, tell Global Connect at once: ${MAIL_CONTACT}`;
@@ -45,15 +53,16 @@ export const SECURITY_NOTICES = {
   account_locked: () => ['Too many wrong passwords or codes were entered for your account, so sign-in is locked for a while. If it was you, wait and try again; nothing else is needed.'],
   account_disabled: () => ['Your account has been disabled by Global Connect. You cannot sign in until it is enabled again.'],
   account_enabled: () => ['Your account has been enabled again by Global Connect.'],
-  authenticator_reset_requested: (data: { until?: number }) => [
+  authenticator_reset_requested: (data: { until?: number; delayMs?: number }) => [
     'Global Connect staff have approved a reset of the authenticator on your account.',
-    `It has NOT happened yet. It will not happen before ${utc(data.until ?? 0)}. After that your current password, authenticator and recovery codes will stop working and a new activation link will be emailed to this address.`,
+    // In the email the time is worked out when the email is SENT (the delay runs from then); in the app it is the earliest it could be.
+    `It has NOT happened yet. It will not happen before ${data.delayMs !== undefined ? afterSend(data.delayMs) : utc(data.until ?? 0)}. After that your current password, authenticator and recovery codes will stop working and a new activation link will be emailed to this address.`,
     'If you did not ask for this: sign in now with your current password and authenticator code (that cancels the reset), and tell Global Connect.',
   ],
   authenticator_reset_cancelled: () => ['The reset of the authenticator on your account was cancelled. Nothing was changed: your password, authenticator and recovery codes work as before.'],
   authenticator_reset_completed: () => ['The authenticator on your account has been reset. Your earlier password, authenticator and recovery codes no longer work. A separate email carries a new activation link.'],
   session_revoked: () => ['One of the signed-in sessions of your account was signed out from your security settings.'],
-} satisfies Record<string, (data: { until?: number }) => string[]>;
+} satisfies Record<string, (data: { until?: number; delayMs?: number }) => string[]>;
 export type SecurityNotice = keyof typeof SECURITY_NOTICES;
 
 /**
@@ -172,7 +181,7 @@ export const TEMPLATES = {
     ],
   }),
   // The link ALONE resets nothing: the page it opens also asks for a code from the authenticator app (or a recovery code).
-  'reset.client': (data: { name: string; link: string; expiresAt: number }): Draft => ({
+  'reset.client': (data: { name: string; link: string; validForMs: number }): Draft => ({
     subject: 'Reset the password of your Global Connect account',
     lines: [
       `Hello ${safe(data.name)},`,
@@ -180,11 +189,11 @@ export const TEMPLATES = {
       'A password reset was asked for on your Global Connect account. To choose a new password, open this link:',
       { link: data.link },
       '',
-      `The link works once and expires ${utc(data.expiresAt)}. You will also be asked for a code from your authenticator app, or one of your recovery codes: the link alone changes nothing.`,
+      `The link works once, until ${afterSend(data.validForMs)}. You will also be asked for a code from your authenticator app, or one of your recovery codes: the link alone changes nothing.`,
       'If you did not ask for this, you need do nothing: your password has not changed. If it keeps happening, tell Global Connect.',
     ],
   }),
-  'reset.staff': (data: { name: string; link: string; expiresAt: number }): Draft => ({
+  'reset.staff': (data: { name: string; link: string; validForMs: number }): Draft => ({
     subject: 'Reset the password of your Global Connect staff account',
     lines: [
       `Hello ${safe(data.name)},`,
@@ -192,14 +201,33 @@ export const TEMPLATES = {
       'A password reset was asked for on your Global Connect staff account. To choose a new password, open this link:',
       { link: data.link },
       '',
-      `The link works once and expires ${utc(data.expiresAt)}. You will also be asked for a code from your authenticator app, or one of your recovery codes: the link alone changes nothing.`,
+      `The link works once, until ${afterSend(data.validForMs)}. You will also be asked for a code from your authenticator app, or one of your recovery codes: the link alone changes nothing.`,
       'If you did not ask for this, you need do nothing: your password has not changed. Tell an ops admin.',
     ],
   }),
   // A NOTICE: it tells, it never asks. No link, no code, nothing to click.
-  'security.notice': (data: { name: string; audience: 'client' | 'staff'; kind: SecurityNotice; at: number; until?: number }): Draft => ({
+  'security.notice': (data: { name: string; audience: 'client' | 'staff'; kind: SecurityNotice; at: number; until?: number; delayMs?: number }): Draft => ({
     subject: data.audience === 'staff' ? 'Security notice for your Global Connect staff account' : 'Security notice for your Global Connect account',
     lines: [`Hello ${safe(data.name)},`, '', ...SECURITY_NOTICES[data.kind](data), '', `Time: ${utc(data.at)}.`, NOT_YOU],
+  }),
+  /**
+   * THE WARNING before an authenticator reset. The one security message with a link: "this was not me". The link
+   * opens a page of this server that asks for confirmation and then CANCELS the reset; it does nothing else, and
+   * cannot be used to sign in. (A person who is locked out of signing in, or is away from every network they
+   * have used, can still object.)
+   */
+  'security.reset_warning': (data: { name: string; at: number; delayMs: number; cancelLink: string }): Draft => ({
+    subject: 'Security notice for your Global Connect account',
+    lines: [
+      `Hello ${safe(data.name)},`,
+      '',
+      ...SECURITY_NOTICES.authenticator_reset_requested({ delayMs: data.delayMs }),
+      'Or, if you cannot sign in: open this link and confirm. It cancels the reset and does nothing else; it cannot be used to sign in.',
+      { link: data.cancelLink },
+      '',
+      `Time: ${utc(data.at)}.`,
+      NOT_YOU,
+    ],
   }),
   // A NOTIFICATION the person can turn off (rate alerts, approvals, their own payments). No link, no code, no bank details.
   notification: (data: { name: string; kind: NotificationKind; note: unknown }): Draft => ({
@@ -256,6 +284,10 @@ export interface MailRequest<N extends TemplateName = TemplateName> {
   /** The same key is the same message: it is queued once. */
   key: string;
   category: MailCategory;
+  /** Not to be sent after this time (a link that would arrive dead, or too late to be expected): it is recorded as failed instead. */
+  deadline?: number;
+  /** Names what the message carries, for whoever must know WHEN it was sent (mail/queue.ts `onSent`). Never a code or a link. */
+  ref?: string;
 }
 
 /** Builds a request with its template's data checked. */
@@ -263,5 +295,6 @@ export const mailOf = <N extends TemplateName>(request: MailRequest<N>): MailReq
 
 /** The email that carries an activation link. One message per link: asking again for the same link queues nothing new. */
 export function activationMail(invite: { activationLink: string; expiresAt: number }, to: string, name: string, kind: 'client' | 'staff'): MailRequest {
-  return mailOf({ to, template: kind === 'staff' ? 'activation.staff' : 'activation.client', data: { name, link: invite.activationLink, expiresAt: invite.expiresAt }, key: `activation:${sha256(invite.activationLink)}`, category: 'activation' });
+  // (An activation link is good for days; its email is not sent once the link has run out.)
+  return mailOf({ to, template: kind === 'staff' ? 'activation.staff' : 'activation.client', data: { name, link: invite.activationLink, expiresAt: invite.expiresAt }, key: `activation:${sha256(invite.activationLink)}`, category: 'activation', deadline: invite.expiresAt });
 }
