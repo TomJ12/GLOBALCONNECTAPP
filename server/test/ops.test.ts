@@ -1632,7 +1632,7 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
 
   // The request and its confirmation say there is a delay, and how long.
   const page = await admin.browser.post('/ops/users/usr_amira/reset-authenticator', { verification: 'Called back on the number on file' });
-  assert.match(page.body, /Once approved, a warning is emailed to the client and shown to them in the app\. NOTHING changes until 24 hours after the mail server has ACCEPTED that warning \(if the warning cannot be delivered, the reset waits\): their current credentials go on working, and the reset is cancelled if they sign in with them or if an ops admin cancels it/);
+  assert.match(page.body, /Once approved, a warning is emailed to the client and shown to them in the app\. NOTHING changes until 24 hours after the mail server has ACCEPTED that warning \(if the warning cannot be delivered, the reset waits\): their current credentials go on working, and the reset is cancelled if a code from their authenticator is accepted \(signing in, a step-up, a password change\), if they use the “this was not me” link in the warning email, or if an ops admin cancels it/);
 
   // --- 1. Approved: the client is told, nothing else happens.
   const first = await ask('usr_amira');
