@@ -315,6 +315,7 @@ test('outbox: each class of email has its own hourly allowance; ordinary notific
   // The allowance is counted from the outbox itself: a restart does not reset it...
   const restarted = queueOf(outbox, { delivery: 'inline' });
   await restarted.recover();
+  h.clock.advance(61_000);
   await restarted.pump();
   assert.equal(to('victim@northfield.example', /^Activate/), 6);
   // ...an hour does: everything that waited is SENT.

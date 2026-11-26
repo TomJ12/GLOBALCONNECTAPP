@@ -109,6 +109,13 @@ test('an alert is checked against the client’s own rate, fires once, says the 
   // Somebody else's id changes nothing for either person.
   assert.deepEqual((await h.call('POST', '/v1/notifications/read', { token: ben.token, body: { id: list.items[1]?.id } })).json, { ok: true, unread: 0 });
   assert.equal((await notesOf(amira.token)).unread, 2);
+  // The same for a colleague in the SAME company: a notification belongs to one person, not to the company.
+  const colleague = await signedIn(DANA, 'co_northfield');
+  const hers = await notesOf(colleague.token);
+  assert.ok(hers.items.every((item) => !list.items.some((other) => other.id === item.id)));
+  assert.deepEqual((await h.call('POST', '/v1/notifications/read', { token: colleague.token, body: { id: list.items[1]?.id } })).json, { ok: true, unread: hers.unread });
+  assert.deepEqual((await h.call('POST', '/v1/notifications/read', { token: colleague.token, body: {} })).json, { ok: true, unread: 0 });
+  assert.equal((await notesOf(amira.token)).unread, 2);
   assert.deepEqual((await h.call('POST', '/v1/notifications/read', { token: amira.token, body: {} })).json, { ok: true, unread: 0 });
   assert.ok((await notesOf(amira.token)).items.every((item) => item.read));
   // The audit log says who was told and which kind; never what it said.

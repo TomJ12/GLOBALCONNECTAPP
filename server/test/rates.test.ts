@@ -320,6 +320,8 @@ test('a provider that books WITHOUT the client’s terms: the client is shown wh
   const again = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '300.00' });
   assert.equal((await book(amira.token, again.id, 'rates-key-m-0004')).status >= 500, true);
   h.providerA.request = original;
+  // (Retried after the quote has run out: it is still the conversion that was made, not "quote expired".)
+  h.clock.advance(Date.parse(again.expiresAt) - h.clock.now + 1000);
   const second2 = await book(amira.token, again.id, 'rates-key-m-0004');
   assert.deepEqual([second2.status, second2.json.buyAmount], [200, '388.05']);
   assert.deepEqual((await revenue()).filter((item) => item.quoteId === again.id).map((item) => item.status), ['booked']);
