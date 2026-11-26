@@ -918,7 +918,12 @@ on **every quote**: `provider` with no markup there (the client would be shown a
 given the wholesale rate) and `server` with a markup there (the client would be charged
 twice) both **refuse to quote**, with the reason in the server log. With `provider`,
 an indicative rate is passed on only after one real quote has shown the markup is
-there (checked again every ten minutes). Provider B's quotes do not say, so
+there (checked again every ten minutes). **Every rate that reaches a client goes
+through that one check**: the rate page, the trend line, creating a rate alert, and
+the alert check itself (an alert whose company's setting is wrong does not fire, so no
+notification or email quotes the wholesale rate). The code has one entry point for it
+(`indicative` and `history` in `server/src/rates/service.ts`); the function that turns
+a provider's rate into the client's is private to that file. Provider B's quotes do not say, so
 `MARGIN_APPLIED_BY_EQUALS=provider` is **refused at start-up**: the server could not
 tell a marked-up rate from the wholesale one.
 
@@ -961,7 +966,11 @@ client's terms is **not counted** in the totals and is listed by itself.
   client is shown **what was really booked** (that is what moved on their account),
   flagged as differing from the quote, with wording from a placeholder
   (`disclosures.conversionDiffers`) telling them to get in touch, and is notified in the
-  app and by email. The revenue row is **left out of the totals** and listed
+  app and by email. That notification is not held back by the hourly allowance of
+  ordinary notifications (which a busy colleague can use up), its email goes in the
+  security class of mail, and it is **tried again every minute until it exists**: the
+  record stays marked as untold until then, so an error or a restart between the
+  booking and the notification does not lose it. The revenue row is **left out of the totals** and listed
   separately on the Revenue page with what was quoted and what was booked; it is
   audited (`system.conversion.mismatch`) and logged. In that case the client sees the
   provider's own rate for that trade: that is what happened to their money. Nothing

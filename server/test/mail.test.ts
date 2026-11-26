@@ -121,6 +121,7 @@ test('templates: every message has a harmless subject, the same lines as text an
     ['bitcoin:1abc', 'bitcoin[:]1abc'],
     ['magnet:?xt=1', 'magnet[:]?xt=1'],
     ['geo:51.5,0', 'geo[:]51.5,0'],
+    ['call tel: 020 7946 0000 or mailto :someone', 'call tel[:] 020 7946 0000 or mailto[:]someone'],
     ['evil\uFF0Ecom', 'evil[.]com'],
     ['evil\u2024com', 'evil[.]com'],
     ['evil\u3002com', 'evil[.]com'],
