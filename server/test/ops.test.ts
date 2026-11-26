@@ -1769,7 +1769,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   await ask(admin.email);
   const link = resetLink(admin.email);
   assert.ok(link && firstLink && link !== firstLink);
-  assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /Choose a new password/);
+  assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /Code from your authenticator app, or a recovery code/);
   await ask(admin.email);
   assert.equal(h.outbox.sent.filter((message) => message.to === admin.email && /ops\/reset#code=/.test(message.text)).length, 2, 'the third request in the hour from this network made no link');
   const live = resetLink(admin.email);
@@ -1828,6 +1828,24 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.deepEqual(entries.map((entry) => [entry.actor.label, entry.detail.method]).reverse(), [[admin.email, 'totp'], [second.email, 'recovery']]);
   const everything = JSON.stringify(await audit());
   assert.ok(!everything.includes(live) && !everything.includes('a completely new staff password'));
+  // The mail server is down for ten minutes: the link is good for half an hour from when its email was ACCEPTED, as for clients.
+  h.clock.advance(61 * 60_000);
+  const send = h.outbox.send.bind(h.outbox);
+  h.outbox.send = async () => {
+    throw Object.assign(new Error('mail server down'), { code: 'ETIMEDOUT' });
+  };
+  const asked = h.clock.now;
+  await ask(admin.email);
+  h.clock.advance(10 * 60_000);
+  h.outbox.send = send;
+  await h.mail.pump();
+  const late = resetLink(admin.email);
+  assert.notEqual(late, live);
+  h.clock.advance(25 * 60_000);
+  assert.ok(h.clock.now > asked + 30 * 60_000);
+  assert.match((await opened('/ops/reset', { resetCode: late })).body, /Code from your authenticator app, or a recovery code/);
+  h.clock.advance(6 * 60_000);
+  assert.match((await opened('/ops/reset', { resetCode: late })).body, /That reset link is not valid any more/);
   // A disabled member of staff gets no link.
   await h.stores.ops.users.update(second.id, (current) => ({ ...current, disabledAt: 1 }));
   const count = h.outbox.sent.length;

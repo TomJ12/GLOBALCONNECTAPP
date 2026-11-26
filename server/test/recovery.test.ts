@@ -144,7 +144,8 @@ test('forgotten password: ANYONE can ask, so asking takes nothing from the owner
   h = await harness({ trustProxy: 1 });
   const amira = await h.activate(AMIRA);
   const HOME = '198.51.100.7';
-  await h.stores.directory.updateUser('usr_amira', (user) => ({ ...user, knownSources: [networkOf(HOME)] }));
+  const OFFICE = '192.0.2.44';
+  await h.stores.directory.updateUser('usr_amira', (user) => ({ ...user, knownSources: [networkOf(HOME), networkOf(OFFICE)] }));
   const from = (address: string) => ({ 'x-forwarded-for': address });
   const sent = () => mailsTo(AMIRA, RESET).length;
   const codes = () => mailsTo(AMIRA, RESET).map((message) => /\/reset#code=([A-Z2-7-]+)/.exec(message.text)?.[1] as string);
@@ -172,7 +173,10 @@ test('forgotten password: ANYONE can ask, so asking takes nothing from the owner
   // ...and CANNOT use up hers: from where she usually is, she is still sent a link (it used to be refused silently).
   await request(AMIRA, from(HOME));
   assert.equal(sent(), 5);
-  // Five is the most this account's mailbox gets in an hour, from anywhere.
+  // Five is the most this account's mailbox gets in an hour, from anywhere: even from another network she uses.
+  await request(AMIRA, from(OFFICE));
+  assert.equal(sent(), 5);
+  assert.deepEqual((await refusals()).slice(-1), ['account']);
   await request(AMIRA, from(HOME));
   assert.equal(sent(), 5);
   assert.deepEqual((await refusals()).slice(-1), ['source']);
@@ -598,6 +602,8 @@ test('“this was not me”: the warning before an authenticator reset carries a
   // Used again, or kept for later: it cancels nothing more. A LATER reset (one she may have asked for herself) has its own link.
   const later = await schedule('usr_dana', 'req_2');
   assert.deepEqual((await cancel(token)).json, { ok: true });
+  // (Nor does its signature under the later reset's name: a link is for ONE reset.)
+  assert.deepEqual((await cancel(`${later.id}.${signature}`)).json, { ok: true });
   assert.equal((await resetOf(later.id)).status, 'waiting');
   assert.equal((await audit('system.client.reset_authenticator.cancelled')).length, 1);
   assert.notEqual(tokenIn(DANA), token);
