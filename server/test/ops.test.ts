@@ -1657,7 +1657,7 @@ test('authenticator reset: once approved NOTHING changes for 24 hours; the clien
   assert.equal((await h.login(AMIRA, amira.secret)).status, 200);
   assert.equal((await h.authenticatorResets.waiting()).length, 0);
   const cancelled = (await audit('system.client.reset_authenticator.cancelled'))[0];
-  assert.deepEqual([cancelled?.target?.label, cancelled?.detail.by, cancelled?.detail.request], [AMIRA, 'signed in', first.id]);
+  assert.deepEqual([cancelled?.target?.label, cancelled?.detail.by, cancelled?.detail.request], [AMIRA, 'an authenticator code was accepted', first.id]);
   assert.match(noticesTo(AMIRA).at(-1) ?? '', /reset of the authenticator on your account was cancelled\. Nothing was changed/);
   // The delay passes: nothing happens. She keeps her account.
   h.clock.advance(30 * HOUR_MS);

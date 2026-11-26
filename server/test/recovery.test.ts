@@ -414,14 +414,28 @@ test('an authenticator reset is claimed before anything is cleared (a sign-in ca
   await request(DANA);
   assert.equal((await complete(resetCodeOf(DANA), h.freshCode(dana.secret))).status, 200);
   assert.equal((await resetOf(second.id)).status, 'cancelled');
-  assert.equal((await audit('system.client.reset_authenticator.cancelled'))[0]?.detail.by, 'password reset with an authenticator code');
+  assert.equal((await audit('system.client.reset_authenticator.cancelled'))[0]?.detail.by, 'an authenticator code was accepted');
   // The same when she changes her password, signed in, with a code.
   const signedIn = await h.login(DANA, dana.secret, NEW_PASSWORD);
   assert.equal(signedIn.status, 200);
   const third = await schedule('usr_dana', 'req_3');
   const changed = await h.call('POST', '/v1/account/password', { token: signedIn.json.token, body: { currentPassword: NEW_PASSWORD, code: h.freshCode(dana.secret), newPassword: 'emerald kettle window frost' } });
   assert.equal(changed.status, 200, JSON.stringify(changed.json));
-  assert.deepEqual([(await resetOf(third.id)).status, (await resetOf(third.id)).closedBy], ['cancelled', 'password changed with an authenticator code']);
+  assert.deepEqual([(await resetOf(third.id)).status, (await resetOf(third.id)).closedBy], ['cancelled', 'an authenticator code was accepted']);
+  // ANY code from her authenticator that the server accepts does it, in a session she already has: a step-up...
+  assert.equal((await h.call('POST', '/v1/session/company', { token: signedIn.json.token, body: { companyId: 'co_northfield' } })).status, 200);
+  const viaStepUp = await schedule('usr_dana', 'req_3a');
+  const wrong = await h.call('POST', '/v1/step-up', { token: signedIn.json.token, body: { action: 'payment.create', payload: { amount: '1.00' }, code: '000000' } });
+  assert.deepEqual([wrong.status, (await resetOf(viaStepUp.id)).status], [400, 'waiting'], 'a wrong code cancels nothing');
+  const stepUp = await h.call('POST', '/v1/step-up', { token: signedIn.json.token, body: { action: 'payment.create', payload: { amount: '1.00' }, code: h.freshCode(dana.secret) } });
+  assert.equal(stepUp.status, 200, JSON.stringify(stepUp.json));
+  assert.equal((await resetOf(viaStepUp.id)).status, 'cancelled');
+  // ...and making new recovery codes.
+  const viaCodes = await schedule('usr_dana', 'req_3b');
+  const newCodes = await h.call('POST', '/v1/account/recovery-codes', { token: signedIn.json.token, body: { code: h.freshCode(dana.secret) } });
+  assert.equal(newCodes.status, 200, JSON.stringify(newCodes.json));
+  assert.equal((await resetOf(viaCodes.id)).status, 'cancelled');
+  dana.recoveryCodes = newCodes.json.recoveryCodes;
   // A RECOVERY code does not show that she holds the authenticator: that reset stays.
   const fourth = await schedule('usr_dana', 'req_4');
   h.clock.advance(HOUR + 1);

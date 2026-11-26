@@ -288,6 +288,10 @@ export class AuthService {
     );
     if (!updated) return reused();
     await this.lockout.succeed(attempt);
+    // ANY code from the authenticator that this server accepts (at sign-in, for a step-up, to change the password,
+    // to make new recovery codes, to reset the password) shows that its holder has not lost it: a reset of the
+    // authenticator that is waiting is cancelled, here, in the one place every such code is checked.
+    await this.cancelAuthenticatorResets(updated, 'an authenticator code was accepted', source);
     return updated;
   }
 
@@ -565,9 +569,6 @@ export class AuthService {
     await this.lockout.unlock([`email:${user.email}`]);
     await this.record('client.password_reset', 'success', partyOf(user), source, { method, sessionsEnded: String(sessions) });
     await this.notice(saved, 'password_reset');
-    // A code from the authenticator was just entered: whoever holds it evidently did not lose it, so a reset of
-    // the authenticator that is waiting is cancelled. (A recovery code does not show that.)
-    if (method === 'totp') await this.cancelAuthenticatorResets(saved, 'password reset with an authenticator code', source);
   }
 
   // --- Signed in: your own security settings -----------------------------------------
@@ -603,8 +604,6 @@ export class AuthService {
     await endResetLinks(this.stores.auth.passwordResets, user.id);
     await this.record('client.password_change', 'success', who, source, { otherSessionsEnded: String(others) });
     await this.notice(user, 'password_changed');
-    // The password was changed with a code from the authenticator: a waiting reset of it is cancelled.
-    await this.cancelAuthenticatorResets(user, 'password changed with an authenticator code', source);
   }
 
   /** An authenticator code buys a fresh set of recovery codes, shown once. The old ones stop working. */
