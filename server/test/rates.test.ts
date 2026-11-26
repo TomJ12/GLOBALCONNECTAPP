@@ -478,6 +478,20 @@ test('the mock providers take the client’s side of a trade only when it is no 
   assert.equal(loadConfig({ ...LIVE, DEFAULT_MARGIN_BPS: '0' }).defaultMarginBps, 0);
 });
 
+test('NOT A SECRET, and stated: two held quotes for one pair, one each way, give the provider’s rate and the margin exactly', async () => {
+  // Quoting both ways at full precision makes this unavoidable. It is not hidden; the README says so. Nothing in this
+  // suite shows the margin cannot be worked out: the scans only show that no field names it and the rate page does not print it.
+  h = await harness();
+  await setMargin('co_northfield', { defaultBps: 37 });
+  const amira = await signedIn(AMIRA);
+  const sell = await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '100000.00' });
+  const buy = await quoteFor(amira.token, { sellCurrency: 'USD', buyCurrency: 'GBP', fixedSide: 'buy', amount: '100000.00' });
+  assert.deepEqual([sell.rate, buy.rate], ['1.295190', '1.304810']);
+  const [low, high] = [new Big(sell.rate), new Big(buy.rate)];
+  assert.equal(high.minus(low).div(high.plus(low)).times(10_000).toFixed(4), '37.0000');
+  assert.equal(high.plus(low).div(2).toFixed(6), '1.300000');
+});
+
 test('the scan that guards every client response does catch the forbidden fields', async () => {
   // It is applied to what the API really sends: a reply that carries a forbidden word fails the call that got it.
   h = await harness();

@@ -248,6 +248,10 @@ test('alerts belong to one person in one company: a cap per person, validation, 
   const dev = (env: Record<string, string>) => loadConfig({ APP_ENV: 'development', ...env });
   assert.deepEqual([dev({}).alertCheckMs, dev({}).alertsPerUser, dev({}).paymentExpiryWarningMs, dev({}).notificationsPerUserPerHour], [60_000, 20, 6 * 60 * 60_000, 60]);
   assert.equal(dev({ ALERT_CHECK_SECONDS: '15', PAYMENT_EXPIRY_WARNING_HOURS: '1.5' }).alertCheckMs, 15_000);
+  // The two mail allowances the README names are real settings, with bounds.
+  assert.deepEqual([dev({}).mailPerRecipientPerHour, dev({}).mailGlobalPerHour], [20, 1000]);
+  assert.deepEqual([dev({ MAIL_PER_RECIPIENT_PER_HOUR: '8', MAIL_GLOBAL_PER_HOUR: '400' }).mailPerRecipientPerHour, dev({ MAIL_PER_RECIPIENT_PER_HOUR: '8', MAIL_GLOBAL_PER_HOUR: '400' }).mailGlobalPerHour], [8, 400]);
+  for (const [name, value] of [['MAIL_PER_RECIPIENT_PER_HOUR', '0'], ['MAIL_PER_RECIPIENT_PER_HOUR', '5000'], ['MAIL_GLOBAL_PER_HOUR', '10'], ['MAIL_GLOBAL_PER_HOUR', 'unlimited']] as const) assert.throws(() => dev({ [name]: value }), new RegExp(name));
   for (const [name, value] of [['ALERT_CHECK_SECONDS', '1'], ['ALERTS_PER_USER', '0'], ['PAYMENT_EXPIRY_WARNING_HOURS', '-1'], ['NOTIFICATIONS_PER_USER_PER_HOUR', 'lots']] as const) assert.throws(() => dev({ [name]: value }), new RegExp(name));
   assert.ok(isProviderError);
 });

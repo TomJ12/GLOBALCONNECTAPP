@@ -783,10 +783,13 @@ margin. **What is and is not disclosed, precisely:** no API response or error me
 has a field or wording that names the provider's rate, a mid-market rate, the margin or
 what Global Connect earns. But a client is shown a rate for selling **and** a rate for
 buying, and from any two-way price anyone can estimate a midpoint and a spread; that is
-not hidden and cannot be while both directions are shown. What the server does is stop
-that estimate being **exact for free**: indicative rates are given only to the
-precision the app displays (five significant figures), each rounded against the client
-by itself, and never as an exact image of the provider's rate and the margin (below).
+not hidden and cannot be while both directions are shown. **The margin is not a
+secret from a client who looks for it:** two held quotes for the same pair, one each
+way, are given at full precision and together give the provider's rate and the margin
+**exactly** (sell 1.295190 and buy 1.304810 are 37 basis points around 1.300000). That
+is inherent in quoting both ways and is not hidden. All the server does is not hand it
+over unasked on the rate page: indicative rates are given only to the precision the
+app displays (five significant figures), each rounded against the client by itself.
 The code is `server/src/rates/margin.ts`
 (the arithmetic) and `server/src/rates/service.ts` (everything a client is told about a
 rate, a quote or a conversion passes through it).
@@ -860,7 +863,7 @@ movement. The Home total is a valuation, not an offer: other currencies are valu
 the rate the client would sell them at, and it says "estimated at your current sell
 rates". (A two-way price lets anyone estimate the midpoint between the two; that is
 true of any buy/sell price and is not hidden. Two held quotes, one each way, give the
-client's two rates in full and so a closer estimate still.)
+client's two rates in full, and from those the provider's rate and the margin exactly.)
 
 **A quote is checked by this server when it is booked**, not left to the provider: it
 must be the quote this server gave **this person** in **this company**, not past its
@@ -878,8 +881,11 @@ client API gives, in every test, for a field or wording that speaks of a mid rat
 margin, a markup, a spread, basis points, wholesale or partner figures, provider
 amounts or revenue, or a provider's parameter name in an error
 (`forbiddenInClientResponse` in `server/test/helpers.ts`), and fails the test that
-caused it. It also fails if a reply carries a sell rate and a buy rate whose spread is
-**exactly** a margin in force, to six places (`marginReadableFrom`).
+caused it. It also fails if one reply's **indicative** sell and buy rate have a spread
+that is exactly a margin in force, to six places (`marginReadableFrom`). **Neither scan
+shows the margin is secret, and it is not** (above): they show that no field names it
+and that the rate page does not print it; a test states that two opposite held quotes
+give it exactly.
 
 **Where the margin is applied: a setting per provider.**
 
@@ -910,7 +916,9 @@ to three overridden pairs). A negative margin is never accepted; one above 300 b
 only when the request ticks "allow a margin this high", and the approver is warned;
 above 2000 bp never. The change is written to the audit log with the old and the new
 configuration and both people. It applies to quotes given from then on; a quote a
-client is already holding keeps its rate.
+client is already holding from before the change **cannot be booked** (the app is told
+it has expired and asks for a new one, at the new margin), and the approver is told so
+on the confirmation page.
 
 **Revenue (ops admins only).** When a conversion is booked the server records, before
 it asks the provider, the provider's rate and amounts, the client's rate and amounts,
@@ -1572,9 +1580,9 @@ a restart does not reset it):
 
 | Class | To one address, per hour | Overall, per hour |
 | --- | --- | --- |
-| Security notices | 12 | `MAIL_GLOBAL_PER_HOUR` (1,000) |
+| Security notices | 12 | `MAIL_GLOBAL_PER_HOUR` (default 1,000) |
 | Activation and reset links | 6 | 1,000 |
-| Payment notifications | `MAIL_PER_RECIPIENT_PER_HOUR` (20) | 1,000 |
+| Payment notifications | `MAIL_PER_RECIPIENT_PER_HOUR` (default 20) | 1,000 |
 | Rate alerts | half of that (10) | 500 |
 | Digest ("more is waiting in the app") | 1 | 1,000 |
 

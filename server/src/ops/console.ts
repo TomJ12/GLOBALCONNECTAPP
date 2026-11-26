@@ -1368,7 +1368,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             const other = await providerRateFor(company, item.pair);
             if (other) examples.push(workedExample(current, wanted, other, item.pair, '10000', item.direction === 'buy' ? 'buy' : 'sell'));
           }
-          const warnings = [`Every conversion this company’s people book from the moment this is approved is priced with the new margin. Quotes they are already holding keep the rate they were given.`];
+          const warnings = [`Every conversion this company’s people book from the moment this is approved is priced with the new margin. A quote one of them is holding from before the change cannot be booked: they are told it has expired and get a new one at the new margin.`];
           const highest = Math.max(wanted.defaultBps, wanted.forwardBps ?? 0, ...wanted.overrides.map((item) => item.bps), ...wanted.tiers.map((item) => item.bps));
           if (highest > MARGIN_USUAL_MAX_BPS) warnings.push(`This sets a margin of ${highest} basis points (${highest / 100}%), above the usual limit of ${MARGIN_USUAL_MAX_BPS}. It was asked for explicitly.`);
           if (wanted.defaultBps === 0) warnings.push('The default margin becomes ZERO: Global Connect earns nothing on this company’s conversions unless an override or tier applies.');

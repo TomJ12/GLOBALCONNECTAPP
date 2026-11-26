@@ -1874,6 +1874,9 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const approvalPage = await admin.browser.get(`/ops/approvals/${id}`);
   assert.match(approvalPage.body, /selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800/);
   assert.match(approvalPage.body, /Every conversion this company’s people book from the moment this is approved is priced with the new margin/);
+  // ...and the truth about quotes already held: they cannot be booked after the change (the page used to say they keep their rate).
+  assert.match(approvalPage.body, /A quote one of them is holding from before the change cannot be booked/);
+  assert.doesNotMatch(approvalPage.body, /keep the rate/);
   // Another ops USER cannot approve it, nor can the requester; an ops admin can, and only with their password.
   assert.equal((await pat.act(`/ops/approvals/${id}/approve`)).status, 403);
   assert.equal((await olu.act(`/ops/approvals/${id}/approve`)).status, 403);

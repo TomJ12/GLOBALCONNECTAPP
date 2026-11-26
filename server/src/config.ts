@@ -383,8 +383,9 @@ export function loadConfig(env: Env = process.env): Config {
     host,
     openOnNetwork,
     smtp: smtpSettings(env, development),
-    mailPerRecipientPerHour: 20,
-    mailGlobalPerHour: 1000,
+    // Payment notifications to one address, and any one class of email overall, per hour (mail/queue.ts has the rest).
+    mailPerRecipientPerHour: numberOf('MAIL_PER_RECIPIENT_PER_HOUR', 20, 2, 200),
+    mailGlobalPerHour: numberOf('MAIL_GLOBAL_PER_HOUR', 1000, 50, 100_000),
     auditAcceptLogEnd: env.AUDIT_ACCEPT_LOG_END?.trim() || null,
     development,
     strict,

@@ -173,8 +173,8 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     // margin or what Global Connect earns may be in it, under any name.
     const leaked = forbiddenInClientResponse(response.body) ?? forbiddenInClientResponse(JSON.stringify(response.headers));
     if (leaked) throw new Error(`${method} ${url} sent a client something it must never see: ${leaked}`);
-    // ...and no reply may carry a PAIR OF NUMBERS from which a configured margin can be read off exactly: where it has
-    // a sell rate and a buy rate, (buy - sell) / (buy + sell) must not be any margin in force, to six places.
+    // ...and the INDICATIVE pair in one reply (rate and buyRate) must not print a margin in force exactly, to six places.
+    // (This does not make the margin a secret: two opposite held quotes give it exactly, and a test in rates.test.ts says so.)
     const exact = await marginReadableFrom(response.body, stores, config);
     if (exact) throw new Error(`${method} ${url} sent a client two rates that give the margin away exactly: ${exact}`);
     let json: unknown = null;
