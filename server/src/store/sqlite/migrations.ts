@@ -172,4 +172,8 @@ CREATE INDEX held_quotes_company ON held_quotes (json_extract(data, '$.companyId
 -- Held payments are looked up by when their status last changed (the notification scan reads only what is recent).
 CREATE INDEX held_payments_status_at ON held_payments (json_extract(data, '$.statusAt'));
 `,
+  // 11: conversions whose booker has still to be told that the booking differs from the quote are found through an index.
+  `
+CREATE INDEX fx_revenue_untold ON fx_revenue (json_extract(data, '$.untold'));
+`,
 ];

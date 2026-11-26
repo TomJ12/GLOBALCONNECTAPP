@@ -32,6 +32,11 @@ export interface PushChannel {
 const HOUR = 60 * 60_000;
 /** Read notifications are kept this long, unread ones twice as long. */
 const KEEP_MS = 30 * 24 * HOUR;
+/**
+ * Kinds that are never held back by the hourly allowance of ordinary notifications (which a busy colleague can use
+ * up), and whose email goes in the security class, which ordinary mail cannot use up either.
+ */
+const MUST_ARRIVE: ReadonlySet<NotificationKind> = new Set<NotificationKind>(['conversion_differs']);
 const MAIL_CATEGORY = { rates: 'rates', approvals: 'payments', payments: 'payments' } as const;
 const SYSTEM = { type: 'system' as const, id: null, label: 'notifications' };
 
@@ -110,7 +115,7 @@ export class Notifier {
     const target = { type: 'client' as const, id: user.id, label: user.email };
     const entry = (outcome: 'success' | 'failure', detail: Record<string, string>): AuditInput => ({ at, actor: SYSTEM, target, action: 'notification', outcome, source: 'server', detail: { kind: request.kind, category: request.category, ...detail } });
     const security = request.category === 'security';
-    if (!security) {
+    if (!security && !MUST_ARRIVE.has(request.kind)) {
       const recent = await this.stores.notifications.count({ userId: user.id }, (row) => row.createdAt > at - HOUR && row.category !== 'security');
       if (recent >= this.options.perUserPerHour) {
         // Held back for now, and on record (once per event while this server runs). The caller is told, so that
@@ -128,7 +133,7 @@ export class Notifier {
     // nothing. A security notice's email is sent by notify/security.ts, not here.
     let email = 'off';
     if (!security && (await this.prefsOf(user.id))[request.category as Exclude<NotificationCategory, 'security'>]) {
-      const delivery = await this.mail.enqueue(mailOf({ to: user.email, template: 'notification', data: { name: user.name, kind: request.kind, note: request.note }, key: `notification:${key}`, category: MAIL_CATEGORY[request.category as Exclude<NotificationCategory, 'security'>] }));
+      const delivery = await this.mail.enqueue(mailOf({ to: user.email, template: 'notification', data: { name: user.name, kind: request.kind, note: request.note }, key: `notification:${key}`, category: MUST_ARRIVE.has(request.kind) ? 'security' : MAIL_CATEGORY[request.category as Exclude<NotificationCategory, 'security'>] }));
       email = delivery.state;
     }
     let created = false;

@@ -77,7 +77,7 @@ const SYSTEM = { type: 'system' as const, id: null, label: 'mail' };
 
 export type MailClass = NonNullable<MailRecord['class']>;
 export const classOf = (template: string, category: string): MailClass =>
-  template === 'notification.digest' ? 'digest' : template.startsWith('activation.') || template.startsWith('reset.') ? 'links' : template === 'security.notice' ? 'security' : category === 'rates' ? 'rates' : 'payments';
+  template === 'notification.digest' ? 'digest' : template.startsWith('activation.') || template.startsWith('reset.') ? 'links' : template === 'security.notice' || category === 'security' ? 'security' : category === 'rates' ? 'rates' : 'payments';
 /** Security and link mail per address per hour: fixed, and not taken from anybody else's allowance. */
 export const SECURITY_PER_RECIPIENT = 12;
 export const LINKS_PER_RECIPIENT = 6;

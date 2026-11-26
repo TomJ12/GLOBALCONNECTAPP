@@ -464,6 +464,32 @@ export async function buildApp(deps: AppDeps) {
   const notifier = new Notifier(deps.stores, mail, { now, perUserPerHour: config.notificationsPerUserPerHour, push: null, onError: (message) => app.log.error({ message }, 'notification failed') });
   // A client's security notice is shown in the app as well as emailed.
   notices.attachInApp((person, kind, data, key) => notifier.security(person, kind, data, key));
+  /**
+   * "Your conversion was not booked as quoted": the person who booked is told, and KEEPS being told until the
+   * notification exists. The record stays marked `untold` until then; whatever stops it (an error, a restart
+   * between the booking and the notification) is put right by the next scan, which reads only such records.
+   */
+  const conversionNotes = {
+    async tell(record: RevenueRecord): Promise<boolean> {
+      try {
+        const result = await notifier.notify(
+          noteOf({ userId: record.userId, companyId: record.companyId, category: 'payments', kind: 'conversion_differs', note: { sellCurrency: record.sellCurrency, buyCurrency: record.buyCurrency, quotedSell: record.clientSellAmount, quotedBuy: record.clientBuyAmount, bookedSell: record.bookedSellAmount ?? record.clientSellAmount, bookedBuy: record.bookedBuyAmount ?? record.clientBuyAmount }, dedupe: `conversion:${record.conversionId}:differs` }),
+        );
+        // Made, there already, or the person may no longer be told anything about this company: done. Anything else is tried again.
+        if (result !== 'created' && result !== 'duplicate' && result !== 'skipped') return false;
+        await rates.told(record.key);
+        return true;
+      } catch (error) {
+        app.log.error({ message: error instanceof Error ? error.message : 'unknown error' }, 'a conversion that differs from its quote could not be notified yet');
+        return false;
+      }
+    },
+    async scan(): Promise<number> {
+      let told = 0;
+      for (const record of await rates.untoldMismatches()) if (await conversionNotes.tell(record)) told += 1;
+      return told;
+    },
+  };
   const paymentNotes = new PaymentNotifications(deps.stores, notifier, { now, expiryWarningMs: config.paymentExpiryWarningMs, onError: (message) => app.log.error({ message }, 'payment notifications failed') });
   const alerts = new RateAlerts({
     stores: deps.stores,
@@ -694,7 +720,7 @@ export async function buildApp(deps: AppDeps) {
               if (!changed || !record?.mismatch) return;
               // Booked, but NOT on the terms the client was quoted: logged, audited (by the record), and the person is told.
               app.log.error({ conversion: conversion.id }, 'the provider booked a conversion without the client terms it was sent');
-              await notifier.notify(noteOf({ userId: record.userId, companyId: record.companyId, category: 'payments', kind: 'conversion_differs', note: { sellCurrency: record.sellCurrency, buyCurrency: record.buyCurrency, quotedSell: record.clientSellAmount, quotedBuy: record.clientBuyAmount, bookedSell: conversion.sellAmount, bookedBuy: conversion.buyAmount }, dedupe: `conversion:${conversion.id}:differs` }));
+              await conversionNotes.tell(record);
             };
             // ONE KEY IS ONE BOOKING OF ONE QUOTE. A key that was used before answers from what it did then:
             const earlier = await rates.recordFor(context.company.id, hash);
@@ -740,7 +766,7 @@ export async function buildApp(deps: AppDeps) {
         const closed = await rates.completeBooking(`${context.company.id}:${keyHash(key)}`, conversion);
         if (closed.changed && closed.record?.mismatch) {
           app.log.error({ conversion: conversion.id }, 'the provider booked a conversion without the client terms it was sent');
-          await notifier.notify(noteOf({ userId: closed.record.userId, companyId: closed.record.companyId, category: 'payments', kind: 'conversion_differs', note: { sellCurrency: closed.record.sellCurrency, buyCurrency: closed.record.buyCurrency, quotedSell: closed.record.clientSellAmount, quotedBuy: closed.record.clientBuyAmount, bookedSell: conversion.sellAmount, bookedBuy: conversion.buyAmount }, dedupe: `conversion:${conversion.id}:differs` }));
+          await conversionNotes.tell(closed.record);
         }
         return rates.present(conversion, closed.record ?? (await rates.recordFor(context.company.id, keyHash(key))));
       });
@@ -954,5 +980,5 @@ export async function buildApp(deps: AppDeps) {
   }
 
   // Returned as a pair: a Fastify instance is itself awaitable, so it must not be the async result.
-  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets, rates, notifier, paymentNotes, alerts };
+  return { app, admin, auth, opsAuth, opsRoutes, held, mail, notices, authenticatorResets, rates, notifier, paymentNotes, conversionNotes, alerts };
 }

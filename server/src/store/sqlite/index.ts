@@ -270,7 +270,7 @@ export function createSqliteStores(options: SqliteOptions): SqliteStores {
   const notifications = new SqlTable<NotificationRecord>(db, 'notifications', { indexed: ['userId'], secret: { field: 'body', keys }, audit });
   const notificationPrefs = new SqlTable<NotificationPrefsRecord>(db, 'notification_prefs', { audit });
   const margins = new SqlTable<MarginRecord>(db, 'company_margins', { audit });
-  const revenue = new SqlTable<RevenueRecord>(db, 'fx_revenue', { indexed: ['companyId', 'conversionId'], audit });
+  const revenue = new SqlTable<RevenueRecord>(db, 'fx_revenue', { indexed: ['companyId', 'conversionId', 'untold'], audit });
   const seedCodes = new SqlTable<SeedCode>(db, 'dev_seed_codes');
   if (options.seed && !db.get('SELECT 1 FROM users LIMIT 1') && !db.get('SELECT 1 FROM companies LIMIT 1')) {
     const { seed } = options;

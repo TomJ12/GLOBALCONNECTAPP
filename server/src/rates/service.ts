@@ -248,7 +248,7 @@ export class ClientRates {
         if (!current || current.status === 'booked') return undefined;
         const mismatch = current.appliedBy === 'server' && (!new Big(conversion.sellAmount).eq(current.clientSellAmount) || !new Big(conversion.buyAmount).eq(current.clientBuyAmount));
         changed = true;
-        return { ...current, status: 'booked', conversionId: conversion.id, mismatch, bookedAt: at, bookedRate: conversion.rate, bookedSellAmount: conversion.sellAmount, bookedBuyAmount: conversion.buyAmount };
+        return { ...current, status: 'booked', conversionId: conversion.id, mismatch, ...(mismatch ? { untold: 'mismatch' as const } : {}), bookedAt: at, bookedRate: conversion.rate, bookedSellAmount: conversion.sellAmount, bookedBuyAmount: conversion.buyAmount };
       },
       (stored) =>
         changed && stored?.mismatch
@@ -256,6 +256,16 @@ export class ClientRates {
           : null,
     );
     return { record, changed };
+  }
+
+  /** Mismatched bookings whose booker has not yet been told (read through an index: normally none). */
+  untoldMismatches(): Promise<RevenueRecord[]> {
+    return this.stores.revenue.list({ untold: 'mismatch' });
+  }
+
+  /** The person has their notification (or may no longer be told anything about this company). */
+  async told(key: string): Promise<void> {
+    await this.stores.revenue.mutate(key, (current) => (current && current.untold ? { ...current, untold: null } : undefined));
   }
 
   recordFor(companyId: string, keyHash: string): Promise<RevenueRecord | null> {

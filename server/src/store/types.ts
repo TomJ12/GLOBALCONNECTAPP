@@ -592,6 +592,8 @@ export interface RevenueRecord {
   revenueCurrency: string | null;
   /** True when the provider's answer did not carry the client's terms it was sent: needs a person to look. */
   mismatch: boolean;
+  /** 'mismatch' from the moment a mismatch is recorded until the person who booked has been told (notification made); then null. Indexed, so the retry reads only these. */
+  untold?: 'mismatch' | null;
   createdAt: number;
   bookedAt: number | null;
 }

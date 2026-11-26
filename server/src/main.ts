@@ -7,7 +7,7 @@ const config = loadConfig();
 const runtime = createRuntime(config);
 const { stores, registry, mailer } = runtime;
 if (stores.acceptedLogEnd) console.error('AUDIT_ACCEPT_LOG_END was used: the audit log was accepted as it stood and that is recorded in it. REMOVE THE SETTING NOW; the server will not start again while it is set.');
-const { app, admin, auth, opsAuth, held, mail, authenticatorResets, notifier, paymentNotes, alerts } = await buildApp({ config, stores, registry, mailer });
+const { app, admin, auth, opsAuth, held, mail, authenticatorResets, notifier, paymentNotes, conversionNotes, alerts } = await buildApp({ config, stores, registry, mailer });
 // The email outbox: attempts cut off by the last stop are due again, and what is due is sent now and every 15 seconds.
 await mail.recover();
 void mail.pump();
@@ -29,6 +29,9 @@ if (interrupted > 0) console.error(`${interrupted} approved ${interrupted === 1 
 // After each sweep: whoever is due a notification about a held payment (waiting, about to expire, expired, settled) gets it.
 // Each is made once however often this looks, so looking again after a restart sends nothing twice.
 setInterval(() => void settle(false).then(() => paymentNotes.scan()), 60_000).unref();
+// A conversion booked differently from its quote whose booker has still to be told (normally none): told now.
+setInterval(() => void conversionNotes.scan().catch(() => 0), 60_000).unref();
+void conversionNotes.scan().catch(() => 0);
 void paymentNotes.scan();
 // Rate alerts are checked against each company's client rate; an alert fires once.
 setInterval(() => void alerts.check(), config.alertCheckMs).unref();

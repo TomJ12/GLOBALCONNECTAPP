@@ -36,6 +36,7 @@ export interface Harness {
   rates: ClientRates;
   notifier: Awaited<ReturnType<typeof buildApp>>['notifier'];
   paymentNotes: Awaited<ReturnType<typeof buildApp>>['paymentNotes'];
+  conversionNotes: Awaited<ReturnType<typeof buildApp>>['conversionNotes'];
   alerts: Awaited<ReturnType<typeof buildApp>>['alerts'];
   call: (method: 'GET' | 'POST', url: string, options?: { token?: string; body?: unknown; headers?: Record<string, string> }) => Promise<Reply>;
   invite: (email: string) => Promise<string>;
@@ -214,7 +215,7 @@ export async function harness(overrides: Partial<Config> = {}, directory: Direct
     return reply.json.token;
   };
 
-  return { notifier: built.notifier, paymentNotes: built.paymentNotes, alerts: built.alerts, rates: built.rates, mail: built.mail, notices: built.notices, authenticatorResets: built.authenticatorResets, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
+  return { notifier: built.notifier, paymentNotes: built.paymentNotes, conversionNotes: built.conversionNotes, alerts: built.alerts, rates: built.rates, mail: built.mail, notices: built.notices, authenticatorResets: built.authenticatorResets, policy, held, config, stores, clock, bodies, call, invite, activate, code, freshCode, login, stepUp, app, opsAuth, opsRoutes, admin, adminCall, auth, registry, outbox, mailedCode, providerA, providerB, logs, warnings,
     close: async () => {
       await app.close();
       await admin.close();

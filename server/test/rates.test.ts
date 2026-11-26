@@ -345,6 +345,42 @@ test('a provider that books WITHOUT the client’s terms: the client is shown wh
   assert.equal(forbiddenInClientResponse(JSON.stringify(tiny.json)), null);
 });
 
+test('“not booked as quoted” always reaches the person: it is not held back by the hourly allowance of ordinary notifications, and it is tried again until the notification exists', async () => {
+  h = await harness({ notificationsPerUserPerHour: 1 });
+  const amira = await signedIn(AMIRA);
+  const original = h.providerA.request.bind(h.providerA);
+  h.providerA.request = async (request) => {
+    if (request.path !== '/v2/conversions/create') return original(request);
+    const { client_buy_amount: _buy, client_sell_amount: _sell, ...params } = request.params ?? {};
+    return original({ ...request, params });
+  };
+  const differs = async () => (await get(amira.token, '/v1/notifications')).items.filter((item: { title: string }) => item.title === 'A conversion was not booked as quoted').length;
+  // Her allowance of ordinary notifications for the hour is used up (by a colleague's payments, say).
+  await h.stores.notifications.put('filler', { id: 'ntf_filler', key: 'filler', userId: 'usr_amira', companyId: 'co_northfield', category: 'payments', kind: 'payment_sent', body: '{}', createdAt: h.clock.now, readAt: null });
+  const first = await book(amira.token, (await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '1000.00' })).id, 'rates-key-n-0001');
+  assert.deepEqual([first.status, first.json.differsFromQuote], [200, true]);
+  assert.equal(await differs(), 1, 'told although the ordinary allowance was used up');
+  assert.deepEqual((await revenue()).map((item) => item.untold), [null]);
+  // Its email is in the class that ordinary notifications cannot use up either.
+  assert.deepEqual((await h.stores.mail.list()).filter((row) => row.template === 'notification').map((row) => row.class), ['security']);
+
+  // The notification cannot be made at that moment (the database is busy, the process dies...): the booking is
+  // still answered, the record stays marked, and the next scan tells her. Once.
+  const notify = h.notifier.notify.bind(h.notifier);
+  h.notifier.notify = async () => {
+    throw new Error('database is locked');
+  };
+  const second = await book(amira.token, (await quoteFor(amira.token, { sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '500.00' })).id, 'rates-key-n-0002');
+  assert.deepEqual([second.status, second.json.differsFromQuote], [200, true]);
+  assert.equal(await differs(), 1);
+  assert.deepEqual((await h.rates.untoldMismatches()).map((item) => item.clientSellAmount), ['500.00']);
+  assert.equal(await h.conversionNotes.scan(), 0, 'still failing: still marked');
+  h.notifier.notify = notify;
+  assert.equal(await h.conversionNotes.scan(), 1);
+  assert.equal(await differs(), 2);
+  assert.deepEqual([(await h.rates.untoldMismatches()).length, await h.conversionNotes.scan(), await differs()], [0, 0, 2]);
+});
+
 test('a quote is checked BY THIS SERVER when it is booked: this person’s, in this company, not run out, used once, and priced by the margin still in force; it survives a restart; provider field names never reach the client', async () => {
   h = await harness();
   const amira = await signedIn(AMIRA);
