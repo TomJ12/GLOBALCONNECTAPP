@@ -568,7 +568,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           reply,
           anchor,
           'Add your authenticator app',
-          h`${alert(message)}<p>Scan this with an authenticator app, or enter the key by hand (account ${enrol.email}, time-based).</p>${qrSvg(enrol.otpauthUri)}<p class="secret">${enrol.secret}</p><form method="post" action="/ops/activate/confirm">${hidden(anchor, { activationCode })}<button>Confirm</button></form>`,
+          h`${alert(message)}<p>Scan this with an authenticator app, or enter the key by hand (account ${enrol.email}, time-based).</p>${qrSvg(enrol.otpauthUri)}<p class="secret">${enrol.secret}</p><form method="post" action="/ops/activate/confirm">${hidden(anchor, { activationCode })}<label>6-digit code from your authenticator app <input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"></label><button>Confirm</button></form>`,
           reply.statusCode,
         );
 

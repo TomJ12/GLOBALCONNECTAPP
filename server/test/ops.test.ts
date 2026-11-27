@@ -65,6 +65,10 @@ async function activateStaff(email: string, role: OpsRole, password = OPS_PASSWO
   assert.match((await browser.post('/ops/activate', { activationCode })).body, /Choose a password/);
   const enrol = await browser.post('/ops/activate/password', { activationCode, password });
   assert.match(enrol.body, /<svg class="qr"/);
+  // The page must offer the field this step posts: a person, unlike this test, can only send what the form holds.
+  assert.match(enrol.body, /<form method="post" action="\/ops\/activate\/confirm">[^]*?<input name="code"[^]*?<\/form>/);
+  const refused = await browser.post('/ops/activate/confirm', { activationCode, code: '000000' });
+  assert.match(refused.body, /not accepted[^]*<input name="code"/);
   const secret = /<p class="secret">([A-Z2-7]+)<\/p>/.exec(enrol.body)?.[1] ?? '';
   assert.ok(secret.length >= 32);
   const done = await browser.post('/ops/activate/confirm', { activationCode, code: h.code(secret) });
