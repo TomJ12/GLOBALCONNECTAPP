@@ -60,8 +60,12 @@ At start-up, in development mode only, the server prints an activation code and 
 for each **sample** account that is not activated yet: the three sample clients and
 three demo staff for the ops console (`ops.admin@globalconnect.example` and
 `ops.admin2@globalconnect.example`, ops admins, and `ops.second@globalconnect.example`,
-an ops user). Three, because sensitive ops actions need a second person, and staff
-management and company mappings need a second ops **admin**.
+an ops user). **One of them is enough**: the console's default mode is single-person
+(`OPS_APPROVALS=single`), in which the member of staff who starts an action carries it
+out; `npm run demo` says so in one line when it starts. The other two accounts are
+there for trying two-person mode (`OPS_APPROVALS=two-person npm run demo`), in which
+sensitive actions need a second person, and staff management and company mappings a
+second ops **admin**. See "Ops modes".
 
 **A restart does not replace codes.** A code printed on an earlier start is printed
 again, marked "still valid", for its 72 hours; a link emailed from the ops console
@@ -98,11 +102,15 @@ To try it:
 7. In the ops console (`/ops`): activate a demo staff account from its printed link the
    same way and sign in with password and code. After that the console never asks for a
    code again: press a button (say **Revoke all sessions** on a client's page), read the
-   confirmation page that says what will happen, and press **Confirm**. Things that
-   need a second person become a request under **Approvals**, which another staff
-   member opens and confirms; for staff changes, a new or re-pointed company, a
-   change to a company's payment-approval rule and a client authenticator reset that
-   second person is also asked for their password.
+   confirmation page that says what will happen, and press **Confirm**. In the
+   default single-person mode that is all there is to any action, with one staff
+   account: for staff changes, a new or re-pointed company, a change to a company's
+   payment-approval rule and a client authenticator reset the confirmation page also
+   asks for your password. (In two-person mode those things, and everything else that
+   gives access, become a request under **Approvals**, which another staff member
+   opens and confirms.) To change a company's FX margin, open the company, type the
+   margin **as a percentage** (0.50 is half of one percent), read the worked example
+   on the confirmation page and confirm.
 
 8. **A forgotten password.** Sign out, press **Forgot your password?**, type the email.
    The reset email is printed in the server's terminal (`DEVELOPMENT OUTBOX`); open its
@@ -423,7 +431,7 @@ been assessed.
 
 There is no sign-up endpoint. Operations add the person to the directory (users,
 companies, memberships with a role: `creator`, `approver` or `admin`) from the ops
-console, where a second staff member has to approve it, and an activation link is
+console (in two-person mode a second staff member has to approve it), and an activation link is
 emailed to the address on file (the seed file provides the sample people):
 
 1. `POST /v1/activation/start {activationCode}` → email, name, password policy.
@@ -850,7 +858,7 @@ company's forward margin if one is set; otherwise an override for that currency 
 and direction; otherwise the tier for the amount (larger amounts, smaller margin);
 otherwise the company's default. A company with no configuration of its own uses
 `DEFAULT_MARGIN_BPS`. An override is written for a pair and a direction (`GBPUSD
-sell 40`: 40 bp when the client sells GBP for USD) and also covers the same trade
+sell 0.40`: 0.40% when the client sells GBP for USD) and also covers the same trade
 spelled the other way round (buying the first currency of `USDGBP`): inside the server
 every pair has ONE orientation (the market's usual order), whatever a provider's
 adapter calls the base. **Tier amounts are in ONE currency per company** (`tierCurrency`,
@@ -927,19 +935,37 @@ a provider's rate into the client's is private to that file. Provider B's quotes
 `MARGIN_APPLIED_BY_EQUALS=provider` is **refused at start-up**: the server could not
 tell a marked-up rate from the wholesale one.
 
-**Changing a company's margin (ops console).** Any staff member can see a company's
-margin on its page. Changing it is a request that a **second staff member who is an ops
-admin** approves, typing their password again; the confirmation and the request show a
+**Changing a company's margin (ops console): in percentages, by one person.** Any staff
+member can see a company's margin on its page. **Everything a person reads or types is
+a percentage to two places** ("0.50%"): the forms, the company page, the confirmation
+page, the list of recent changes, the Revenue page (the margin and the effective margin
+after rounding), the CSV export (`margin_percent`, `effective_margin_percent`), the
+messages and the audit entries. A percentage is typed with up to two decimal places
+(steps of 0.01%), with a dot or a comma, with or without a % sign: `0.5`, `0,75`,
+`1.25%`. **`50` means 50%** and is refused ("50.00% is above the maximum of 20.00%");
+a third decimal place (`0.005`), a thousands separator, a sign or "bp" is refused.
+Storage and all arithmetic stay in whole basis points; the conversion is two functions
+in `server/src/rates/margin.ts` and nowhere else. The settings keep their names and
+units (`DEFAULT_MARGIN_BPS=50` is 0.50%).
+
+In **single-person mode** (the default) any member of staff, ops or ops admin, changes
+a margin alone and at once: confirmation page, **no password** (a margin has to be
+changeable at any moment by whoever is in). It is treated as high-impact all the same:
+an audit entry of its own (`ops.margin.changed`, written in the same transaction as
+the change, with who, which company, old and new values), the week's list of
+high-impact changes that every member of staff sees, and the oversight notice. In
+**two-person mode** it is a request that a second staff member who is an ops admin
+approves, typing their password again. The confirmation (and the request) show a
 **worked example** at the provider's rate at that moment ("selling GBP 10,000 for USD:
 the client rate changes from 1.293500 to 1.294800, so they receive USD 12948.00 instead
 of USD 12935.00", the same for buying, for the largest tier, for a forward and for up
-to three overridden pairs). A negative margin is never accepted; one above 300 bp (3%)
-only when the request ticks "allow a margin this high", and the approver is warned;
-above 2000 bp never. The change is written to the audit log with the old and the new
-configuration and both people. It applies to quotes given from then on; a quote a
+to three overridden pairs). A negative margin is never accepted; one above 3.00%
+only when the form ticks "allow a margin this high", and the confirmation page warns;
+above 20.00% never. The change is written to the audit log with the old and the new
+configuration and who made it (and who approved it, in two-person mode). It applies to quotes given from then on; a quote a
 client is already holding from before the change **cannot be booked** (the app is told
-it has expired and asks for a new one, at the new margin), and the approver is told so
-on the confirmation page.
+it has expired and asks for a new one, at the new margin), and the confirmation page
+says so.
 
 **Revenue (ops admins only).** When a conversion is booked the server records, before
 it asks the provider, the provider's rate and amounts, the client's rate and amounts,
@@ -1158,7 +1184,81 @@ It shares nothing with the client app: separate routes, a separate account table
 (`stores.ops`), separate invitations, sessions and lockout counters, and a separate
 cookie.
 
+### Ops modes: single-person (the default) and two-person
+
+`OPS_APPROVALS` decides how many staff an ops action takes. It is a setting of the
+server, allowed in every mode, development or not, and the start-up log says which is
+on.
+
+**`OPS_APPROVALS=single` (the default).** The member of staff who starts an action
+carries it out, through its confirmation page (what will happen, old and new values,
+consequences, high-impact marking). That is every action: creating client users and
+attaching them to companies, role changes, activation links, client authenticator
+resets, re-enabling, company create / rename / re-point, payment-approval rule changes,
+margin changes and staff management. Their **password is asked for again** on the
+confirmation page for staff management, creating or re-pointing a company, a client
+authenticator reset and a change of a payment-approval rule; margin changes and
+everyday actions are confirmation only. Nothing needs a second member of staff to
+exist.
+
+**Say this plainly to whoever decides:** in single-person mode **one staff account, or
+anyone who takes it over, can create a client user at an email address they control,
+attach it to any company and have the activation link sent there**, and so reach that
+company's money as a client would (within the company's own payment-approval rule,
+which the same account can also change). Nobody sees it before it happens. What stands
+against that is:
+
+- **The oversight notice.** Set `OPS_OVERSIGHT_EMAILS` to one or more addresses that do
+  not belong to the people using the console (typically a director). After every
+  high-impact action (the password-checked ones above, and: a client user created or
+  attached to a company, a client re-enabled, an activation link issued, a margin
+  changed) a short email goes to those addresses: who did what to whom and when, with
+  the old and new values where the action has them. It has no link and nothing to
+  press. It goes through the mail queue in the security class, which ordinary mail
+  cannot use up. **Staff cannot change or disable it from the console**: it is only in
+  the server's settings. When it is **not set**, every page of the console carries a
+  standing warning that single-person mode is on with no oversight address, and the
+  start-up log says the same.
+- **The audit log**, and on the console's first page (and under Approvals) the list of
+  **high-impact changes in the last 7 days**, for every member of staff
+  (`ops.oversight` entries).
+- **Restricting who can reach `/ops`** (a separate host, an allow-list or VPN in front
+  of it: see "Deploying"), a strong password and the authenticator on each staff account.
+- Everything in the list below that does not depend on a second person, which is
+  unchanged: links are never shown to staff and go only to the address on file; a
+  client authenticator reset still waits out its delay, with the warning and its
+  cancel link; a provider account can belong to one company, is verified with the
+  provider, and cannot be changed while a payment is being sent; staff can only be at
+  the allowed email domains; nobody can demote, disable or reset themselves, and the
+  last active ops admin cannot be removed; the stranger's-email-domain flag (now on
+  the confirmation page, since there is no approver to show it to); break-glass.
+
+**`OPS_APPROVALS=two-person`.** As this console worked before: the sensitive actions
+only make a request, and a different member of staff approves it (an ops admin, with
+their password, for the highest-impact kinds, margins included). Everything under
+"Four-eyes approval" below describes this mode. Oversight notices are sent in this mode
+too, naming both people. The test suite runs the console's tests in both modes
+(`ops.test.ts` in two-person mode, `ops.single.test.ts` the same file in single-person
+mode; tests that are about the second person are skipped there, by name).
+
+**Switching.** Set `OPS_APPROVALS` and restart. Going from two-person to single with
+requests still waiting: the member of staff who made a request can carry it out
+themselves or cancel it (for the kinds only ops admins decide, an ops admin can carry
+out somebody else's); what a request does is checked again when it is carried out, and
+requests still expire after 24 hours. The Approvals page stays for those, for
+authenticator resets waiting out their delay, and for two-person mode; in single-person
+mode it leaves the navigation while nothing is waiting. (`FOUR_EYES=off|on`, the older
+name of this setting, is still read when `OPS_APPROVALS` is not set.)
+
+**Bootstrap.** The first ops admin is made with `create-ops-admin`, which stays
+available while fewer than two ops admins are active, as before. One is enough to run
+the console in single-person mode.
+
 ### What stops one staff member acting alone
+
+(Items 2, and "with approval" wherever it appears below, apply in **two-person mode**.
+In single-person mode see "Ops modes" above for what stands in their place.)
+
 
 1. **No activation link or code is ever shown to staff.** Links are sent by the `Mailer`
    to the email address on file; the console shows only `activation email sent to
@@ -1178,7 +1278,7 @@ cookie.
    warned when it is nearly always them. Requests expire after 24 hours and can be
    cancelled (by the requester) or rejected (by anyone else). Request, approval,
    rejection, cancellation and expiry are audited, and the entry for the change itself
-   names both people. `FOUR_EYES=off` is accepted only with `APP_ENV=development`.
+   names both people. This is `OPS_APPROVALS=two-person`; the default is `single` (see "Ops modes").
 3. **Company-to-account mapping.** Only an ops admin can create a company or change
    which provider account it points at, and only with approval. The account id (and for
    provider A the contact id) must be one the provider confirms exists, and no two
@@ -1309,7 +1409,7 @@ role change, email and revocation was too much. Instead, every change goes throu
   approving a **company creation or re-point**, approving a **change to a company's
   payment-approval rule** (in either direction; the page says what it means, for
   example that with 0 payments will be sent without a second person), and approving a
-  **client authenticator reset**. (With `FOUR_EYES=off` in development, where one person carries these out, it
+  **client authenticator reset**. (In single-person mode, where one person carries these out, it
   is asked of that person.) Wrong passwords are counted and lock like sign-in, and are
   audited as `ops.password_check`.
 - A client authenticator reset and a staff one still need the free-text
@@ -1318,15 +1418,15 @@ role change, email and revocation was too much. Instead, every change goes throu
 What the per-action code used to protect against was an **unattended, signed-in staff
 browser**. What stands there now: the session ends after **10 minutes** without a
 request (checked by the server on every request, including a Confirm) or 8 hours;
-everything that gives access needs a second person; and the highest-impact approvals
-need the password. Someone at an unattended console within those ten minutes can still
+in two-person mode everything that gives access needs a second person; and the highest-impact
+actions need the password in either mode. Someone at an unattended console within those ten minutes can still
 do the single-person actions (unlock, revoke sessions, disable, remove from a company,
 deactivate a company), all of which take access away, and can make requests.
 
 Clients are not affected: they still type a fresh 6-digit code for payments, approvals,
 rejections, cancellations and adding a payee.
 
-"Approval" below means a second staff member, as described above.
+"Approval" below means a second staff member, in two-person mode; in single-person mode read it as "the confirmation page (and the password where stated)".
 
 - **Companies:** list, search, view; rename, deactivate / reactivate; create and
   re-point (ops admin, approval); **change how many approvals a payment needs** (0, 1
@@ -1686,7 +1786,8 @@ again. Not run against a real email service yet.
   24 hours can only be closed. Nothing finishes such a request automatically.
 - **Who can reach `/ops`:** it is on the same port as the client API, open to anyone who
   can reach the server. It needs **IP allow-listing or a VPN, and staff SSO**.
-- **Four-eyes is as described above and no more:** two ops admins acting together can do
+- **Single-person mode is the default, and it means what "Ops modes" says:** one staff account can do everything alone, including giving itself a client login to any company. The oversight notice tells somebody afterwards; it prevents nothing.
+- **Four-eyes (two-person mode) is as described above and no more:** two ops admins acting together can do
   anything; the pair-history line warns an approver but stops nobody; there is no review
   of approvals after the fact.
 - **Break-glass and bootstrap rest on `ADMIN_TOKEN`**, one shared secret reachable only

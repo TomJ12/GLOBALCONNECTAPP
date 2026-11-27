@@ -214,8 +214,10 @@ activation codes when it starts. The codes you copied stay valid.
 
 **How people get links after that**
 
-- From the ops console, as in the README: create the client user, request an
-  activation link, a second staff member approves it. "Emailing" the link means
+- From the ops console, as in the README: create the client user and issue an
+  activation link (one staff account is enough: the demo runs in single-person mode,
+  the product's default; see "Ops modes" in the README for what that means and for
+  `OPS_APPROVALS=two-person` and `OPS_OVERSIGHT_EMAILS`). "Emailing" the link means
   **printing the whole email in the server's log**: run `fly logs` and look for
   `DEVELOPMENT OUTBOX`. There is no real email in the demo.
 - For a sample client whose code ran out, from your terminal:

@@ -9,9 +9,13 @@
  * client's money:
  *  1. No activation link or code is ever rendered. Links go by email to the
  *     address on file (Mailer); the console shows only a masked address.
- *  2. FOUR-EYES: the sensitive actions (see `fourEyes` below) only create a
- *     request. A DIFFERENT active staff member must approve it before anything
- *     changes.
+ *  2. TWO MODES (OPS_APPROVALS). `single`, the default: the member of staff
+ *     who starts an action carries it out, after its confirmation page (and
+ *     their password for the highest-impact ones); each high-impact action is
+ *     put on record as `ops.oversight` and, when OPS_OVERSIGHT_EMAILS is set,
+ *     reported to those addresses. `two-person` (FOUR-EYES): the sensitive
+ *     actions (see `fourEyes` below) only create a request, and a DIFFERENT
+ *     active staff member must approve it before anything changes.
  *  3. A company's provider mapping can be set only by an ops admin, to an
  *     account the provider confirms exists and that no other company uses.
  *
@@ -281,7 +285,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       }
       interface Actors {
         requester: OpsUserRecord;
-        /** Null when the action needs no second person (or four-eyes is off in development). */
+        /** Null when the action needs no second person, or the console is in single-person mode. */
         approver: OpsUserRecord | null;
         source: string;
         /** The approval request being carried out, if there is one. What an action creates is named after it, so carrying the same request out again creates nothing twice. */
