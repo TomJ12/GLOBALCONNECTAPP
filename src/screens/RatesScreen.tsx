@@ -27,9 +27,10 @@ import {
   useSetAlertEnabled,
 } from '@/hooks/queries';
 import { formatDate } from '@/lib/dates';
-import { formatMoney, formatRate } from '@/lib/money';
+import { formatIndicativeRate, formatMoney, formatRate } from '@/lib/money';
 import { requestConfirmation } from '@/state/confirm';
 import { colors, sizes, spacing } from '@/theme';
+import { useCapabilities } from '@/state/session';
 
 function RateRow({ base, quote }: { base: string; quote: string }) {
   const router = useRouter();
@@ -37,16 +38,49 @@ function RateRow({ base, quote }: { base: string; quote: string }) {
   const history = useRateHistory(base, quote);
   const pair = `${base} / ${quote}`;
 
+  // The customer's OWN rates, one for each direction: what they get selling the base currency, what they pay
+  // buying it. (The in-app demo has one sample rate for both.) Each opens Convert set up for that trade.
+  if (rate.data) {
+    // Shown as the server gave them (it rounds indicative rates against the customer): never rounded again here.
+    const sell = formatIndicativeRate(rate.data.rate);
+    const buy = formatIndicativeRate(rate.data.buyRate ?? rate.data.rate);
+    const side = (label: string, value: string, from: string, to: string, testID: string) => (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${label}, your rate ${value} ${quote} per ${base}, indicative`}
+        accessibilityHint={`Opens Convert with ${from} to ${to}`}
+        onPress={() => router.push({ pathname: '/convert', params: { sell: from, buy: to } })}
+        style={({ pressed }) => [styles.side, pressed ? styles.pressed : null]}
+        testID={testID}
+      >
+        <AppText variant="caption" tone="muted">
+          {label}
+        </AppText>
+        <AppText variant="title">{value}</AppText>
+      </Pressable>
+    );
+    return (
+      <View style={styles.rateRow}>
+        <View style={styles.rateHead}>
+          <View style={styles.grow}>
+            <AppText variant="bodyStrong">{pair}</AppText>
+            <AppText variant="caption" tone="muted">
+              Your rate · Indicative
+            </AppText>
+          </View>
+          {history.data ? <Sparkline points={history.data.points} /> : <View style={styles.sparkSpace} />}
+        </View>
+        <View style={styles.sides}>
+          {side(`Sell ${base}`, sell, base, quote, `rate-${base}${quote}`)}
+          {side(`Buy ${base}`, buy, quote, base, `rate-buy-${base}${quote}`)}
+        </View>
+      </View>
+    );
+  }
+
   let trailing;
   let spoken: string;
-  if (rate.data) {
-    trailing = (
-      <AppText variant="title" testID={`rate-${base}${quote}`}>
-        {formatRate(rate.data.rate)}
-      </AppText>
-    );
-    spoken = `${base} to ${quote}, ${formatRate(rate.data.rate)}`;
-  } else if (rate.isError) {
+  if (rate.isError) {
     trailing = <Pill label="Unavailable" tone="warning" />;
     spoken = `${base} to ${quote}, rate unavailable`;
   } else if (rate.fetchStatus === 'paused') {
@@ -83,7 +117,8 @@ function AlertRow({ alert }: { alert: RateAlert }) {
   const remove = useRemoveAlert();
   const [error, setError] = useState<string | null>(null);
   const pair = `${alert.base} / ${alert.quote}`;
-  const condition = `${alert.direction === 'above' ? 'reaches' : 'drops to'} ${formatRate(alert.targetRate)}`;
+  // Selling the first currency: at the target or higher. Buying it: at the target or lower. Either way, "or better".
+  const condition = `${alert.direction === 'above' ? `sell ${alert.base}` : `buy ${alert.base}`} at ${formatRate(alert.targetRate)} or better`;
   const busy = setEnabled.isPending || remove.isPending;
 
   const toggle = (enabled: boolean) => {
@@ -109,7 +144,7 @@ function AlertRow({ alert }: { alert: RateAlert }) {
         <View style={styles.grow}>
           <AppText variant="bodyStrong">{`${pair} ${condition}`}</AppText>
           <AppText variant="caption" tone="muted">
-            {alert.enabled ? 'On' : 'Paused'}
+            {alert.triggered ? `Reached ${formatIndicativeRate(alert.triggered.rate)} on ${formatDate(alert.triggered.at)}. Turn on to be told again.` : alert.enabled ? 'On' : 'Paused'}
           </AppText>
         </View>
         <Switch
@@ -164,6 +199,7 @@ function ForwardCard({ forward }: { forward: ForwardContract }) {
 export function RatesScreen() {
   const router = useRouter();
   const alerts = useAlerts();
+  const capabilities = useCapabilities();
   const forwards = useForwardContracts();
 
   return (
@@ -172,7 +208,7 @@ export function RatesScreen() {
       header={<Header title="Rates" leading="none" trailing={isMockBackend() ? <SampleDataPill /> : undefined} />}
       onRefresh={() => {
         void alerts.refetch();
-        void forwards.refetch();
+        if (capabilities.forwardContracts) void forwards.refetch();
       }}
       refreshing={forwards.isRefetching}
     >
@@ -222,29 +258,35 @@ export function RatesScreen() {
         </QueryState>
       </View>
 
-      <View style={{ marginBottom: spacing.lg }}>
-        <SectionHeader title="Forward contracts" />
-        <QueryState
-          query={forwards}
-          skeleton={<SkeletonList rows={1} label="Loading forward contracts" />}
-          isEmpty={(data) => data.length === 0}
-          empty={<EmptyState title="No forward contracts" body="Forwards you book in Convert will appear here." />}
-        >
-          {(data) => (
-            <View style={{ gap: spacing.md }}>
-              {data.map((forward) => (
-                <ForwardCard key={forward.id} forward={forward} />
-              ))}
-            </View>
-          )}
-        </QueryState>
-      </View>
+      {capabilities.forwardContracts ? (
+        <View style={{ marginBottom: spacing.lg }}>
+          <SectionHeader title="Forward contracts" />
+          <QueryState
+            query={forwards}
+            skeleton={<SkeletonList rows={1} label="Loading forward contracts" />}
+            isEmpty={(data) => data.length === 0}
+            empty={<EmptyState title="No forward contracts" body="Forwards you book in Convert will appear here." />}
+          >
+            {(data) => (
+              <View style={{ gap: spacing.md }}>
+                {data.map((forward) => (
+                  <ForwardCard key={forward.id} forward={forward} />
+                ))}
+              </View>
+            )}
+          </QueryState>
+        </View>
+      ) : null}
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
   rateTrailing: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  rateRow: { paddingHorizontal: spacing.lg, paddingVertical: spacing.md, gap: spacing.sm },
+  rateHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  sides: { flexDirection: 'row', gap: spacing.md },
+  side: { flex: 1, minHeight: sizes.touchTarget, justifyContent: 'center', paddingVertical: spacing.xs, paddingHorizontal: spacing.md, borderRadius: 10, borderWidth: 1, borderColor: colors.hairline },
   sparkSpace: { width: 72, height: 28 },
   alertRow: { paddingHorizontal: spacing.lg, paddingVertical: spacing.md, gap: spacing.sm },
   alertMain: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, minHeight: sizes.touchTarget },

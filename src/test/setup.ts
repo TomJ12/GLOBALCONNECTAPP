@@ -4,10 +4,6 @@ jest.mock('@react-native-async-storage/async-storage', () =>
   jest.requireActual('@react-native-async-storage/async-storage/jest/async-storage-mock'),
 );
 
-jest.mock('expo-crypto', () => ({
-  getRandomBytes: (count: number) => new Uint8Array(jest.requireActual<typeof import('crypto')>('crypto').randomBytes(count)),
-}));
-
 jest.mock('expo-clipboard', () => ({ setStringAsync: jest.fn(async () => true) }));
 
 jest.mock('expo-network', () => ({

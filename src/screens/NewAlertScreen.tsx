@@ -15,7 +15,7 @@ import { WATCHLIST_PAIRS } from '@/config/app';
 import { disclosures } from '@/config/disclosures';
 import { useCreateAlert, useRate } from '@/hooks/queries';
 import { useSingleFlight } from '@/hooks/useSingleFlight';
-import { formatRate, parseDecimalInput } from '@/lib/money';
+import { formatIndicativeRate, parseDecimalInput } from '@/lib/money';
 import { showToast } from '@/state/toast';
 import { spacing } from '@/theme';
 
@@ -29,6 +29,9 @@ export function NewAlertScreen() {
 
   const [base, quote] = WATCHLIST_PAIRS[pairIndex] ?? WATCHLIST_PAIRS[0] ?? ['GBP', 'USD'];
   const rate = useRate(base, quote);
+  // An alert is on the customer's OWN rate for one direction: selling the first currency, or buying it.
+  const selling = direction === 'above';
+  const current = rate.data ? (selling ? rate.data.rate : (rate.data.buyRate ?? rate.data.rate)) : null;
 
   const close = () => {
     if (router.canGoBack()) router.back();
@@ -74,25 +77,32 @@ export function NewAlertScreen() {
         />
       </View>
       <Card>
-        <AppText tone="muted">{`Current rate, 1 ${base} in ${quote}`}</AppText>
-        <AppText variant="amount">{rate.data ? formatRate(rate.data.rate) : rate.isError ? 'Unavailable' : '…'}</AppText>
+        <AppText tone="muted">{`Your rate to ${selling ? 'sell' : 'buy'} 1 ${base}, in ${quote}. Indicative.`}</AppText>
+        <AppText variant="amount" testID="alert-current-rate">
+          {current ? formatIndicativeRate(current) : rate.isError ? 'Unavailable' : '…'}
+        </AppText>
       </Card>
       <View style={{ gap: spacing.sm }}>
         <AppText variant="label" tone="muted">
-          Tell me when the rate
+          Tell me when I can
         </AppText>
         <SegmentedControl
           accessibilityLabel="Alert condition"
           value={direction}
           onChange={setDirection}
           options={[
-            { value: 'above', label: 'Reaches' },
-            { value: 'below', label: 'Drops to' },
+            { value: 'above', label: `Sell ${base}`, accessibilityLabel: `Sell ${base} at the target rate or better` },
+            { value: 'below', label: `Buy ${base}`, accessibilityLabel: `Buy ${base} at the target rate or better` },
           ]}
         />
+        <AppText variant="caption" tone="muted" testID="alert-meaning">
+          {selling
+            ? `You will be told when your rate to sell ${base} for ${quote} is at the target or higher.`
+            : `You will be told when your rate to buy ${base} with ${quote} is at the target or lower.`}
+        </AppText>
       </View>
       <TextField
-        label="Target rate"
+        label="Target rate (this rate or better)"
         value={targetText}
         onChangeText={(text) => {
           setTargetText(text);
@@ -101,7 +111,7 @@ export function NewAlertScreen() {
         keyboardType="decimal-pad"
         inputMode="decimal"
         maxLength={16}
-        placeholder={rate.data ? formatRate(rate.data.rate) : '0.0000'}
+        placeholder={current ? formatIndicativeRate(current) : '0.0000'}
         error={error}
         testID="alert-target"
       />

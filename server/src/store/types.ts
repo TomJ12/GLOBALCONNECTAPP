@@ -1,0 +1,697 @@
+/**
+ * Storage contracts. The server only ever talks to these interfaces.
+ *
+ * The implementation is SQLite (store/sqlite/). Services import only these
+ * interfaces: no SQL and no SQLite type appears outside that folder, so moving
+ * to another database means writing that folder again.
+ */
+import type { Beneficiary, Quote, StepUpAction, UserRole } from '@/api/types';
+
+import type { MarginConfig } from '../rates/margin';
+
+export type ProviderKey = 'currencycloud' | 'equals';
+
+export interface UserRecord {
+  id: string;
+  email: string;
+  name: string;
+  /** Null until the account is activated. */
+  passwordHash: string | null;
+  /** Base32. The store encrypts it at rest (store/sqlite/keys.ts); services see it in plain form. */
+  totpSecret: string | null;
+  /** The newest TOTP time step already accepted, for replay protection. */
+  lastTotpStep: number;
+  /** SHA-256 of each unused recovery code. */
+  recoveryCodeHashes: string[];
+  activatedAt: number | null;
+  /** Set by operations. A disabled person cannot sign in and has no sessions. */
+  disabledAt?: number | null;
+  lastSignInAt?: number | null;
+  /** Networks (IPv4 /24, IPv6 /64) this person has completed a full sign-in from. A few, newest last. Not a secret. */
+  knownSources?: string[];
+}
+
+export interface CompanyRecord {
+  id: string;
+  name: string;
+  /** Which provider holds this company's account. Never sent to the app. */
+  providerKey: ProviderKey;
+  /** The company's account and contact ids at that provider. Never sent to the app. */
+  providerAccountId: string;
+  providerContactId: string;
+  /** Set by operations. A deactivated company cannot be selected or used by anyone. */
+  deactivatedAt?: number | null;
+  /** The name before the last rename and when that was, so an approver is not misled by a fresh name. */
+  previousName?: string | null;
+  renamedAt?: number | null;
+  /**
+   * How many people other than the creator must approve a payment before the
+   * server sends it to the provider: 0, 1 or 2. Absent means 1 (the default
+   * for a new company). Changed only through the ops console.
+   */
+  approvalsRequired?: ApprovalsRequired;
+}
+
+export type ApprovalsRequired = 0 | 1 | 2;
+export const approvalsRequiredOf = (company: Pick<CompanyRecord, 'approvalsRequired'>): ApprovalsRequired => company.approvalsRequired ?? 1;
+
+export interface Membership {
+  userId: string;
+  companyId: string;
+  role: UserRole;
+}
+
+/** Users, companies and who may act for which company. Maintained by operations. */
+export interface Directory {
+  findUserByEmail(email: string): Promise<UserRecord | null>;
+  getUser(id: string): Promise<UserRecord | null>;
+  saveUser(user: UserRecord): Promise<void>;
+  /**
+   * Atomic read-modify-write of one user, in one database transaction.
+   * `change` returns the new record, or null to leave the user as it is (the
+   * condition did not hold). Returns the saved record, or null when nothing
+   * was written.
+   */
+  updateUser(id: string, change: (user: UserRecord) => UserRecord | null): Promise<UserRecord | null>;
+  listUsers(): Promise<UserRecord[]>;
+  getCompany(id: string): Promise<CompanyRecord | null>;
+  membershipsOf(userId: string): Promise<Membership[]>;
+  listCompanies(): Promise<CompanyRecord[]>;
+  /** Adds a NEW company. (To change one, use updateCompany: this is never used to write a copy that was read earlier.) */
+  saveCompany(company: CompanyRecord): Promise<void>;
+  /**
+   * Atomic read-modify-write of one company, in one transaction; only the
+   * columns that differ are written, so a change made meanwhile to another
+   * column is never undone. `change` gets the row as it is NOW and returns
+   * the new one, or null to leave it. Returns what is stored, or null when
+   * nothing was written. `audit` entries are written in the same transaction.
+   */
+  updateCompany(id: string, change: (company: CompanyRecord) => CompanyRecord | null, audit?: AuditWith<CompanyRecord>): Promise<CompanyRecord | null>;
+  /** The people in a company, with whether they can act now. No credential is read for this. */
+  listMembers(companyId: string): Promise<CompanyMember[]>;
+  listMemberships(): Promise<Membership[]>;
+  /** Adds the membership, or changes its role when it exists. */
+  setMembership(membership: Membership): Promise<void>;
+  removeMembership(userId: string, companyId: string): Promise<void>;
+}
+
+export interface CompanyMember {
+  userId: string;
+  name: string;
+  email: string;
+  role: UserRole;
+  /** Activated and not disabled. */
+  active: boolean;
+}
+
+/** A name or a provider account that another company already has. Thrown by the store, whatever the code checked first. */
+export class StoreConflict extends Error {
+  constructor(readonly what: 'company_name' | 'company_account') {
+    super(what === 'company_name' ? 'Another company already has that name.' : 'Another company is already mapped to that provider account.');
+  }
+}
+
+export interface ActivationRecord {
+  userId: string;
+  expiresAt: number;
+  /** Set as the person works through activation; applied to the user only when it completes. */
+  pendingPasswordHash: string | null;
+  pendingTotpSecret: string | null;
+}
+
+export interface LoginChallengeRecord {
+  userId: string;
+  expiresAt: number;
+  attempts: number;
+}
+
+/** A password-reset link that was emailed. Keyed by the hash of its code; it works once, for half an hour, and never by itself. */
+export interface PasswordResetRecord {
+  userId: string;
+  expiresAt: number;
+  /** Wrong second factors entered with this link. At five the link is withdrawn. */
+  attempts: number;
+  /**
+   * Only on a person's LEDGER row (auth/resetLedger.ts): who asked for links (when, from which network, and whether
+   * the account had signed in from there before), and which links are live. `requests` and `current` are how
+   * earlier versions wrote the same row; they are still read.
+   */
+  asked?: { at: number; network: string; known: boolean }[];
+  live?: { key: string; until: number }[];
+  requests?: number[];
+  current?: string | null;
+}
+
+/**
+ * An authenticator reset that staff have approved and that has not happened yet. During the delay the person's
+ * credentials still work; a successful sign-in with them cancels it, and so can any ops admin.
+ */
+export interface AuthenticatorResetRecord {
+  id: string;
+  userId: string;
+  /** The approval request it came from. */
+  requestId: string;
+  requestedBy: string;
+  approvedBy: string;
+  approvedAt: number;
+  /** When the credentials are cleared and the new activation link is emailed. */
+  dueAt: number;
+  /**
+   * `running`: its delay has passed and it has been claimed to be carried out (a sign-in can no longer cancel it).
+   * It becomes `done` once the credentials are cleared and the new link is queued; a crash in between is finished
+   * at the next run.
+   */
+  status: 'waiting' | 'running' | 'done' | 'cancelled';
+  /**
+   * When the mail server accepted the WARNING email. The delay runs from then: until it is set, nothing is due.
+   * (A waiting row from before this existed has none: it is warned afresh and its delay starts from then.)
+   */
+  warnedAt?: number | null;
+  /** How many times the warning has had to be queued again because the mail server refused it for good. */
+  warningTries?: number;
+  /** After a warning was refused: when the next one may be queued. */
+  warningRetryAt?: number | null;
+  closedAt: number | null;
+  /** Who or what cancelled it: a staff email, or "signed in". */
+  closedBy: string | null;
+}
+
+export interface SessionRecord {
+  id: string;
+  userId: string;
+  /** What kind of device or browser signed in ("Chrome on Windows"): a family, never the full identifying string. */
+  agent?: string;
+  /** Null until the person picks a company (only when they have several). */
+  companyId: string | null;
+  createdAt: number;
+  lastSeenAt: number;
+}
+
+export interface StepUpRecord {
+  userId: string;
+  sessionId: string;
+  /** The company the permission was given for. It is good for that company only. */
+  companyId: string | null;
+  action: StepUpAction;
+  payloadHash: string;
+  expiresAt: number;
+}
+
+export interface AttemptRecord {
+  failures: number;
+  lockedUntil: number;
+  /** How many locks this counter has started; the next one is that many times doubled. */
+  locks: number;
+  /** Whose credential is being guessed, e.g. `email:a@b.example` or `user:usr_1`; lets operations find and clear locks. */
+  subject: string;
+  updatedAt: number;
+}
+
+/** Idempotency key -> provider order id, kept outside any adapter instance. Key: `<companyId>:<kind>:<idempotency key>`. */
+export interface ProviderKeyRecord {
+  orderId: string;
+  createdAt: number;
+}
+
+/**
+ * Which rows: an object of fields that must be equal (the store can use an
+ * index for these), or, for tests and one-off administration only, a function
+ * (the store then reads every row).
+ */
+export type Where<T> = Partial<T> | ((row: T) => boolean);
+
+/** A small keyed table. Keys are always hashes or internal ids, never raw tokens. */
+export interface Table<T> {
+  get(key: string): Promise<T | null>;
+  put(key: string, value: T): Promise<void>;
+  delete(key: string): Promise<void>;
+  /** Remove every row that matches (and, when given, passes `filter`). */
+  deleteWhere(where: Where<T>, filter?: (row: T) => boolean): Promise<void>;
+  count(where: Where<T>, filter?: (row: T) => boolean): Promise<number>;
+  list(where?: Where<T>, filter?: (row: T) => boolean): Promise<T[]>;
+  /**
+   * Atomic read-modify-write, in ONE database transaction that holds the
+   * write lock from before the read. `change` gets the current row (or null)
+   * and returns the row to store, null to delete it, or undefined to leave it
+   * untouched. Returns what is stored afterwards. Every read-modify-write of
+   * security state goes through this (or `take`), never get-then-put.
+   */
+  mutate(key: string, change: (current: T | null) => T | null | undefined, audit?: AuditWith<T | null>): Promise<T | null>;
+  /** Atomic read-and-delete: of two simultaneous callers, in this process or another, only one gets the row. */
+  take(key: string): Promise<T | null>;
+}
+
+export interface AuthStore {
+  activations: Table<ActivationRecord>;
+  challenges: Table<LoginChallengeRecord>;
+  sessions: Table<SessionRecord>;
+  stepUps: Table<StepUpRecord>;
+  attempts: Table<AttemptRecord>;
+  passwordResets: Table<PasswordResetRecord>;
+  authenticatorResets: Table<AuthenticatorResetRecord>;
+}
+
+// --- Operations staff: a separate account table and separate session tables ---
+
+export type OpsRole = 'ops' | 'ops_admin';
+
+export interface OpsUserRecord {
+  id: string;
+  email: string;
+  name: string;
+  role: OpsRole;
+  passwordHash: string | null;
+  /** Base32. The store encrypts it at rest (store/sqlite/keys.ts); services see it in plain form. */
+  totpSecret: string | null;
+  lastTotpStep: number;
+  recoveryCodeHashes: string[];
+  activatedAt: number | null;
+  disabledAt: number | null;
+  lastSignInAt: number | null;
+  /** See UserRecord.knownSources. */
+  knownSources?: string[];
+}
+
+export interface OpsDirectory {
+  findByEmail(email: string): Promise<OpsUserRecord | null>;
+  get(id: string): Promise<OpsUserRecord | null>;
+  save(user: OpsUserRecord): Promise<void>;
+  /** Atomic read-modify-write; see Directory.updateUser. */
+  update(id: string, change: (user: OpsUserRecord) => OpsUserRecord | null): Promise<OpsUserRecord | null>;
+  list(): Promise<OpsUserRecord[]>;
+}
+
+/** A change one staff member asked for that another must approve before it takes effect. */
+export interface ApprovalRecord {
+  id: string;
+  /** The console action, e.g. `client.reset_authenticator`. */
+  action: string;
+  /** The validated input of the action. Never a credential. */
+  params: Record<string, string>;
+  /** One line for the approver: what will happen. */
+  summary: string;
+  /** Consequences the approver must see (for example sessions that will be ended). */
+  warnings: string[];
+  target: AuditParty | null;
+  requestedBy: { id: string; email: string };
+  requestedAt: number;
+  expiresAt: number;
+  /**
+   * `applying`: approved, and being carried out. A request found in this state
+   * after a crash or a failure half-way has to be finished (or closed) from
+   * the console; it is never silently treated as done or as never approved.
+   */
+  status: 'pending' | 'applying' | 'approved' | 'rejected' | 'cancelled' | 'expired';
+  /** For a request whose result is an email: what had become of that email when the request was carried out (sent, queued, deferred, failed). */
+  mailed?: string;
+  decidedBy: { id: string; email: string } | null;
+  decidedAt: number | null;
+}
+
+export interface OpsSessionRecord {
+  id: string;
+  userId: string;
+  createdAt: number;
+  lastSeenAt: number;
+}
+
+export interface OpsStore {
+  users: OpsDirectory;
+  activations: Table<ActivationRecord>;
+  challenges: Table<LoginChallengeRecord>;
+  sessions: Table<OpsSessionRecord>;
+  attempts: Table<AttemptRecord>;
+  approvals: Table<ApprovalRecord>;
+  passwordResets: Table<PasswordResetRecord>;
+  /** Confirmation tokens that have been used, by their random part, until they would have expired anyway. A token works once. */
+  confirmations: Table<{ expiresAt: number }>;
+}
+
+// --- Audit log -----------------------------------------------------------------
+
+export interface AuditParty {
+  type: 'client' | 'ops' | 'system' | 'company';
+  /** Internal id, or null when the account is unknown (a failed sign-in). */
+  id: string | null;
+  /** Email or name, for reading. */
+  label: string;
+}
+
+export interface AuditEntry {
+  id: string;
+  at: number;
+  actor: AuditParty;
+  target: AuditParty | null;
+  /** e.g. `client.sign_in`, `ops.client.reset_authenticator`. */
+  action: string;
+  outcome: 'success' | 'failure';
+  /** Network address the request came from; empty for server-internal events. */
+  source: string;
+  /** Short facts about the event. NEVER a password, key, code or token. */
+  detail: Record<string, string>;
+  /** True for a failure by nobody we can identify (see AuditLog.append). */
+  anonymous?: boolean;
+}
+
+/** An audit entry as it is handed to the log (the log gives it its id). */
+export type AuditInput = Omit<AuditEntry, 'id' | 'anonymous'>;
+/**
+ * Audit entries to write IN THE SAME TRANSACTION as a state change: called
+ * with what was stored (not called when nothing was written). So a change and
+ * its record are both there or both absent, whatever happens in between.
+ */
+export type AuditWith<T> = (stored: T) => AuditInput | AuditInput[] | null;
+
+export interface AuditFilter {
+  actor?: string;
+  target?: string;
+  action?: string;
+  from?: number;
+  to?: number;
+  limit?: number;
+}
+
+/**
+ * Append-only by contract: there is no way to change or remove an entry.
+ *
+ * `append` must not fail because the log is "full". An implementation with a
+ * bounded working set moves a full segment to an archive (AuditArchive) and
+ * carries on, telling the operator loudly; it never refuses the entry and
+ * never drops the newest ones. A database implementation simply inserts.
+ */
+export interface AuditLog {
+  /**
+   * A failure by a person nobody has identified (`actor.id === null`) goes to a
+   * separate, bounded, rate-limited stream with a truncated label, so that
+   * anonymous noise can never push out or fill the main log.
+   */
+  append(entry: Omit<AuditEntry, 'id' | 'anonymous'>): Promise<void>;
+  /** Newest first. */
+  query(filter?: AuditFilter): Promise<AuditEntry[]>;
+  /** How many entries there are, and how many of them are in the archive. `query` reads both: they are one log. */
+  counts(): { live: number; archived: number };
+}
+
+/** Where a full segment of the main log goes. Durable in a real deployment. */
+export interface AuditArchive {
+  write(segment: AuditEntry[]): Promise<string>;
+}
+
+/**
+ * A payment the server is holding until enough people have approved it.
+ *  awaiting_approval -> sending -> sent | failed
+ *  awaiting_approval -> rejected | cancelled | expired | payee_changed   (all final)
+ * `sending` means the provider has been (or is about to be) asked to make the
+ * payment under `sendKey` and the answer is not yet known. Nothing else may
+ * happen to the payment until that is settled, and it is never sent under any
+ * other key.
+ */
+export type HeldPaymentStatus = 'awaiting_approval' | 'sending' | 'sent' | 'failed' | 'rejected' | 'cancelled' | 'expired' | 'payee_changed';
+
+export interface HeldPaymentRecord {
+  id: string;
+  companyId: string;
+  /** The creator's own idempotency key: the same key never makes a second held payment. */
+  idempotencyKey: string;
+  createdBy: string;
+  createdAt: number;
+  expiresAt: number;
+  amount: string;
+  currency: string;
+  reference: string;
+  reason: string;
+  /** The payee as they were when the payment was created (for showing; the comparison uses the digest). */
+  payee: Beneficiary;
+  /**
+   * The provider adapter's digest of EVERYTHING at the provider that decides
+   * where the money goes (every routing code, account number, holder, bank
+   * country, payment type, and any field the adapter does not know). Taken at
+   * creation; a different value at approval blocks the payment.
+   */
+  payeeDigest: string;
+  /** SHA-256 of the request as it was first made. The same idempotency key with anything else is refused. */
+  requestHash: string;
+  /** The company's policy when the payment was created. A later change of policy does not alter it. */
+  approvalsRequired: 1 | 2;
+  approvals: { userId: string; at: number }[];
+  /** Approvals that stopped counting because the approver was disabled, removed or lost the role before the payment was sent. */
+  droppedApprovals?: { userId: string; at: number; droppedAt: number; reason: string }[];
+  status: HeldPaymentStatus;
+  statusAt: number;
+  /** Who rejected or cancelled it; null for the system (expiry). */
+  closedBy: string | null;
+  note: string | null;
+  /** The idempotency key the provider is given, derived from `id`. Set when the last approval is recorded. */
+  sendKey: string | null;
+  /** The provider account the payment was handed to, fixed when it moved to `sending`. It is settled there, wherever the company points later. */
+  sendMapping?: { providerKey: ProviderKey; providerAccountId: string; providerContactId: string } | null;
+  providerPaymentId: string | null;
+  /** Set when what the provider says it made differs from this record (amount, currency or payee). */
+  mismatch?: string | null;
+  /** The payee's digest field by field (name -> short hash), so that a refusal can say WHICH field changed. Names only are ever reported. */
+  payeeFields?: Record<string, string>;
+  /**
+   * Every time the provider was asked to make this payment, newest last (the last 20). `started` is written BEFORE
+   * the provider is asked: an attempt still `started` after a crash is one whose outcome is not known.
+   */
+  attempts?: { at: number; outcome: 'started' | 'sent' | 'refused' | 'unknown'; reason?: string }[];
+  /**
+   * Set when the provider REFUSED an attempt after an earlier attempt's outcome was not known. The refusal proves
+   * nothing about the earlier attempt, which may still land: the payment stays `sending`, is only looked up by its
+   * key (never asked for again), and becomes `failed` only once the reconciliation window has passed without it.
+   */
+  unconfirmedSince?: number | null;
+  refusal?: string | null;
+}
+
+/**
+ * A payment sent straight to the provider because the company had no approval rule. Recorded by key BEFORE the
+ * provider is asked, so the key is known to this server whatever the provider says, or does not say, afterwards.
+ */
+export interface DirectPaymentRecord {
+  companyId: string;
+  idempotencyKey: string;
+  createdBy: string;
+  /** SHA-256 of the request as it was first made (payee, amount, currency, reference, reason). */
+  requestHash: string;
+  createdAt: number;
+  /** The provider account it was sent to. It is looked for there, wherever the company points later. */
+  mapping: { providerKey: ProviderKey; providerAccountId: string; providerContactId: string };
+  /** `started`: asked, outcome not (yet) known. `made`: the provider has it. `refused`: the provider plainly refused the latest attempt. */
+  state: 'started' | 'made' | 'refused';
+  /** True once any attempt ended without an answer: a later refusal then proves nothing about that attempt. */
+  unknown: boolean;
+  providerPaymentId: string | null;
+}
+
+/** The people and the company a decision depends on, read in the same transaction as the payment. */
+export interface HeldPaymentPeople {
+  /** The payment's company as it is now (its approval rule may have changed since the payment was created). */
+  company: CompanyRecord | null;
+  /** Null when the person no longer exists. `role` is their role in the payment's company, null when they are not a member. */
+  get(userId: string): { user: UserRecord; role: UserRole | null } | null;
+}
+
+export interface HeldPaymentStore {
+  /**
+   * Stores the payment unless this company and idempotency key already have one, held OR sent directly: returns
+   * whichever is stored. ONE transaction, so the same key can never become both.
+   */
+  create(record: HeldPaymentRecord, audit?: AuditWith<HeldPaymentRecord>): Promise<{ record: HeldPaymentRecord; created: boolean } | { direct: DirectPaymentRecord }>;
+  /** The same for a payment about to be sent directly: recorded unless the key already has a held payment or a direct record. */
+  claimDirect(record: DirectPaymentRecord): Promise<{ held: HeldPaymentRecord } | { direct: DirectPaymentRecord; created: boolean }>;
+  getDirect(companyId: string, idempotencyKey: string): Promise<DirectPaymentRecord | null>;
+  /** ATOMIC. Null leaves it as it is. */
+  updateDirect(companyId: string, idempotencyKey: string, change: (current: DirectPaymentRecord) => DirectPaymentRecord | null): Promise<DirectPaymentRecord | null>;
+  get(id: string): Promise<HeldPaymentRecord | null>;
+  findByKey(companyId: string, idempotencyKey: string): Promise<HeldPaymentRecord | null>;
+  /** `changedSince`: only payments whose status changed at or after that moment. */
+  list(where: { companyId?: string; status?: HeldPaymentStatus; changedSince?: number }): Promise<HeldPaymentRecord[]>;
+  /**
+   * ATOMIC. Reads the payment and the named people (their accounts and their
+   * roles in the payment's company) in ONE transaction and stores what
+   * `change` returns; null leaves it as it is. Returns the stored record, or
+   * null when nothing was written. `audit` entries are written in the same
+   * transaction as the change.
+   */
+  update(id: string, userIds: string[] | ((current: HeldPaymentRecord) => string[]), change: (current: HeldPaymentRecord, people: HeldPaymentPeople) => HeldPaymentRecord | null, audit?: AuditWith<HeldPaymentRecord>): Promise<HeldPaymentRecord | null>;
+}
+
+/**
+ * One email in the outbox (see mail/queue.ts). `body` is the finished message, stored encrypted, and is erased
+ * once the message is sent, has failed for good or was suppressed.
+ */
+export interface MailRecord {
+  id: string;
+  /** The row's own key (a hash of the logical message key). */
+  key: string;
+  to: string;
+  category: string;
+  template: string;
+  body: string | null;
+  /** Which allowance it is counted against (mail/queue.ts). Rows written before classes existed have none: it is worked out from the template. */
+  class?: 'security' | 'links' | 'payments' | 'rates' | 'digest';
+  /** `suppressed`: an ordinary notification that was folded into the hourly digest instead of being sent by itself. */
+  status: 'queued' | 'sending' | 'sent' | 'failed' | 'suppressed';
+  /** Set while it waits for its hourly allowance: which limit ("recipient" or "global"). It is still queued and will be sent. */
+  deferred?: string | null;
+  /** The hour (since 1970) in which it was sent: lets the allowance be counted through an index. */
+  sentHour?: number | null;
+  attempts: number;
+  nextAttemptAt: number;
+  attemptAt: number | null;
+  createdAt: number;
+  sentAt: number | null;
+  /** A short code only (an error code, a reply code, or which limit): never anything from the message. */
+  lastError: string | null;
+  /** Not to be sent after this time: it becomes `failed` ("not sent in time") instead. Links carry one. */
+  deadline?: number | null;
+  /** What the message carries, for its issuer to be told when it was sent. A name and a hash: never a code or a link. */
+  ref?: string | null;
+}
+
+/**
+ * A company's FX margin (rates/margin.ts). SERVER-SIDE ONLY: no client API ever returns any of it. Keyed by the
+ * company id. A company without one uses DEFAULT_MARGIN_BPS.
+ */
+export interface MarginRecord extends MarginConfig {
+  companyId: string;
+  updatedAt: number;
+  /** The staff member who asked for the change and the one who approved it (emails). */
+  updatedBy: string;
+  approvedBy: string | null;
+}
+
+/**
+ * What Global Connect earned on one conversion. SERVER-SIDE ONLY, for ops admins. Written BEFORE the provider is
+ * asked to book (status `booking`), so a booking whose answer was lost is still on record, and completed after.
+ */
+export interface RevenueRecord {
+  /** `${companyId}:${hash of the idempotency key}`. */
+  key: string;
+  companyId: string;
+  userId: string;
+  quoteId: string;
+  conversionId: string | null;
+  status: 'booking' | 'booked' | 'failed';
+  kind: 'spot' | 'forward';
+  /** Who applied the margin. `provider`: the server added none and does not know the revenue. */
+  appliedBy: 'server' | 'provider';
+  /** The pair and direction in the ONE orientation used for every provider (rates/margin.ts `canonicalTrade`). */
+  pair: string;
+  direction: 'sell' | 'buy';
+  /** The orientation the RATES below are quoted in (base then quote), as the provider's adapter gave it. */
+  quotedAs?: string;
+  /** The margin REALLY applied after all rounding, in basis points to two places (may differ slightly from `marginBps`). */
+  effectiveBps?: string | null;
+  /** What the provider's answer said was booked, when it is not the client's terms (`mismatch`). */
+  bookedRate?: string | null;
+  bookedSellAmount?: string | null;
+  bookedBuyAmount?: string | null;
+  sellCurrency: string;
+  buyCurrency: string;
+  /** The provider's side of the trade. */
+  providerRate: string;
+  providerSellAmount: string;
+  providerBuyAmount: string;
+  /** The client's side. */
+  clientRate: string;
+  clientSellAmount: string;
+  clientBuyAmount: string;
+  marginBps: number | null;
+  /** The difference, in the currency it arises in (the side the client did not fix). Null when the provider applies the margin. */
+  revenueAmount: string | null;
+  revenueCurrency: string | null;
+  /** True when the provider's answer did not carry the client's terms it was sent: needs a person to look. */
+  mismatch: boolean;
+  /** 'mismatch' from the moment a mismatch is recorded until the person who booked has been told (notification made); then null. Indexed, so the retry reads only these. */
+  untold?: 'mismatch' | null;
+  createdAt: number;
+  bookedAt: number | null;
+}
+
+/**
+ * A rate alert: "tell me when I can SELL (or BUY) the base currency of this pair at this rate or better". It is
+ * checked against the CLIENT's rate for the company it was made in. It fires once and is then `triggered` until
+ * its owner turns it on again.
+ */
+export interface RateAlertRecord {
+  id: string;
+  userId: string;
+  companyId: string;
+  base: string;
+  quote: string;
+  side: 'sell' | 'buy';
+  targetRate: string;
+  status: 'active' | 'paused' | 'triggered';
+  createdAt: number;
+  /** When it was last turned on, and a random mark of that arming. One notification per arming, however often it is checked. */
+  armedAt: number;
+  arming: string;
+  triggeredAt: number | null;
+  /** The client's rate that set it off. */
+  triggeredRate: string | null;
+}
+
+/** `security` is shown in the app always and is emailed as a security notice (notify/security.ts): it is not a choice. */
+export type NotificationCategory = 'rates' | 'approvals' | 'payments' | 'security';
+
+/** One entry in a person's in-app notification list. `body` (what it says, as data for the wording in mail/templates.ts) is stored encrypted. */
+export interface NotificationRecord {
+  id: string;
+  /** A hash of what the notification is about and who it is for: the same event never makes two. */
+  key: string;
+  userId: string;
+  companyId: string | null;
+  category: NotificationCategory;
+  kind: string;
+  body: string;
+  createdAt: number;
+  readAt: number | null;
+}
+
+/** Which categories a person also gets by email. Security notices are not here: they cannot be turned off. */
+export interface NotificationPrefsRecord {
+  userId: string;
+  email: Record<Exclude<NotificationCategory, 'security'>, boolean>;
+  updatedAt: number;
+}
+
+/**
+ * A quote this server gave a client, kept until it runs out so that a restart does not strand someone in the middle
+ * of confirming. `provider` (the provider's own side) never leaves the server.
+ */
+export interface HeldQuoteRecord {
+  /** `${companyId}:${quote id}`. */
+  key: string;
+  companyId: string;
+  /** The person it was given to: only they can book it. */
+  userId: string;
+  client: Quote;
+  provider: Quote;
+  appliedBy: 'server' | 'provider';
+  marginBps: number | null;
+  revenue: { amount: string; currency: string } | null;
+  /** Which margin configuration priced it (when that was last changed; 0 for the server default). A quote priced before a change cannot be booked after it. */
+  marginVersion: number;
+  createdAt: number;
+  expiresAt: number;
+  /** The idempotency key (hashed) of the booking that used it. A quote is booked once. */
+  usedBy: string | null;
+}
+
+export interface Stores {
+  quotes: Table<HeldQuoteRecord>;
+  alerts: Table<RateAlertRecord>;
+  notifications: Table<NotificationRecord>;
+  notificationPrefs: Table<NotificationPrefsRecord>;
+  margins: Table<MarginRecord>;
+  revenue: Table<RevenueRecord>;
+  mail: Table<MailRecord>;
+  payments: HeldPaymentStore;
+  directory: Directory;
+  auth: AuthStore;
+  ops: OpsStore;
+  audit: AuditLog;
+  providerKeys: Table<ProviderKeyRecord>;
+}

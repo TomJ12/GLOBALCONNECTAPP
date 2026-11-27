@@ -1,11 +1,10 @@
 import { render } from '@testing-library/react-native';
 import { AppState, type AppStateStatus } from 'react-native';
 
-import { getProviderClient } from '@/api';
 import RootLayout from '@/app/_layout';
 import { INACTIVITY_LOCK_MS } from '@/lib/inactivity';
 import { useSession } from '@/state/session';
-import { installMockBackend, TEST_DEVICE_SECRET } from '@/test/utils';
+import { installMockBackend, startTestSession } from '@/test/utils';
 
 jest.mock('@expo-google-fonts/inter', () => ({ useFonts: () => [true, null] }));
 jest.mock('expo-splash-screen', () => ({ preventAutoHideAsync: async () => undefined, hideAsync: async () => undefined }));
@@ -30,9 +29,7 @@ describe('RootLayout', () => {
       return { remove: () => undefined } as ReturnType<typeof AppState.addEventListener>;
     });
     installMockBackend();
-    const client = getProviderClient();
-    const link = await client.requestMagicLink('finance@example.com', TEST_DEVICE_SECRET);
-    useSession.getState().startSession(await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET));
+    await startTestSession();
 
     await render(<RootLayout />);
     expect(listener).toBeDefined();

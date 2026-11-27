@@ -115,6 +115,10 @@ export const rawHeldRateQuote = z.object({
   client_buy_amount: decimal,
   client_sell_amount: decimal,
   client_rate: decimal,
+  /** The provider's own side of the quote, when it says: differs from the client's when a partner markup is configured there. */
+  partner_rate: decimal.nullish(),
+  partner_buy_amount: decimal.nullish(),
+  partner_sell_amount: decimal.nullish(),
   currency_pair: z.string().length(6),
   fixed_side: z.enum(['buy', 'sell']),
   created_at: z.string(),
@@ -222,19 +226,7 @@ export const rawErrorBody = z.object({
 });
 
 // --- NOT PART OF THE PROVIDER API -------------------------------------------
-// Magic-link sign-in and rate history are not offered by
-// the provider. A real build needs a Global Connect service for these.
-
-export const rawMagicLinkRequest = z.object({
-  request_id: z.string(),
-  email: z.string(),
-  expires_at: z.string(),
-});
-
-export const rawAppSession = z.object({
-  auth_token: z.string().min(1),
-  contact: rawContact,
-});
+// Rate history is not offered by the provider. A real build needs a market-data source.
 
 export const rawRateHistory = z.object({
   currency_pair: z.string().length(6),
@@ -254,6 +246,4 @@ export type RawBeneficiary = z.infer<typeof rawBeneficiary>;
 export type RawPayment = z.infer<typeof rawPayment>;
 export type RawPaymentAuthorisation = z.infer<typeof rawPaymentAuthorisation>;
 export type RawErrorBody = z.infer<typeof rawErrorBody>;
-export type RawMagicLinkRequest = z.infer<typeof rawMagicLinkRequest>;
-export type RawAppSession = z.infer<typeof rawAppSession>;
 export type RawRateHistory = z.infer<typeof rawRateHistory>;

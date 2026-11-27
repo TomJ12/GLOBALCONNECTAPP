@@ -3,7 +3,7 @@ import { useRouter } from 'expo-router';
 import { LogOut } from 'lucide-react-native';
 import { StyleSheet, Switch, View } from 'react-native';
 
-import { isMockBackend, resetSampleData } from '@/api';
+import { getAuthClient, isMockBackend, resetSampleData } from '@/api';
 import { FORCED_ERRORS, FORCED_ERROR_LABELS, type ForcedError } from '@/api/mockControls';
 import { AppText } from '@/components/AppText';
 import { DetailRow } from '@/components/Bits';
@@ -146,6 +146,7 @@ export function SettingsScreen() {
           <Card padded={false}>
             <DetailRow label="Signed in as" value={session.user.email || session.user.displayName} />
           </Card>
+          {getAuthClient().selfService ? <Button variant="secondary" label="Security: password, recovery codes, sessions" onPress={() => router.push('/security')} testID="open-security" /> : null}
           <Button
             variant="danger"
             label="Sign out"
@@ -155,7 +156,7 @@ export function SettingsScreen() {
             testID="sign-out"
           />
           <AppText variant="caption" tone="muted">
-            Signing out leaves nothing on this device that can sign you back in. You will need a new login link.
+            Signing out leaves nothing on this device that can sign you back in. You will need your password and a new code from your authenticator app.
           </AppText>
         </>
       ) : (

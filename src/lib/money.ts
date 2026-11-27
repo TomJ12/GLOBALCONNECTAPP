@@ -111,6 +111,17 @@ export function formatRate(rate: DecimalString, decimalPlaces = 4): string {
   return new Big(rate).round(decimalPlaces, Big.roundHalfUp).toFixed(decimalPlaces);
 }
 
+/**
+ * An INDICATIVE rate from the Global Connect server, shown exactly as it was given: the server has already rounded
+ * it to display precision AGAINST the customer, so rounding it again here (to the nearest) could show a better rate
+ * than they would get. Only padded with zeros to four places when it is shorter ("1.3" -> "1.3000").
+ */
+export function formatIndicativeRate(rate: DecimalString): string {
+  if (!isDecimalString(rate)) return INVALID_AMOUNT_PLACEHOLDER;
+  const decimals = rate.includes('.') ? rate.length - rate.indexOf('.') - 1 : 0;
+  return decimals >= 4 || new Big(rate).gte(100) ? rate : new Big(rate).toFixed(4);
+}
+
 export function addAmounts(a: DecimalString, b: DecimalString): DecimalString {
   return toBig(a).plus(toBig(b)).toFixed();
 }

@@ -13,11 +13,10 @@ import {
 } from '@tanstack/react-query';
 
 import { getAlertsStore, type NewRateAlert } from '@/alerts';
-import { getProviderClient } from '@/api';
+import { getAuthClient, getProviderClient } from '@/api';
 import { ProviderError } from '@/api/errors';
-import type { BookConversionRequest, CurrencyCode, DecimalString, NewBeneficiary, NewPayment } from '@/api/types';
-import { clearSignInAttempt, loadSignInAttempt, newDeviceSecret, saveSignInAttempt } from '@/lib/signInAttempt';
-import { useSession } from '@/state/session';
+import type { BookConversionRequest, CodeMethod, CurrencyCode, DecimalString, NewBeneficiary, NewPayment, NotificationEmailChoices } from '@/api/types';
+import { useCapabilities, useSession } from '@/state/session';
 
 export const queryKeys = {
   company: ['company'] as const,
@@ -83,7 +82,7 @@ export function useRate(base: CurrencyCode, quote: CurrencyCode) {
 }
 
 /**
- * Rates from one base currency to several others, for totals.
+ * Rates from one base currency to several others, for totals: the customer's own sell-side rate for each.
  * `rates[c]` is undefined until that rate has loaded.
  */
 export function useRatesFromBase(base: CurrencyCode, currencies: readonly CurrencyCode[]) {
@@ -94,7 +93,9 @@ export function useRatesFromBase(base: CurrencyCode, currencies: readonly Curren
       const rates: Record<CurrencyCode, DecimalString | undefined> = {};
       results.forEach((result, index) => {
         const currency = wanted[index];
-        if (currency) rates[currency] = result.data?.rate;
+        // A balance in another currency is valued at what the customer would get by SELLING it for the base
+        // currency: that is the rate at which they BUY the base (`buyRate`), not the rate at which they sell it.
+        if (currency) rates[currency] = result.data?.buyRate ?? result.data?.rate;
       });
       // The oldest of the rates used, so the screen can say how fresh the total is.
       const times = results.map((result) => result.data?.asOf).filter((value): value is string => Boolean(value));
@@ -145,36 +146,35 @@ export function uniqueById<T extends { id: string }>(items: readonly T[]): T[] {
   return items.filter((item) => (seen.has(item.id) ? false : (seen.add(item.id), true)));
 }
 
-// --- Sign-in ------------------------------------------------------------------
+// --- Sign-in and activation ----------------------------------------------------
 
-/** Asks for a login link and remembers, on this device only, the secret that goes with it. */
-export function useRequestMagicLink() {
+/** Step 1: email and password. */
+export function useSignIn() {
+  return useMutation({ mutationFn: (input: { email: string; password: string }) => getAuthClient().signIn(input.email, input.password) });
+}
+
+/** Step 2: a code from the authenticator app, or a recovery code. */
+export function useCompleteSignIn() {
   return useMutation({
-    mutationFn: async (email: string) => {
-      const secret = newDeviceSecret();
-      const link = await getProviderClient().requestMagicLink(email, secret);
-      await saveSignInAttempt({ requestId: link.requestId, secret });
-      return link;
-    },
+    mutationFn: (input: { challengeId: string; code: string; method: CodeMethod }) =>
+      getAuthClient().completeSignIn(input.challengeId, input.code, input.method),
   });
 }
 
-/**
- * Completes a login link or code. Only works on the device that asked for it:
- * without the matching secret stored here, it is refused before anything is sent.
- */
-export function useVerifyMagicLink() {
-  return useMutation({
-    mutationFn: async (input: { requestId: string; code: string }) => {
-      const attempt = await loadSignInAttempt();
-      if (!attempt || attempt.requestId !== input.requestId) {
-        throw new ProviderError('forbidden', { detail: 'Login link was not requested on this device' });
-      }
-      const session = await getProviderClient().verifyMagicLink(input.requestId, input.code, attempt.secret);
-      await clearSignInAttempt();
-      return session;
-    },
-  });
+export function useSelectCompany() {
+  return useMutation({ mutationFn: (companyId: string) => getAuthClient().selectCompany(companyId) });
+}
+
+export function useBeginActivation() {
+  return useMutation({ mutationFn: (activationCode: string) => getAuthClient().beginActivation(activationCode) });
+}
+
+export function useSetActivationPassword() {
+  return useMutation({ mutationFn: (password: string) => getAuthClient().setActivationPassword(password) });
+}
+
+export function useConfirmActivation() {
+  return useMutation({ mutationFn: (code: string) => getAuthClient().confirmActivation(code) });
 }
 
 // --- Reconciliation after an unknown outcome ------------------------------------
@@ -189,15 +189,20 @@ export function useFindPaymentByKey() {
   return useMutation({ mutationFn: (idempotencyKey: string) => getProviderClient().findPaymentByIdempotencyKey(idempotencyKey) });
 }
 
+/** Not asked for at all when the account has no payment approvals. */
 export function usePendingApprovals() {
+  const { paymentApprovals } = useCapabilities();
   return useQuery({
     queryKey: queryKeys.pendingApprovals,
     queryFn: () => getProviderClient().listPendingApprovals(),
+    enabled: paymentApprovals,
   });
 }
 
+/** Not asked for at all when the account has no forward contracts. */
 export function useForwardContracts() {
-  return useQuery({ queryKey: queryKeys.forwards, queryFn: () => getProviderClient().listForwardContracts() });
+  const { forwardContracts } = useCapabilities();
+  return useQuery({ queryKey: queryKeys.forwards, queryFn: () => getProviderClient().listForwardContracts(), enabled: forwardContracts });
 }
 
 /** After money moves, everything derived from balances and payments is stale. */
@@ -243,7 +248,23 @@ export function useApprovePayment() {
 export function useRejectPayment() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (paymentId: string) => getProviderClient().rejectPayment(paymentId),
+    mutationFn: (input: { paymentId: string; reason?: string }) => getProviderClient().rejectPayment(input.paymentId, input.reason),
+    onSettled: () => {
+      // Not awaited: the screen shows its result at once and the lists refresh behind it.
+      void invalidateMoney(client);
+    },
+  });
+}
+
+/** Withdraw a payment that is still waiting for approval. Only the Global Connect server holds payments, so only it can. */
+export function useCancelPayment() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (paymentId: string) => {
+      const backend = getProviderClient();
+      if (!backend.cancelPayment) throw new ProviderError('validation', { reason: 'not_supported' });
+      await backend.cancelPayment(paymentId);
+    },
     onSettled: () => {
       // Not awaited: the screen shows its result at once and the lists refresh behind it.
       void invalidateMoney(client);
@@ -298,5 +319,40 @@ export function useRemoveAlert() {
   return useMutation({
     mutationFn: (id: string) => getAlertsStore(userKey).remove(id),
     onSettled: () => client.invalidateQueries({ queryKey: queryKeys.alerts(userKey) }),
+  });
+}
+
+// --- Notifications (kept by the Global Connect server; nothing in the in-app demo) ---------------
+
+const NOTIFICATIONS_KEY = ['notifications'] as const;
+
+/** The person's notification list and unread count, refreshed every minute while the app is open. Disabled where there is no server. */
+export function useNotifications() {
+  const available = getAuthClient().notifications !== null;
+  return useQuery({
+    queryKey: NOTIFICATIONS_KEY,
+    queryFn: () => getAuthClient().notifications?.list() ?? Promise.resolve({ items: [], unread: 0 }),
+    enabled: available,
+    refetchInterval: available ? 60_000 : false,
+  });
+}
+
+export function useMarkNotificationsRead() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (id?: string) => getAuthClient().notifications?.markRead(id) ?? Promise.resolve(0),
+    onSettled: () => client.invalidateQueries({ queryKey: NOTIFICATIONS_KEY }),
+  });
+}
+
+export function useNotificationEmailChoices() {
+  return useQuery({ queryKey: ['notificationChoices'], queryFn: () => getAuthClient().notifications?.emailChoices() ?? Promise.resolve({ rates: true, approvals: true, payments: true }), enabled: getAuthClient().notifications !== null });
+}
+
+export function useSetNotificationEmailChoices() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (choices: NotificationEmailChoices) => getAuthClient().notifications?.setEmailChoices(choices) ?? Promise.resolve(choices),
+    onSuccess: (saved) => client.setQueryData(['notificationChoices'], saved),
   });
 }

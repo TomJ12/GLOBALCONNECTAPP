@@ -16,18 +16,7 @@ export interface Money {
   currency: CurrencyCode;
 }
 
-// --- Auth -------------------------------------------------------------------
-
-export interface MagicLinkRequest {
-  requestId: string;
-  email: string;
-  expiresAt: IsoDateTime;
-  /**
-   * Only ever set by a mock backend, so the sign-in screen can offer a
-   * "complete the link" shortcut. A real backend emails the code instead.
-   */
-  devCode: string | null;
-}
+// --- Sign-in, activation and step-up ------------------------------------------
 
 export interface SessionUser {
   id: string;
@@ -35,8 +24,76 @@ export interface SessionUser {
   displayName: string;
 }
 
+/** A company the signed-in person can act for. */
+export interface CompanyOption {
+  id: string;
+  name: string;
+}
+
+export type UserRole = 'creator' | 'approver' | 'admin';
+
+/** What the selected company's account supports. The app hides what is not supported. */
+export interface Capabilities {
+  forwardContracts: boolean;
+  paymentApprovals: boolean;
+}
+
+/** Actions that can need a fresh authenticator code. */
+export type StepUpAction = 'payment.create' | 'payment.approve' | 'payment.reject' | 'payment.cancel' | 'beneficiary.create' | 'conversion.book';
+
+/** A signed-in person acting for one company. */
 export interface Session {
   user: SessionUser;
+  company: CompanyOption;
+  role: UserRole;
+  capabilities: Capabilities;
+  /** Actions the backend will refuse without a fresh authenticator code. */
+  stepUpActions: StepUpAction[];
+}
+
+/** Password accepted; a code from the authenticator app is needed next. */
+export interface LoginChallenge {
+  challengeId: string;
+}
+
+export type CodeMethod = 'totp' | 'recovery';
+
+/** Signed in. `session` is null until a company is chosen (only when there are several). */
+export interface SignInResult {
+  user: SessionUser;
+  companies: CompanyOption[];
+  session: Session | null;
+}
+
+export interface PasswordPolicy {
+  minLength: number;
+}
+
+export interface ActivationStart {
+  email: string;
+  displayName: string;
+  passwordPolicy: PasswordPolicy;
+}
+
+/** What the authenticator app needs: scan `otpauthUri` as a QR code or type `secret`. */
+export interface TotpEnrolment {
+  otpauthUri: string;
+  secret: string;
+}
+
+/** One of your own signed-in sessions, as your security settings show it: a device family and rough times, nothing that identifies a network. */
+export interface OwnSession {
+  /** A reference for ending it. Not the session itself. */
+  id: string;
+  current: boolean;
+  device: string;
+  signedInAt: string;
+  lastActiveAt: string;
+}
+
+export interface ActivationResult {
+  /** Shown once. Each works one time in place of an authenticator code at sign-in. */
+  recoveryCodes: string[];
 }
 
 export interface CompanyProfile {
@@ -103,11 +160,20 @@ export interface PageRequest {
 
 // --- Rates and conversions --------------------------------------------------
 
-/** `rate` is how many units of `quote` one unit of `base` buys. */
+/**
+ * `rate` is how many units of `quote` one unit of `base` is worth.
+ *
+ * From the Global Connect server this is THE CUSTOMER'S OWN RATE, and there
+ * are two of them: `rate` is what they get when they SELL the base currency,
+ * `buyRate` what they pay when they BUY it. `indicative` says it is not a
+ * held rate. (Without `buyRate`, both directions use `rate`.)
+ */
 export interface RatePair {
   base: CurrencyCode;
   quote: CurrencyCode;
   rate: DecimalString;
+  buyRate?: DecimalString;
+  indicative?: boolean;
   asOf: IsoDateTime;
 }
 
@@ -153,6 +219,11 @@ export interface Quote {
   createdAt: IsoDateTime;
   expiresAt: IsoDateTime;
   settlementDate: IsoDate | null;
+  /**
+   * SERVER ONLY, never sent to the app: whether the provider's quote already carries a partner markup (its client
+   * figures differ from its own). Absent when the provider's answer does not say.
+   */
+  markup?: 'present' | 'absent';
 }
 
 export type ConversionStatus = 'pending' | 'settled' | 'cancelled';
@@ -171,12 +242,19 @@ export interface Conversion {
   rate: DecimalString;
   settlementDate: IsoDate;
   createdAt: IsoDateTime;
+  /**
+   * True when what was BOOKED is not what was quoted: the figures here are what was booked (what moved on the
+   * account). The customer should be told to get in touch (wording: disclosures.conversionDiffers).
+   */
+  differsFromQuote?: boolean;
 }
 
 export interface BookConversionRequest {
   quote: Quote;
   /** Same key on a retry means the provider must not book twice. */
   idempotencyKey: string;
+  /** SERVER ONLY: the customer's side of the trade when it differs from the provider's quote. */
+  clientTerms?: { sellAmount: DecimalString; buyAmount: DecimalString };
 }
 
 export interface ForwardContract {
@@ -245,6 +323,53 @@ export interface Payment {
   /** Null when the provider has not told us. Never guess one. */
   estimatedArrival: IsoDate | null;
   createdAt: IsoDateTime;
+  /**
+   * Present only on a payment that Global Connect is holding (or held) until
+   * the company's approvers have approved it. Such a payment has NOT been
+   * sent to the bank and no money is set aside for it.
+   */
+  held?: PaymentHold;
+}
+
+/** `mismatch`: it was sent, but the provider's record of it differs from what was approved (amount, currency or payee). */
+/** `checking`: approved and handed to the provider, but an attempt to send it went unanswered: it may or may not have been made, and must not be created again. */
+export type PaymentHoldState = 'awaiting_approval' | 'sending' | 'rejected' | 'cancelled' | 'expired' | 'payee_changed' | 'failed' | 'mismatch' | 'checking';
+
+export interface PaymentHold {
+  state: PaymentHoldState;
+  /** Display name of the person who created it. */
+  createdBy: string;
+  createdByYou: boolean;
+  approvalsRequired: number;
+  approvals: { by: string; at: IsoDateTime }[];
+  /** After this moment it can no longer be approved. */
+  expiresAt: IsoDateTime;
+  /** Whether the person asking may approve or reject it now. Never true for its creator. */
+  canApprove: boolean;
+  /** Whether the person asking may cancel it now. */
+  canCancel: boolean;
+  /** Display names of the people who could still approve it. Empty means nobody can: the company needs another approver. */
+  approvers: string[];
+  /** On a rejected payment: who rejected it and the reason they typed, if any. Free text from a colleague: show it as text. */
+  rejection?: { by: string; reason: string | null };
+}
+
+/** One entry in the person's notification list. `title` and `body` are plain text written by the server. */
+export interface AppNotification {
+  id: string;
+  /** `security`: a notice about the account itself; always shown and always emailed. */
+  category: 'rates' | 'approvals' | 'payments' | 'security';
+  title: string;
+  body: string;
+  createdAt: IsoDateTime;
+  read: boolean;
+}
+
+/** Which kinds of notification are also sent by email. Security notices are always sent and are not here. */
+export interface NotificationEmailChoices {
+  rates: boolean;
+  approvals: boolean;
+  payments: boolean;
 }
 
 export interface NewPayment {
@@ -274,6 +399,12 @@ export interface ApprovalStep {
 
 export interface PendingApproval {
   payment: Payment;
+  /**
+   * True for a payment that is waiting for approval somewhere other than
+   * Global Connect (it was already pending there before approvals were held
+   * here). Approving it does not go through Global Connect's own rules.
+   */
+  external?: boolean;
   /** The payee's saved details. Null if they could not be found: such a payment must not be approved. */
   beneficiary: Beneficiary | null;
   /** Approvals still needed before the payment is released, including yours. */

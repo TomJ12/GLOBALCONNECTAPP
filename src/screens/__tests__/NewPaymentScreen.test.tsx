@@ -7,7 +7,7 @@ import { paymentMatchesRequest } from '@/lib/paymentMatch';
 import { pendingStorageKey } from '@/lib/pendingOutcome';
 import { NewPaymentScreen, paymentOutcomeCopy } from '@/screens/NewPaymentScreen';
 import { useSession } from '@/state/session';
-import { installMockBackend, renderScreen, setControls, setOutcomeTiming, signIn, sleep, TEST_DEVICE_SECRET } from '@/test/utils';
+import { installMockBackend, renderScreen, setControls, setOutcomeTiming, signIn, sleep, startTestSession } from '@/test/utils';
 
 async function gbpBalance(): Promise<string | undefined> {
   return (await getProviderClient().listBalances()).find((balance) => balance.currency === 'GBP')?.amount;
@@ -26,11 +26,7 @@ async function sendAndConfirm(): Promise<void> {
 }
 
 async function signInAs(email: string): Promise<string> {
-  const client = getProviderClient();
-  const link = await client.requestMagicLink(email, TEST_DEVICE_SECRET);
-  const session = await client.verifyMagicLink(link.requestId, link.devCode ?? '', TEST_DEVICE_SECRET);
-  useSession.getState().startSession(session);
-  return session.user.id;
+  return (await startTestSession(email)).user.id;
 }
 
 describe('NewPaymentScreen', () => {

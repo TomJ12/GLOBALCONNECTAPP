@@ -18,6 +18,8 @@ export default function AppLayout() {
       <Stack.Screen name="alerts/new" options={{ presentation: 'modal' }} />
       {/* Settings and the developer panel sit behind the session, like every other screen here. */}
       <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
+      <Stack.Screen name="security" options={{ presentation: 'modal' }} />
+      <Stack.Screen name="notifications" options={{ presentation: 'modal' }} />
     </Stack>
   );
 }

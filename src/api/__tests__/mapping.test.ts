@@ -312,6 +312,8 @@ describe('rates and conversions', () => {
       createdAt: '2025-08-11T08:10:21Z',
       expiresAt: '2025-08-11T08:15:21Z',
       settlementDate: null,
+      // The provider's own figures equal the client's in this sample: no partner markup is configured there (used only by the server).
+      markup: 'absent',
     });
   });
 

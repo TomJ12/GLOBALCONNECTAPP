@@ -18,7 +18,6 @@ import type {
   ConversionStatus,
   ForwardContract,
   IsoDate,
-  MagicLinkRequest,
   Money,
   NewBeneficiary,
   Page,
@@ -30,14 +29,12 @@ import type {
   QuoteRequest,
   RateHistory,
   RatePair,
-  Session,
   Transaction,
   TransactionKind,
 } from '../../types';
 import {
   rawErrorBody,
   type RawAccount,
-  type RawAppSession,
   type RawBalance,
   type RawBasicRates,
   type RawBeneficiary,
@@ -45,7 +42,6 @@ import {
   type RawConversion,
   type RawFundingAccount,
   type RawHeldRateQuote,
-  type RawMagicLinkRequest,
   type RawPagination,
   type RawPayment,
   type RawPaymentAuthorisation,
@@ -155,25 +151,8 @@ export function mapPage<T>(pagination: RawPagination, items: T[]): Page<T> {
 
 // --- Auth and profile -------------------------------------------------------
 
-export function mapMagicLinkRequest(raw: RawMagicLinkRequest, devCode: string | null): MagicLinkRequest {
-  return { requestId: raw.request_id, email: raw.email, expiresAt: raw.expires_at, devCode };
-}
-
 export function contactDisplayName(contact: RawContact): string {
   return `${contact.first_name} ${contact.last_name}`.trim();
-}
-
-export function mapSession(raw: RawAppSession): { session: Session; token: string } {
-  return {
-    token: raw.auth_token,
-    session: {
-      user: {
-        id: raw.contact.id,
-        email: raw.contact.email_address ?? '',
-        displayName: contactDisplayName(raw.contact),
-      },
-    },
-  };
 }
 
 export function mapCompanyProfile(raw: RawAccount, planName: string | null): CompanyProfile {
@@ -318,6 +297,10 @@ export function mapQuote(raw: RawHeldRateQuote, request: QuoteRequest): Quote {
     createdAt: raw.created_at,
     expiresAt: raw.expires_at,
     settlementDate: request.kind === 'forward' ? (request.settlementDate ?? null) : null,
+    // Server only: does the provider's quote already carry a partner markup? (Its client figures differ from its own.)
+    ...(raw.partner_rate && raw.partner_buy_amount && raw.partner_sell_amount
+      ? { markup: new Big(raw.partner_rate).eq(raw.client_rate) && new Big(raw.partner_buy_amount).eq(raw.client_buy_amount) && new Big(raw.partner_sell_amount).eq(raw.client_sell_amount) ? ('absent' as const) : ('present' as const) }
+      : {}),
   };
 }
 

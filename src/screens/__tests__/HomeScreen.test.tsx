@@ -19,8 +19,8 @@ describe('HomeScreen', () => {
     expect(screen.getByText('Business Standard')).toBeOnTheScreen();
     // 101,964.00 + 57,891.00 / 1.3 + 24,310.50 / 1.18
     expect(await screen.findByTestId('total-balance')).toHaveTextContent('£167,097.66');
-    // L9: these are indicative rates with a time, not "live" rates.
-    expect(screen.getByText(/^Across 3 currencies\. Estimated at indicative rates as of \d{2}:\d{2}\.$/)).toBeOnTheScreen();
+    // L9: a valuation at the customer's own sell rates, with a time; not "live" rates.
+    expect(screen.getByText(/^Across 3 currencies\. A valuation, estimated at your current sell rates as of \d{2}:\d{2}\.$/)).toBeOnTheScreen();
     expect(screen.queryByText(/live rates/i)).not.toBeOnTheScreen();
     expect(screen.getByText('101,964.00')).toBeOnTheScreen();
     expect(screen.getByText('57,891.00')).toBeOnTheScreen();

@@ -6,6 +6,10 @@
  */
 import type { CurrencyCode, DecimalString, IsoDateTime } from '@/api/types';
 
+/**
+ * 'above' is an alert on the rate at which you SELL the pair's first currency (tell me when it is at or above the
+ * target); 'below' on the rate at which you BUY it (at or below the target). Either way: "at this rate or better".
+ */
 export type AlertDirection = 'above' | 'below';
 
 export interface RateAlert {
@@ -17,6 +21,8 @@ export interface RateAlert {
   targetRate: DecimalString;
   enabled: boolean;
   createdAt: IsoDateTime;
+  /** Set once a server-checked alert has fired: when, and the rate (your own) that set it off. It stays off until turned on again. */
+  triggered?: { at: IsoDateTime; rate: DecimalString } | null;
 }
 
 export interface NewRateAlert {

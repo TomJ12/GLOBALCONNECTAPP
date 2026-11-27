@@ -1,7 +1,8 @@
 /**
- * The provider-neutral contract the app talks to. One implementation exists
- * today (an in-memory mock); a real adapter implements the same interface and
- * is selected in src/api/index.ts.
+ * The provider-neutral contract the app talks to for account data and money
+ * actions. Implementations: the Global Connect server over HTTP, and an
+ * in-app mock for the offline demo. Selected in src/api/index.ts.
+ * Sign-in, activation and step-up are a separate contract: see auth.ts.
  *
  * Every method rejects with a ProviderError (src/api/errors.ts) and nothing else.
  */
@@ -16,7 +17,6 @@ import type {
   CurrencyCode,
   ListResult,
   ForwardContract,
-  MagicLinkRequest,
   NewBeneficiary,
   NewPayment,
   Page,
@@ -27,21 +27,10 @@ import type {
   QuoteRequest,
   RateHistory,
   RatePair,
-  Session,
   Transaction,
 } from './types';
 
 export interface ProviderClient {
-  // Sign-in. The client keeps the session token internally.
-  /**
-   * `deviceSecret` is a random value this device makes up and keeps. The same
-   * value must be presented at verification, so a link opened on any other
-   * device does not sign anyone in.
-   */
-  requestMagicLink(email: string, deviceSecret: string): Promise<MagicLinkRequest>;
-  verifyMagicLink(requestId: string, code: string, deviceSecret: string): Promise<Session>;
-  signOut(): Promise<void>;
-
   getCompanyProfile(): Promise<CompanyProfile>;
   listBalances(): Promise<Balance[]>;
   getAccountDetails(currency: CurrencyCode): Promise<AccountDetails>;
@@ -76,5 +65,15 @@ export interface ProviderClient {
    * waiting for approval is rejected with a `validation` error, never paid twice.
    */
   approvePayment(paymentId: string): Promise<ApprovalResult>;
-  rejectPayment(paymentId: string): Promise<void>;
+  /** `reason`: optional, in the approver's own words, shown to the person who created the payment. */
+  rejectPayment(paymentId: string, reason?: string): Promise<void>;
+  /**
+   * The text to digest for "has this payee's destination changed?": the
+   * provider's whole raw record of the payee, normalised (see digest.ts).
+   * Null when the payee no longer exists. Only backends that talk to a
+   * provider directly have this.
+   */
+  beneficiaryDigestSource?(beneficiaryId: string): Promise<string | null>;
+  /** Withdraw a payment that is still waiting for approval. Only a backend that holds payments itself has this. */
+  cancelPayment?(paymentId: string): Promise<void>;
 }

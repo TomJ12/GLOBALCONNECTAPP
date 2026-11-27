@@ -41,3 +41,11 @@ example
 # generated native folders
 /ios
 /android
+
+# demo web build and server secrets
+dist-demo/
+server/.env
+.env
+
+# local demo database (password hashes, encrypted authenticator keys) and its development key
+.demo-data/

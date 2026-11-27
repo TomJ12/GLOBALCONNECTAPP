@@ -4,7 +4,8 @@ import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
 import { toProviderError } from '@/api/errors';
-import type { Beneficiary, Payment, PaymentStatus } from '@/api/types';
+import type { Beneficiary, NewPayment, Payment, PaymentStatus } from '@/api/types';
+import { formatDateTime } from '@/lib/dates';
 import { AmountField } from '@/components/AmountField';
 import { AppText } from '@/components/AppText';
 import { Avatar, DetailRow, ListRow } from '@/components/Bits';
@@ -28,7 +29,7 @@ import { useIsOnline } from '@/lib/online';
 import { paymentMatchesRequest, type PaymentFacts } from '@/lib/paymentMatch';
 import { colors, spacing } from '@/theme';
 
-import { describeBeneficiaryAccount } from './shared';
+import { describeBeneficiaryAccount, listNames } from './shared';
 
 type Step = 'payee' | 'amount' | 'review' | 'done';
 export const MAX_REFERENCE_LENGTH = 35;
@@ -59,6 +60,24 @@ export function paymentOutcomeCopy(status: PaymentStatus): { header: string; tit
         tone: 'warning',
       };
   }
+}
+
+/** For a payment Global Connect is holding: who can approve it and until when, or that nobody can. Null for any other payment. */
+export function heldPaymentCopy(payment: Payment): { body: string; tone: 'warning' | 'danger' } | null {
+  const hold = payment.held;
+  if (!hold || hold.state !== 'awaiting_approval') return null;
+  const needed = hold.approvalsRequired === 1 ? 'someone else' : `${hold.approvalsRequired} other people`;
+  const expiry = formatDateTime(hold.expiresAt);
+  if (hold.approvers.length < hold.approvalsRequired) {
+    return {
+      tone: 'danger',
+      body: `This payment has not been sent. It has to be approved by ${needed}, and ${hold.approvers.length === 0 ? 'nobody else on this account can approve payments yet' : `only ${listNames(hold.approvers)} can approve payments on this account`}. Ask Global Connect to add an approver. If it is not approved by ${expiry} it will expire. No money has left your account.`,
+    };
+  }
+  return {
+    tone: 'warning',
+    body: `This payment has not been sent. It has to be approved by ${needed} first: ${listNames(hold.approvers)} can approve it. If it is not approved by ${expiry} it will expire. No money has left your account or been set aside for it.`,
+  };
 }
 
 export function NewPaymentScreen() {
@@ -156,14 +175,25 @@ export function NewPaymentScreen() {
   const send = useSingleFlight(async () => {
     if (!payee || amount === null || amountError || referenceError || outcomeUnknown || !outcome.ready) return;
     setNotice(null);
+    const signature = [payee.id, amount, currency, trimmedReference].join('|');
+    const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('payment');
+    const input: NewPayment = {
+      beneficiaryId: payee.id,
+      amount,
+      currency,
+      reference: trimmedReference,
+      // The provider requires a reason. Until the product decides what to ask, the reference is reused.
+      reason: trimmedReference,
+      idempotencyKey: key,
+    };
     const confirmed = await confirmAction({
       title: 'Send this payment?',
       message: `${formatMoney(amount, currency)} to ${payee.name}, ${describeBeneficiaryAccount(payee)}. Reference ${trimmedReference}.`,
       confirmLabel: 'Send payment',
+      // The authenticator code is tied to exactly this payment.
+      stepUp: { action: 'payment.create', payload: input },
     });
     if (!confirmed) return;
-    const signature = [payee.id, amount, currency, trimmedReference].join('|');
-    const key = attempt?.signature === signature ? attempt.key : newIdempotencyKey('payment');
     setAttempt({ signature, key });
     setSent({ beneficiaryId: payee.id, amount, currency, reference: trimmedReference });
     try {
@@ -174,15 +204,7 @@ export function NewPaymentScreen() {
       return;
     }
     try {
-      const payment = await createPayment.mutateAsync({
-        beneficiaryId: payee.id,
-        amount,
-        currency,
-        reference: trimmedReference,
-        // The provider requires a reason. Until the product decides what to ask, the reference is reused.
-        reason: trimmedReference,
-        idempotencyKey: key,
-      });
+      const payment = await createPayment.mutateAsync(input);
       await outcome.settle();
       finish(payment);
     } catch (caught) {
@@ -212,7 +234,8 @@ export function NewPaymentScreen() {
   });
 
   if (step === 'done' && result) {
-    const copy = paymentOutcomeCopy(result.status);
+    const heldCopy = heldPaymentCopy(result);
+    const copy = { ...paymentOutcomeCopy(result.status), ...heldCopy };
     const mismatch = sent !== null && !paymentMatchesRequest(result, sent);
     const Icon = copy.tone === 'positive' ? CircleCheck : copy.tone === 'warning' ? Clock : CircleAlert;
     const iconColor = copy.tone === 'positive' ? colors.positive : copy.tone === 'warning' ? colors.warningAccent : colors.danger;
