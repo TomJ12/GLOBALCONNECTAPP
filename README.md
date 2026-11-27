@@ -257,7 +257,7 @@ npx expo export -p web   # static web build in dist/
 
 cd server
 npm run typecheck
-npm test                 # node:test, 246 tests (about five minutes)
+npm test                 # node:test, 284 tests (about six minutes; the ops console file runs twice, once in each ops mode)
 ```
 
 Serve the web build with any static server that falls back to `index.html`, for example
