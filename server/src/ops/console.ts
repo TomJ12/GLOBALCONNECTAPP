@@ -42,11 +42,11 @@ import { randomToken, safeEqual, sha256 } from '../crypto';
 import { ApiError } from '../errors';
 import { maskEmail } from '../mailer';
 import { MAIL_MAX_ATTEMPTS, type MailQueue } from '../mail/queue';
-import { activationMail } from '../mail/templates';
+import { activationMail, mailOf } from '../mail/templates';
 import type { SecurityNotices } from '../notify/security';
 import type { AuthenticatorResets } from '../auth/authenticatorResets';
 import type { ProviderRegistry } from '../providers/adapter';
-import { emailDomain, hasControlCharacters, isEmail, nameKey } from '../validate';
+import { emailDomain, hasControlCharacters, isEmail, nameKey, plainText } from '../validate';
 import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type ApprovalsRequired, type AuditInput, type AuditParty, type CompanyRecord, type OpsRole, type OpsUserRecord, type ProviderKey, type Stores, type UserRecord } from '../store/types';
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { h, Html, layout, qrSvg, when } from './html';
@@ -201,7 +201,22 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       });
 
       const send = (reply: FastifyReply, status: number, page: string) => reply.status(status).type('text/html; charset=utf-8').send(page);
-      const chromeOf = (ctx: OpsContext, title: string, flash?: string) => ({ title, user: ctx.user, csrf: csrfFor(ctx.token), flash });
+      /**
+       * SINGLE-PERSON MODE, said on every page when nobody is told afterwards: one staff account can do everything
+       * alone, and no oversight address is configured. (It can only be configured in the server's settings.)
+       */
+      const NO_OVERSIGHT =
+        !config.fourEyes && config.opsOversightEmails.length === 0
+          ? 'Single-person mode is on and NO OVERSIGHT ADDRESS is configured: one member of staff carries out every action alone, and nobody is told afterwards. Whoever runs this server should set OPS_OVERSIGHT_EMAILS (it cannot be set from this console).'
+          : undefined;
+      /** Whether anything is waiting on the Approvals page (a request, an interrupted one, an authenticator reset in its delay). Worked out once per request. */
+      const waitingWork = new WeakMap<OpsContext, boolean>();
+      const noteWaiting = async (ctx: OpsContext): Promise<void> => {
+        if (config.fourEyes) return;
+        const open = (await stores.ops.approvals.count({ status: 'pending' })) + (await stores.ops.approvals.count({ status: 'applying' })) + (await stores.auth.authenticatorResets.count({ status: 'waiting' }));
+        waitingWork.set(ctx, open > 0);
+      };
+      const chromeOf = (ctx: OpsContext, title: string, flash?: string) => ({ title, user: ctx.user, csrf: csrfFor(ctx.token), flash, hideApprovals: !config.fourEyes && waitingWork.get(ctx) === false, warning: NO_OVERSIGHT });
       const problem = (reply: FastifyReply, ctx: OpsContext | null, error: unknown) => {
         const status = statusOf(error);
         if (error instanceof ApiError && error.options.retryAfterSeconds !== undefined) reply.header('Retry-After', String(error.options.retryAfterSeconds));
@@ -248,6 +263,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           if (!ctx) return reply.header('Set-Cookie', cookie(SESSION_COOKIE, '', true)).redirect('/ops/login', 303);
           try {
             if (options.admin && ctx.user.role !== 'ops_admin') throw new OpsError('Only an ops admin can do that.', 403, 'forbidden');
+            await noteWaiting(ctx);
             return await handler(ctx, request, reply);
           } catch (error) {
             return problem(reply, ctx, error);
@@ -295,6 +311,11 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         adminApproval?: boolean | ((params: Record<string, string>) => boolean);
         /** The result is an activation email; the approval page then says where it went. */
         mails?: boolean;
+        /**
+         * HIGH-IMPACT for oversight although no password is asked: giving a client access (a new client user, a
+         * membership, an activation link, re-enabling) and a margin change. Every action with `password` is too.
+         */
+        oversight?: boolean;
         /** Destructive or high-impact: its confirmation page is marked as such. */
         danger?: boolean | ((params: Record<string, string>) => boolean);
         /**
@@ -307,7 +328,6 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         apply(params: Record<string, string>, actors: Actors): Promise<Applied>;
       }
       const actions = new Map<string, ActionDef>();
-      const MARGIN_ACTION = 'company.margin';
       const needsApproval = (def: ActionDef, params: Record<string, string>): boolean =>
         config.fourEyes && (typeof def.fourEyes === 'function' ? def.fourEyes(params) : def.fourEyes === true);
       const needsAdminApproval = (def: ActionDef, params: Record<string, string>): boolean =>
@@ -391,6 +411,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         ops.post(url, { preHandler: limitAttempts }, async (request, reply) => {
           const ctx = await sessionOf(request);
           if (!ctx) return problem(reply, null, new OpsError('Your session has ended. Sign in again.', 401));
+          await noteWaiting(ctx);
           if (!fieldOk(request, ctx.token)) return problem(reply, ctx, new OpsError('This form could not be verified. Reload the page and try again.', 403));
           const form = (request.body ?? {}) as Form;
           const path = request.url.split('?')[0] as string;
@@ -446,6 +467,39 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           }
         });
 
+      /**
+       * OVERSIGHT. In single-person mode nobody sees a change before it happens, so somebody is told after: every
+       * high-impact action is put on record under one name (`ops.oversight`, which the console lists for a week
+       * for all staff) and, when OPS_OVERSIGHT_EMAILS is set, a short notice goes to those addresses through the
+       * mail queue in the security class (which ordinary mail cannot use up). Who, what, to whom, when; the old
+       * and new values where the action's own summary has them. No link, no code, nothing that does anything.
+       * Nothing in the console can turn it off or change where it goes. It never fails the action it reports.
+       */
+      const isHighImpact = (def: ActionDef, params: Record<string, string>): boolean => def.oversight === true || flagOf(def.password, params);
+      const oversee = async (def: ActionDef, params: Record<string, string>, summary: string, by: OpsUserRecord, approver: OpsUserRecord | null, target: AuditParty | null, source: string): Promise<void> => {
+        if (!isHighImpact(def, params)) return;
+        const at = now();
+        const what = plainText(summary, 600);
+        const to = config.opsOversightEmails;
+        try {
+          const id = randomToken().slice(0, 16);
+          for (const address of to) {
+            await mail.enqueue(mailOf({ to: address, template: 'ops.oversight', data: { what, by: by.email, approvedBy: approver?.email ?? null, at, mode: config.fourEyes ? 'two-person' : 'single' }, key: `oversight:${id}:${address}`, category: 'security' }));
+          }
+          await append(opsParty(by), 'ops.oversight', 'success', target, source, { action: def.name, what, ...(approver ? { approvedBy: approver.email } : {}), notice: to.length > 0 ? `queued for ${to.length} oversight address${to.length === 1 ? '' : 'es'}` : 'no oversight address is configured' });
+        } catch (error) {
+          app.log.error({ message: error instanceof Error ? error.message : 'unknown error', action: def.name }, 'an oversight notice could not be recorded');
+        }
+      };
+      /** The last week's high-impact actions, for every member of staff: on the console's first page and on Approvals. */
+      const recentHighImpact = async (): Promise<Html | string> => {
+        const entries = await stores.audit.query({ action: 'ops.oversight', from: now() - 7 * 24 * 60 * 60_000, limit: 100 });
+        if (entries.length === 0) return '';
+        return h`<div class="card"><h2>High-impact changes in the last 7 days</h2><p class="muted">${config.fourEyes ? 'Each of these was carried out with a second member of staff.' : 'In single-person mode each of these was carried out by one member of staff alone.'} ${config.opsOversightEmails.length > 0 ? 'A notice of each was also sent to the oversight address.' : 'No oversight address is configured, so this list and the audit log are the only record.'}</p><table><tr><th>When</th><th>By</th><th>What</th></tr>${entries.map(
+          (entry) => h`<tr><td>${when(entry.at)}</td><td>${entry.actor.label}${entry.detail.approvedBy ? `, approved by ${entry.detail.approvedBy}` : ''}</td><td>${entry.detail.what ?? ''}</td></tr>`,
+        )}</table></div>`;
+      };
+
       /** Registers a console action: done at once, or turned into a request for a second staff member. */
       const action = (url: string, def: ActionDef) => {
         actions.set(def.name, def);
@@ -474,6 +528,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             const applied = await def.apply(prepared.params, { requester: ctx.user, approver: null, source });
             const about = applied.target ?? target;
             if (about) aim(about);
+            await oversee(def, prepared.params, prepared.summary, ctx.user, null, about, source);
             return { detail: applied.detail, redirect: applied.redirect };
           }
           const request: ApprovalRecord = {
@@ -651,7 +706,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           anchor,
           'Reset your password',
           sent
-            ? h`<p class="flash">${SAME_ANSWER}</p><p class="muted">Lost your authenticator and your recovery codes as well? That cannot be done here: ask an ops admin, who needs a second ops admin’s approval.</p><p><a href="/ops/login">Back to sign-in</a></p>`
+            ? h`<p class="flash">${SAME_ANSWER}</p><p class="muted">Lost your authenticator and your recovery codes as well? That cannot be done here: ask ${config.fourEyes ? 'an ops admin, who needs a second ops admin’s approval' : 'another ops admin, or whoever runs the server (the break-glass command)'}.</p><p><a href="/ops/login">Back to sign-in</a></p>`
             : h`${alert(message)}<form method="post" action="/ops/forgot">${hidden(anchor)}<label>Email <input type="email" name="email" required autocomplete="username"></label><button>Email me a reset link</button></form><p class="muted">The link alone changes nothing: you will also need a code from your authenticator app, or a recovery code.</p><p><a href="/ops/login">Back to sign-in</a></p>`,
           reply.statusCode,
         );
@@ -726,6 +781,8 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
       /** A one-line form. Its button leads to the confirmation page; nothing is done before that. `request` marks an action that only creates a request for approval. */
       const form = (ctx: OpsContext, url: string, fields: Html, button: string, options: { danger?: boolean; request?: boolean } = {}) =>
         h`<form method="post" action="${url}">${csrfInput(ctx)}<div class="row tight">${fields}<button${options.danger ? h` class="danger"` : ''}>${options.request && config.fourEyes ? `Request: ${button}` : button}</button></div></form>`;
+      /** ", which needs a second staff member": said only when it does. */
+      const TWO = config.fourEyes ? ', which needs a second staff member' : '';
       const fourEyesNote = config.fourEyes ? h`<p class="muted">Needs approval by a second staff member before it takes effect.</p>` : h``;
       const search = (url: string, q: string, label: string) =>
         h`<form method="get" action="${url}"><label>${label} <input type="search" name="q" value="${q}"></label><button class="quiet">Search</button></form>`;
@@ -734,7 +791,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         h`<select name="${name}">${blank && h`<option value="">—</option>`}${roles.map((role) => h`<option value="${role}"${role === current ? h` selected` : ''}>${role}</option>`)}</select>`;
       const VERIFY_WARNING =
         'Verify this person’s identity BEFORE resetting. The new activation link is emailed to the address on file; whoever controls that mailbox controls the account. Use a contact detail already on file, not one given in the request.';
-      const verifyField = h`<label>How was identity verified? (kept in the audit log and shown to the approver) <textarea name="verification" required minlength="10" maxlength="500" rows="2"></textarea></label>`;
+      const verifyField = h`<label>How was identity verified? (kept in the audit log${config.fourEyes ? ' and shown to the approver' : ''}) <textarea name="verification" required minlength="10" maxlength="500" rows="2"></textarea></label>`;
       const needVerification = (input: Form): string => {
         const value = text(input, 'verification');
         if (value.length < 10 || value.length > 500) throw new OpsError('Say how the person’s identity was verified (10 to 500 characters).');
@@ -829,10 +886,18 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
        * (to carry it out) only while the requester could still make the request.
        */
       const assertMayDecide = async (item: ApprovalRecord, def: ActionDef | undefined, user: OpsUserRecord, carryingOut: boolean): Promise<OpsUserRecord | null> => {
-        if (item.requestedBy.id === user.id) throw new OpsError('You cannot approve, finish or close your own request. A different staff member must do it.', 403, 'own_request');
         if (item.target?.type === 'ops' && item.target.id === user.id) throw new OpsError('This request is about your own account, so you cannot decide it.', 403, 'self');
-        // Who is staff, and where a company's money is, are decided by two ops ADMINS.
-        if (def && needsAdminApproval(def, item.params) && user.role !== 'ops_admin') throw new OpsError('Only an ops admin can approve this kind of request.', 403, 'admin_approval');
+        if (config.fourEyes) {
+          if (item.requestedBy.id === user.id) throw new OpsError('You cannot approve, finish or close your own request. A different staff member must do it.', 403, 'own_request');
+          // Who is staff, and where a company's money is, are decided by two ops ADMINS.
+          if (def && needsAdminApproval(def, item.params) && user.role !== 'ops_admin') throw new OpsError('Only an ops admin can approve this kind of request.', 403, 'admin_approval');
+        } else {
+          // SINGLE-PERSON MODE, and a request left from two-person mode: the person who made it may carry it out or
+          // close it themselves, as they could now do the action directly; and so may any ops admin when it is one
+          // of the kinds that only ops admins decide. Nobody else's request is carried out by an ops user.
+          const adminKind = def !== undefined && (def.admin === true || needsAdminApproval(def, item.params));
+          if (item.requestedBy.id !== user.id && !(adminKind && user.role === 'ops_admin')) throw new OpsError('In single-person mode a request is carried out or closed by the member of staff who made it (or, for the kinds only ops admins decide, by an ops admin).', 403, 'not_requester');
+        }
         if (!carryingOut) return null;
         const requester = await stores.ops.users.get(item.requestedBy.id);
         if (!def || !requester || !isActiveStaff(requester) || (def.admin && requester.role !== 'ops_admin')) throw new OpsError('The staff member who made this request can no longer make it. Reject or close it instead.', 409, 'requester_inactive');
@@ -869,6 +934,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               : null,
         );
         if (done?.status !== 'approved') throw new OpsError('This request is no longer being carried out.', 409, 'not_pending');
+        await oversee(def, item.params, item.summary, requester, approver.id === requester.id ? null : approver, target, source);
       };
       /** How often this approver has been the one to approve this requester lately. Shown to the approver, and kept with the approval. */
       const pairHistory = async (requesterId: string, approverId: string): Promise<{ byRequester: number; byPair: number; flag: boolean }> => {
@@ -888,14 +954,6 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const interrupted = all.filter((item) => item.status === 'applying' && !carrying.has(item.id));
         const resets = (await authenticatorResets.waitingWithWarning()).sort((a, b) => a.dueAt - b.dueAt);
         const people = new Map(await Promise.all(resets.map(async (item) => [item.userId, await stores.directory.getUser(item.userId)] as const)));
-        // ONE PERSON CAN CHANGE A MARGIN, so everybody else is shown that it happened: the last seven days, who and when.
-        const marginChanges = await stores.audit.query({ action: 'ops.margin.changed', from: now() - 7 * 24 * 60 * 60_000, limit: 100 });
-        const marginCard =
-          marginChanges.length > 0
-            ? h`<div class="card"><h2>Margin changes in the last 7 days</h2><p class="muted">A margin is changed by one member of staff, without a second approval. Each change is listed here for everybody else, and is in the audit log (ops.margin.changed).</p><table><tr><th>When</th><th>Company</th><th>Changed by</th><th>From</th><th>To</th></tr>${marginChanges.map(
-                (entry) => h`<tr><td>${when(entry.at)}</td><td>${entry.target?.id ? h`<a href="/ops/companies/${entry.target.id}">${entry.detail.company ?? entry.target.label}</a>` : (entry.detail.company ?? '')}</td><td>${entry.actor.label}</td><td>${entry.detail.from ?? ''}</td><td>${entry.detail.to ?? ''}</td></tr>`,
-              )}</table></div>`
-            : '';
         const resetsCard =
           resets.length > 0
             ? h`<div class="card"><h2>Authenticator resets waiting out their delay</h2><p class="muted">Approved, and nothing has changed yet. Each takes effect at the time shown unless the client signs in with their current credentials first, or an ops admin cancels it.</p><table><tr><th>Client</th><th>Requested by</th><th>Approved by</th><th>Takes effect</th><th></th></tr>${resets.map(
@@ -907,7 +965,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           200,
           layout(
             chromeOf(ctx, 'Approvals', flashOf(request)),
-            h`${marginCard}${resetsCard}${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
+            h`${await recentHighImpact()}${resetsCard}${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
 <div class="card"><h2>Decided (latest 50)</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th>Decided</th></tr>${all.filter((item) => item.status !== 'pending' && item.status !== 'applying').slice(0, 50).map(row)}</table></div>`,
           ),
         );
@@ -934,12 +992,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
 <div>${
               item.status === 'applying'
                 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">This was approved by ${item.decidedBy?.email ?? 'someone'} and then interrupted while being carried out. It may be partly done.</p>${carrying.has(item.id) ? h`<p class="warn">It is being carried out right now. Wait for it to finish.</p>` : ''}${staleApplying(item) ? h`<p class="warn">It was approved more than ${String(Math.round(config.approvalTtlMs / 3_600_000))} hours ago: too long ago to finish without looking again. It can only be closed.</p>` : ''}${
-                    mine || aboutMe ? h`<p class="muted">It is your own request: a different staff member must finish or close it.</p>` : h`${form(ctx, `${base}/resume`, h``, 'Finish carrying it out')}${form(ctx, `${base}/abandon`, h``, 'Close without finishing', { danger: true })}`
+                    aboutMe || (mine && config.fourEyes) ? h`<p class="muted">It is your own request: a different staff member must finish or close it.</p>` : h`${form(ctx, `${base}/resume`, h``, 'Finish carrying it out')}${form(ctx, `${base}/abandon`, h``, 'Close without finishing', { danger: true })}`
                   }</div>`
                 : item.status !== 'pending'
                 ? h`<div class="card"><p class="muted">This request is ${item.status}.</p></div>`
                 : mine
-                  ? h`<div class="card"><h2>Your request</h2><p class="muted">You cannot approve your own request. A different staff member must do it.</p>${form(ctx, `${base}/cancel`, h``, 'Cancel request')}</div>`
+                  ? config.fourEyes || aboutMe
+                    ? h`<div class="card"><h2>Your request</h2><p class="muted">You cannot approve your own request. A different staff member must do it.</p>${form(ctx, `${base}/cancel`, h``, 'Cancel request')}</div>`
+                    : h`<div class="card"><h2>Your request</h2><p class="muted">This request was made when a second member of staff had to approve. The console is now in single-person mode: you can carry it out yourself, or cancel it.</p>${form(ctx, `${base}/approve`, h``, 'Carry it out now')}${form(ctx, `${base}/cancel`, h``, 'Cancel request')}</div>`
                   : h`<div class="card"><h2>Decide</h2>${
                       aboutMe
                         ? h`<p class="muted">This request is about your own account, so you cannot approve it.</p>`
@@ -956,10 +1016,6 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         if (item.target) aim(item.target);
         const def = actions.get(item.action);
         if (!def || item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
-        // A margin change is no longer a request (one person makes it directly). One left over from before is NOT carried
-        // out: its worked example and its "from" are old. Its requester cancels it (anyone else can reject it) and whoever
-        // wants the change makes it on the company's page.
-        if (item.action === MARGIN_ACTION) throw new OpsError('Margin changes no longer need a second person, so this request cannot be approved. Its requester can cancel it (anyone else can reject it); the change itself is made on the company’s page.', 409, 'superseded');
         // Four eyes: never the person who asked, and never the person the request is about (see assertMayDecide).
         const requester = (await assertMayDecide(item, def, ctx.user, true)) as OpsUserRecord;
         const history = await pairHistory(item.requestedBy.id, ctx.user.id);
@@ -1186,7 +1242,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               'Change payment approvals',
               { request: true },
             )}</div>
-<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount (the trade’s size in the tier currency, converted at the provider’s rate); otherwise the default. A client is shown a rate for each direction and can estimate a midpoint from those, as from any two-way price; no field names the margin. A change takes effect as soon as you confirm it: no second person is needed. It is recorded in your name and listed for the other staff under Approvals.</p>`, 'Change FX margin')}</div>
+<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount (the trade’s size in the tier currency, converted at the provider’s rate); otherwise the default. A client is shown a rate for each direction and can estimate a midpoint from those, as from any two-way price; no field names the margin. ${config.fourEyes ? 'A change needs a second staff member, an ops admin, who types their password again.' : 'A change takes effect as soon as you confirm it. It is recorded in your name and listed with the week’s high-impact changes for the other staff.'}</p>`, 'Change FX margin', { request: true })}</div>
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
                 ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company', { request: true })
@@ -1363,14 +1419,17 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         }
       };
       action('/companies/:id/margin', {
-        name: MARGIN_ACTION,
-        // What every client of this company pays on every conversion. ONE member of staff changes it, at once (a
-        // product decision: either of two people must be able to, alone, at any time). So there is no second
-        // approver and no password re-check for THIS action; in their place the confirmation page with the worked
-        // example, the bounds, an audit entry of its own (`ops.margin.changed`, written with the change) and a
-        // list of recent margin changes that every other member of staff sees on the Approvals page.
-        fourEyes: false,
+        name: 'company.margin',
+        // What every client of this company pays on every conversion. In single-person mode ONE member of staff
+        // changes it, at once, with the confirmation page (worked example, old and new values) and NO password: a
+        // margin has to be changeable at any moment by whoever is in. It is high-impact all the same: its own audit
+        // entry (`ops.margin.changed`, written with the change), the week's list for all staff, and the oversight
+        // notice. In two-person mode it is a request that an ops admin approves with their password, as before.
+        fourEyes: true,
+        adminApproval: true,
         danger: true,
+        password: () => config.fourEyes,
+        oversight: true,
         async prepare({ form: input, params, aim }) {
           const company = await companyOf(params.id);
           aim(companyParty(company));
@@ -1388,14 +1447,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             const other = await providerRateFor(company, item.pair);
             if (other) examples.push(workedExample(current, wanted, other, item.pair, '10000', item.direction === 'buy' ? 'buy' : 'sell'));
           }
-          const warnings = [`Every conversion this company’s people book from the moment you confirm is priced with the new margin. Nobody else approves this: it is recorded in your name and shown to the other staff.`, `A quote one of them is holding from before the change cannot be booked: they are told it has expired and get a new one at the new margin.`];
+          const warnings = [config.fourEyes ? 'Every conversion this company’s people book from the moment this is approved is priced with the new margin.' : 'Every conversion this company’s people book from the moment you confirm is priced with the new margin. Nobody else approves this: it is recorded in your name and shown to the other staff.', `A quote one of them is holding from before the change cannot be booked: they are told it has expired and get a new one at the new margin.`];
           const highest = Math.max(wanted.defaultBps, wanted.forwardBps ?? 0, ...wanted.overrides.map((item) => item.bps), ...wanted.tiers.map((item) => item.bps));
           if (highest > MARGIN_USUAL_MAX_BPS) warnings.push(`This sets a margin of ${marginPercent(highest)}, above the usual limit of ${marginPercent(MARGIN_USUAL_MAX_BPS)}. It was asked for explicitly.`);
           if (wanted.defaultBps === 0) warnings.push('The default margin becomes ZERO: Global Connect earns nothing on this company’s conversions unless an override or tier applies.');
           if (rates.appliedBy(company) === 'provider') warnings.push('For this company’s provider the margin is applied BY THE PROVIDER (MARGIN_APPLIED_BY_… = provider). This configuration is stored but is NOT used to price anything while that is so.');
           return {
             params: { id: company.id, config: JSON.stringify(wanted), from: JSON.stringify(current), allowHigh: allowHigh ? 'yes' : 'no' },
-            summary: `Change the FX margin for company ${describe(company)} FROM ${describeMargin(current)}${record ? '' : ' (the server default)'} TO ${describeMargin(wanted)}. Worked example at the provider’s rate now: ${examples.join('; ')}.`,
+            summary: `Change the FX margin for company ${describe(company)} FROM ${describeMargin(current)}${record ? '' : ' (the server default)'} TO ${describeMargin(wanted)}. Worked example at the provider’s rate ${config.fourEyes ? 'when this was requested' : 'now'}: ${examples.join('; ')}.`,
             warnings,
           };
         },
@@ -1511,7 +1570,7 @@ ${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s 
             return {
               params: { id: company.id },
               summary: `${deactivate ? 'Deactivate' : 'Reactivate'} company ${describe(company)}`,
-              warnings: [deactivate ? `${people}. None of them will be able to select or use this company until it is reactivated, which needs a second staff member.` : `${people} and will be able to use it again.`],
+              warnings: [deactivate ? `${people}. None of them will be able to select or use this company until it is reactivated${TWO}.` : `${people} and will be able to use it again.`],
             };
           },
           async apply(params) {
@@ -1532,7 +1591,7 @@ ${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s 
           200,
           layout(
             chromeOf(ctx, 'Client users', flashOf(request)),
-            h`<div class="toolbar">${search('/ops/users', q, 'Search name or email')}<a class="button" href="/ops/users/new">New client user</a></div>
+            h`${await recentHighImpact()}<div class="toolbar">${search('/ops/users', q, 'Search name or email')}<a class="button" href="/ops/users/new">New client user</a></div>
 <div class="card"><table><tr><th>Name</th><th>Email</th><th>Status</th><th>Last sign-in</th></tr>${users.map(
               (user) => h`<tr><td><a href="/ops/users/${user.id}">${user.name}</a></td><td>${user.email}</td><td>${user.disabledAt ? tag(false, '', 'Disabled') : tag(user.activatedAt !== null, 'Activated', 'Not activated')}</td><td>${when(user.lastSignInAt)}</td></tr>`,
             )}</table>${users.length === 0 && h`<p class="muted">No client users found.</p>`}</div>`,
@@ -1580,6 +1639,7 @@ ${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s 
       action('/users', {
         name: 'client.create',
         fourEyes: true,
+        oversight: true,
         async prepare({ form: input }) {
           const { name, email, memberships } = await newClientOf(input);
           const params: Record<string, string> = { name, email };
@@ -1643,7 +1703,7 @@ ${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s 
 ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the failed-attempt count so the person can try again now.</p>${form(ctx, `${base}/unlock`, h``, 'Unlock account')}</div>`}
 <div class="card"><h2>Sessions</h2>${form(ctx, `${base}/revoke-sessions`, h``, 'Revoke all sessions')}</div>
 <div class="card"><h2>Notifications</h2><dl><dt>In the app</dt><dd>${String(notes.total)} kept, ${String(notes.unread)} unread${notes.latestAt !== null ? h` (the latest ${when(notes.latestAt)})` : ''}</dd><dt>Also by email</dt><dd>Rate alerts: ${notes.email.rates ? 'on' : 'off'}. Payments to approve: ${notes.email.approvals ? 'on' : 'off'}. Their own payments: ${notes.email.payments ? 'on' : 'off'}. Security notices: always on.</dd><dt>Rate alerts</dt><dd>${String(alertCounts.active)} on, ${String(alertCounts.triggered)} fired, ${String(alertCounts.paused)} paused</dd></dl><p class="muted">What a notification or an alert says is never shown to staff. Only the person can change these choices, in the app.</p></div>
-<div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2><p class="muted">A disabled person cannot sign in. Disabling ends every session at once. Re-enabling gives back the old password and authenticator, so it needs a second staff member.</p>${
+<div class="card"><h2>${user.disabledAt ? 'Re-enable' : 'Disable'}</h2><p class="muted">A disabled person cannot sign in. Disabling ends every session at once. Re-enabling gives back the old password and authenticator${config.fourEyes ? ', so it needs a second staff member' : ''}.</p>${
               user.disabledAt ? form(ctx, `${base}/enable`, h``, 'Re-enable user', { request: true }) : form(ctx, `${base}/disable`, h``, 'Disable user', { danger: true })
             }</div></div></div>`,
           ),
@@ -1652,6 +1712,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
       action('/users/:id/memberships', {
         name: 'client.membership.set',
         fourEyes: true,
+        oversight: true,
         async prepare({ form: input, params, aim }) {
           const user = await clientOf(params.id);
           aim(clientParty(user));
@@ -1682,7 +1743,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
           const company = await companyOf(text(input, 'companyId'));
           const role = (await stores.directory.membershipsOf(user.id)).find((item) => item.companyId === company.id)?.role;
           if (!role) throw new OpsError('The person is not in that company.');
-          return { params: { id: user.id, companyId: company.id }, summary: `Remove ${user.name} <${user.email}> (${role}) from ${describe(company)}`, warnings: ['They lose access to this company at once. Putting them back needs a second staff member.'] };
+          return { params: { id: user.id, companyId: company.id }, summary: `Remove ${user.name} <${user.email}> (${role}) from ${describe(company)}`, warnings: [`They lose access to this company at once.${config.fourEyes ? ' Putting them back needs a second staff member.' : ''}`] };
         },
         async apply(params) {
           const user = await clientOf(params.id);
@@ -1699,6 +1760,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
       action('/users/:id/activation-link', {
         name: 'client.activation_link',
         fourEyes: true,
+        oversight: true,
         mails: true,
         async prepare({ params, aim }) {
           aim(clientParty(await clientOf(params.id)));
@@ -1775,6 +1837,8 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         action(`/users/:id/${path}`, {
           name,
           fourEyes,
+          // Giving access back (re-enabling) is reported to the oversight address; taking it away is not.
+          oversight: fourEyes,
           danger: say.danger,
           async prepare({ params, aim }) {
             const user = await clientOf(params.id);
@@ -1790,7 +1854,7 @@ ${locked && h`<div class="card"><h2>Unlock</h2><p class="muted">Clears the faile
         });
       simple('unlock', 'client.unlock', 'unlocked', { verb: 'Unlock', consequence: () => 'Clears the count of failed sign-in attempts, so the person can try again now. Their password and authenticator are not changed.' }, async (user) => auth.unlock(user));
       simple('revoke-sessions', 'client.revoke_sessions', 'revoked', { verb: 'Revoke all sessions of', consequence: (sessions) => `Ends their ${sessions}. They are signed out everywhere and can sign in again.` }, async (user, { requester, source }) => ({ sessions: String(await revokeClientSessions(requester, user, source, 'revoked by ops')) }));
-      simple('disable', 'client.disable', 'disabled', { verb: 'Disable', danger: true, consequence: (sessions) => `They cannot sign in until re-enabled, which needs a second staff member. Ends their ${sessions} and cancels any unused activation link.` }, async (user, { requester, source }) => {
+      simple('disable', 'client.disable', 'disabled', { verb: 'Disable', danger: true, consequence: (sessions) => `They cannot sign in until re-enabled${TWO}. Ends their ${sessions} and cancels any unused activation link.` }, async (user, { requester, source }) => {
         await stores.directory.updateUser(user.id, (current) => ({ ...current, disabledAt: now() }));
         await stores.auth.activations.deleteWhere({ userId: user.id });
         await revokeClientSessions(requester, user, source, 'user disabled');

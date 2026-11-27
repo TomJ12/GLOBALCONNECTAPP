@@ -3,8 +3,22 @@ import { afterEach, test } from 'node:test';
 
 import { assertStaffRemovalAllowed, CONFIRM_TTL_MS, OpsError } from '../src/ops/console';
 import { StoreConflict, type OpsRole } from '../src/store/types';
-import { loadConfig } from '../src/config';
-import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness, PASSWORD, TEST_DATA_KEY, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
+import { loadConfig, opsModeLine } from '../src/config';
+import { ADMIN_TOKEN, AMIRA, BEN, DANA, harness as baseHarness, PASSWORD, TEST_DATA_KEY, type Harness, confirmed, confirmTokenOf, OPS_PASSWORD } from './helpers';
+
+/**
+ * THIS WHOLE FILE RUNS IN BOTH OPS MODES. By itself it runs in two-person mode (sensitive actions are requested by
+ * one member of staff and approved by another), so that mode does not rot now that it is not the default.
+ * `ops.single.test.ts` runs the same file again in single-person mode: the `fourEyes` helper below then carries
+ * each action out with the one person who starts it, and the tests that are ABOUT the second person say so
+ * (`twoPerson`) and are skipped there, by name.
+ */
+const SINGLE = process.env.OPS_TEST_MODE === 'single';
+const harness: typeof baseHarness = (overrides = {}, ...rest) => baseHarness({ fourEyes: !SINGLE, ...overrides }, ...rest);
+/** A test about the second person: what two-person mode enforces. Skipped, visibly, when the file runs in single-person mode. */
+const twoPerson: typeof test = ((name: string, run: () => Promise<void>) => test(name, { skip: SINGLE ? 'two-person mode only' : false }, run)) as typeof test;
+/** A test of single-person mode itself. It sets the mode explicitly, and runs once (in the single-person run of this file). */
+const singlePerson: typeof test = ((name: string, run: () => Promise<void>) => test(name, { skip: SINGLE ? false : 'runs in the single-person run of this file (ops.single.test.ts)' }, run)) as typeof test;
 
 let h: Harness;
 afterEach(async () => h?.close());
@@ -144,6 +158,11 @@ const PASSWORD_APPROVALS = ['ops.staff.invite', 'ops.staff.role', 'ops.staff.dis
 async function fourEyes(requester: Staff, approver: Staff, url: string, form: Record<string, string> = {}) {
   const asked = await requester.act(url, form);
   assert.equal(asked.status, 303, `${url}: ${asked.body.slice(-300)}`);
+  // SINGLE-PERSON MODE: the person who started it has carried it out (confirmation page and, where asked, password). Nobody else is involved.
+  if (SINGLE) {
+    assert.doesNotMatch(asked.location, /^\/ops\/approvals\//, url);
+    return { id: idOf(asked.location), approved: asked, record: null as Awaited<ReturnType<typeof h.stores.ops.approvals.get>> };
+  }
   assert.match(asked.location, /^\/ops\/approvals\/req_[\w-]+\?done=requested$/, url);
   const id = idOf(asked.location);
   const approved = await approver.act(`/ops/approvals/${id}/approve`);
@@ -235,7 +254,7 @@ test('ops cookie: over https it is __Host-, Secure, with HSTS; a recovery code s
   assert.equal((await new Browser().get('/ops/login')).headers['strict-transport-security'], undefined);
 });
 
-test('ops: roles. ops manages clients but not staff or company mappings, and cannot approve them; ops_admin does', async () => {
+twoPerson('ops: roles. ops manages clients but not staff or company mappings, and cannot approve them; ops_admin does', async () => {
   h = await harness();
   const { admin, second: olu } = await adminAndOps();
   assert.equal((await olu.browser.get('/ops/staff')).status, 403);
@@ -307,7 +326,7 @@ test('ops: roles. ops manages clients but not staff or company mappings, and can
   assert.equal((await h.stores.directory.getCompany('co_northfield'))?.name, 'Northfield Trading Limited');
 });
 
-test('ops: every action needs its confirmation (bound to session, action and payload, once), never a code, and is written to the audit log', async () => {
+twoPerson('ops: every action needs its confirmation (bound to session, action and payload, once), never a code, and is written to the audit log', async () => {
   h = await harness();
   await h.activate(AMIRA);
   const { admin, second } = await pair();
@@ -341,8 +360,8 @@ test('ops: every action needs its confirmation (bound to session, action and pay
     role: route.startsWith('/ops/staff') ? 'ops' : 'approver',
     verification: 'Called back on the number on file',
     approvalsRequired: '2',
-    defaultBps: '65',
-    forwardBps: '',
+    defaultPercent: '0.65',
+    forwardPercent: '',
     overrides: '',
     tiers: '',
   });
@@ -453,7 +472,7 @@ test('ops: every action needs its confirmation (bound to session, action and pay
   assert.equal(refusal?.target?.label, BEN);
 });
 
-test('ops: CSRF. A post without the field, with a wrong field or from another site is refused; the pre-login anchor is the server\'s own', async () => {
+twoPerson('ops: CSRF. A post without the field, with a wrong field or from another site is refused; the pre-login anchor is the server\'s own', async () => {
   h = await harness();
   const { admin, second: other } = await pair();
   const form = { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' };
@@ -531,7 +550,7 @@ test('separation: a client session never works on /ops and an ops session never 
   assert.equal((await admin.browser.get('/ops/users')).status, 200);
 });
 
-test('ops: an admin cannot demote, disable or reset themselves, and the last active admin cannot be removed', async () => {
+twoPerson('ops: an admin cannot demote, disable or reset themselves, and the last active admin cannot be removed', async () => {
   h = await harness();
   const { admin, second } = await adminAndOps();
   assert.equal((await admin.act(`/ops/staff/${admin.id}/role`, { role: 'ops' })).status, 403);
@@ -569,7 +588,7 @@ test('ops: an admin cannot demote, disable or reset themselves, and the last act
   assert.equal((await boss.act(`/ops/staff/${boss.id}/role`, { role: 'ops' })).status, 403);
 });
 
-test('ops: company and client set up with approval; the link goes by email only; the client sees only that company; reset kills old credentials', async () => {
+twoPerson('ops: company and client set up with approval; the link goes by email only; the client sees only that company; reset kills old credentials', async () => {
   h = await harness();
   const { admin, second } = await pair();
   const company = await fourEyes(admin, second, '/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' });
@@ -643,7 +662,7 @@ test('ops: company and client set up with approval; the link goes by email only;
   for (const page of [...admin.browser.pages.slice(8), ...second.browser.pages.slice(8)]) assert.doesNotMatch(page.replace(/name="(code|activationCode)"/g, ''), LINK_OR_CODE);
 });
 
-test('ops: disable ends sessions and blocks sign-in and activation; unlock and revoke-all work; removing a membership takes effect', async () => {
+twoPerson('ops: disable ends sessions and blocks sign-in and activation; unlock and revoke-all work; removing a membership takes effect', async () => {
   h = await harness();
   const { secret } = await h.activate(AMIRA);
   const { admin, second } = await pair();
@@ -691,7 +710,7 @@ test('ops: disable ends sessions and blocks sign-in and activation; unlock and r
   assert.equal((await h.call('GET', '/v1/balances', { token: back.json.token })).status, 403);
 });
 
-test('H1: a lone staff member cannot obtain a working client credential by any console path', async () => {
+twoPerson('H1: a lone staff member cannot obtain a working client credential by any console path', async () => {
   h = await harness();
   const amira = await h.activate(AMIRA);
   const session = (await h.login(AMIRA, amira.secret)).json.token as string;
@@ -741,7 +760,7 @@ test('H1: a lone staff member cannot obtain a working client credential by any c
   assert.deepEqual(h.opsRoutes.map((route) => route.url).filter((url) => /impersonat|login-as|act-as|session|token|password/i.test(url) && !/^\/ops\/(activate\/password|users\/:id\/revoke-sessions)$/.test(url)), []);
 });
 
-test('four-eyes: requests wait for a different staff member, can be rejected or cancelled, expire after 24 hours and are carried out once', async () => {
+twoPerson('four-eyes: requests wait for a different staff member, can be rejected or cancelled, expire after 24 hours and are carried out once', async () => {
   h = await harness();
   const { admin, second } = await pair();
   const ask = async (who: Staff) => idOf((await who.act('/ops/users/usr_ben/activation-link')).location);
@@ -791,7 +810,7 @@ test('four-eyes: requests wait for a different staff member, can be rejected or 
   assert.equal(h.outbox.sent.length, 1);
 });
 
-test('four-eyes can be switched off only in explicit development mode, and then actions take effect at once', async () => {
+test('single-person mode (set explicitly): an action takes effect at once, for the one member of staff who starts it', async () => {
   h = await harness({ fourEyes: false });
   const admin = await staff();
   const reply = await admin.act('/ops/users/usr_ben/activation-link');
@@ -801,7 +820,7 @@ test('four-eyes can be switched off only in explicit development mode, and then 
   assert.doesNotMatch((await admin.browser.get(reply.location)).body, LINK_OR_CODE);
 });
 
-test('H2: a company can be mapped only by an ops admin, with approval, to a real provider account that no other company uses', async () => {
+twoPerson('H2: a company can be mapped only by an ops admin, with approval, to a real provider account that no other company uses', async () => {
   h = await harness();
   const { admin, second } = await adminAndOps();
   const boss = await staff('boss@globalconnect.example', 'ops_admin');
@@ -1002,7 +1021,7 @@ test('bootstrap: the operator command creates ops admins only while fewer than t
   assert.match((await (await staff('viewer@globalconnect.example', 'ops')).browser.get('/ops/audit?action=ops.staff.new')).body, /<tr class="alert">/);
 });
 
-test('ops: a company\'s payment approval rule is changed by request, approved only by an ops admin, audited, and the console warns when nobody could approve', async () => {
+twoPerson('ops: a company\'s payment approval rule is changed by request, approved only by an ops admin, audited, and the console warns when nobody could approve', async () => {
   h = await harness();
   const admin = await staff();
   const olu = await staff('olu@globalconnect.example', 'ops');
@@ -1060,7 +1079,7 @@ test('ops: a company\'s payment approval rule is changed by request, approved on
   assert.deepEqual([companies.find((company) => company.id === 'co_castlebrook')?.providerAccountId, companies.find((company) => company.id === 'co_castlebrook')?.approvalsRequired], ['S00003', 2]);
 });
 
-test('ops confirmation: says exactly what will happen, works once, marks high-impact changes, and asks for the password only for the highest-impact approvals', async () => {
+twoPerson('ops confirmation: says exactly what will happen, works once, marks high-impact changes, and asks for the password only for the highest-impact approvals', async () => {
   h = await harness();
   const admin = await staff();
   const boss = await staff('boss@globalconnect.example', 'ops_admin');
@@ -1181,7 +1200,7 @@ test('ops confirmation: says exactly what will happen, works once, marks high-im
   assert.equal((await h.stores.directory.getUser('usr_dana'))?.disabledAt ?? null, null);
 });
 
-test('ops behind the demo gate: sign-in, CSRF and the confirmation flow work unchanged, and the gate cookie is not a staff session', async () => {
+twoPerson('ops behind the demo gate: sign-in, CSRF and the confirmation flow work unchanged, and the gate cookie is not a staff session', async () => {
   h = await harness({ demoAccessPassword: 'orchard-lantern-47-quay' });
   // Without the gate cookie there is no console at all.
   assert.equal((await h.app.inject({ method: 'GET', url: '/ops/login', headers: { accept: 'text/html' } })).headers.location, '/demo-access?next=%2Fops%2Flogin');
@@ -1278,7 +1297,7 @@ test('H3: a company edit that is waiting for the provider does not undo a deacti
   assert.equal((await directory.getCompany('co_castlebrook'))?.deactivatedAt, 5);
 });
 
-test('M3: a company cannot be re-pointed, by request or by approval, while one of its payments is being sent; the request says how many are waiting', async () => {
+twoPerson('M3: a company cannot be re-pointed, by request or by approval, while one of its payments is being sent; the request says how many are waiting', async () => {
   h = await harness();
   const { admin, second } = await pair();
   const amira = await client(AMIRA);
@@ -1320,7 +1339,7 @@ test('M3: a company cannot be re-pointed, by request or by approval, while one o
   assert.equal((await h.stores.directory.getCompany('co_northfield'))?.providerAccountId, 'sample-account-0003');
 });
 
-test('M7: one provider account, one company, and one company per name, are rules of the database: two approvals at the same moment make one company', async () => {
+twoPerson('M7: one provider account, one company, and one company per name, are rules of the database: two approvals at the same moment make one company', async () => {
   h = await harness({}, undefined, { storeLatency: true });
   const { admin, second } = await pair();
   const count = async () => (await h.stores.directory.listCompanies()).length;
@@ -1374,7 +1393,7 @@ test('M7: one provider account, one company, and one company per name, are rules
   assert.equal((await directory.getCompany('co_castlebrook'))?.name, 'Castlebrook Imports Ltd');
 });
 
-test('L3: an approved request that was interrupted is neither "approved" nor forgotten: it is finished once, or closed, and both are on record', async () => {
+twoPerson('L3: an approved request that was interrupted is neither "approved" nor forgotten: it is finished once, or closed, and both are on record', async () => {
   h = await harness();
   const { admin, second } = await pair();
   const olu = await staff('olu@globalconnect.example', 'ops');
@@ -1455,7 +1474,7 @@ test('L3: an approved request that was interrupted is neither "approved" nor for
 
 // --- Audit of 2ac6785 ---------------------------------------------------------------------------------
 
-test('N10: finishing or closing an interrupted request takes exactly the checks of approving it, is refused while the approval is still running, and an old one can only be closed', async () => {
+twoPerson('N10: finishing or closing an interrupted request takes exactly the checks of approving it, is refused while the approval is still running, and an old one can only be closed', async () => {
   h = await harness();
   const { admin, second } = await pair();
   const boss = await staff('boss@globalconnect.example', 'ops_admin');
@@ -1558,7 +1577,7 @@ test('N10: finishing or closing an interrupted request takes exactly the checks 
   assert.equal((await h.stores.ops.users.get(subject.id))?.role, 'ops', 'what was done stays done; the request says it may be partly done');
 });
 
-test('a change of a company\'s approval rule is written to the company as it is at that moment, not to a copy read earlier', async () => {
+twoPerson('a change of a company\'s approval rule is written to the company as it is at that moment, not to a copy read earlier', async () => {
   let deactivate = false;
   h = await harness({}, undefined, {
     storeLatency: true,
@@ -1581,7 +1600,7 @@ test('a change of a company\'s approval rule is written to the company as it is 
 
 // --- Email ------------------------------------------------------------------------------------------
 
-test('Mail page: staff see how many emails are waiting, sent, failed or held back, and which failed, without ever seeing a subject, a body, a link or a whole address', async () => {
+twoPerson('Mail page: staff see how many emails are waiting, sent, failed or held back, and which failed, without ever seeing a subject, a body, a link or a whole address', async () => {
   h = await harness();
   const { admin, second } = await pair();
   const olu = await staff('olu@globalconnect.example', 'ops');
@@ -1646,7 +1665,7 @@ const HOUR_MS = 60 * 60_000;
 const linksTo = (email: string) => h.outbox.sent.filter((message) => message.to === email && /\/activate#code=/.test(message.text));
 const noticesTo = (email: string) => h.outbox.sent.filter((message) => message.to === email && /^Security notice/.test(message.subject)).map((message) => message.text);
 
-test('authenticator reset: once approved NOTHING changes for 24 hours; the client is told at once; signing in cancels it; so can any ops admin; only then are the credentials cleared and the link sent', async () => {
+twoPerson('authenticator reset: once approved NOTHING changes for 24 hours; the client is told at once; signing in cancels it; so can any ops admin; only then are the credentials cleared and the link sent', async () => {
   h = await harness({ authenticatorResetDelayMs: 24 * HOUR_MS });
   const { admin, second } = await pair();
   const olu = await staff('olu@globalconnect.example', 'ops');
@@ -1886,7 +1905,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.equal(h.outbox.sent.length, count);
 });
 
-test('ops: ONE member of staff changes a company’s FX margin, in percentages, after a confirmation page with a worked example; bounded; audited and shown to the other staff; a held quote from before cannot be booked; revenue is for ops admins only', async () => {
+singlePerson('ops: ONE member of staff changes a company’s FX margin, in percentages, after a confirmation page with a worked example; bounded; audited and shown to the other staff; a held quote from before cannot be booked; revenue is for ops admins only', async () => {
   h = await harness();
   const admin = await staff();
   const olu = await staff('olu@globalconnect.example', 'ops');
@@ -1910,7 +1929,7 @@ test('ops: ONE member of staff changes a company’s FX margin, in percentages, 
   const page = await olu.browser.get('/ops/companies/co_northfield');
   assert.match(page.body, /<h2>FX margin<\/h2><p>Now: <strong>default 0\.50%; forwards as spot<\/strong> \(the server default: this company has no configuration of its own\)/);
   assert.match(page.body, /Default margin, as a percentage \(0\.50 is half of one percent; steps of 0\.01\) <input name="defaultPercent" inputmode="decimal" required maxlength="8" value="0\.50">/);
-  assert.match(page.body, /A change takes effect as soon as you confirm it: no second person is needed/);
+  assert.match(page.body, /A change takes effect as soon as you confirm it\. It is recorded in your name and listed with the week’s high-impact changes for the other staff\./);
   assert.doesNotMatch(page.body, /basis point|\d bp\b/);
   assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.2934', '1.3065']);
 
@@ -1977,10 +1996,11 @@ test('ops: ONE member of staff changes a company’s FX margin, in percentages, 
   assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, new RegExp(`Now: <strong>default 0\\.80%; forwards 1\\.20%; GBPUSD sell 0\\.40%; EURUSD both 0\\.35%; from GBP 50000: 0\\.60%</strong> \\(set [^)]* by ${olu.email}\\)`));
   // The form now shows what is stored, in percent, ready to be edited.
   assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, /name="defaultPercent"[^>]*value="0\.80">[^]*name="forwardPercent"[^>]*value="1\.20">[^]*>GBPUSD sell 0\.40\nEURUSD both 0\.35<\/textarea>[^]*>50000 0\.60<\/textarea>/);
-  // THE OTHER STAFF ARE SHOWN IT: a list of the last seven days' margin changes, with who and when, where they look for approvals.
-  const told = (await admin.browser.get('/ops/approvals')).body;
-  assert.match(told, new RegExp(`<h2>Margin changes in the last 7 days</h2>[^]*<td><a href="/ops/companies/co_northfield">Northfield Trading Ltd</a></td><td>${olu.email}</td><td>default 0\\.50%; forwards as spot</td><td>default 0\\.80%; forwards 1\\.20%; GBPUSD sell 0\\.40%; EURUSD both 0\\.35%; from GBP 50000: 0\\.60%</td>`));
-  assert.match((await pat.browser.get('/ops/approvals')).body, /Margin changes in the last 7 days/);
+  // THE OTHER STAFF ARE SHOWN IT: the week's high-impact changes, with who and when, on the console's first page (and on Approvals).
+  for (const path of ['/ops/users', '/ops/approvals']) {
+    assert.match((await admin.browser.get(path)).body, new RegExp(`<h2>High-impact changes in the last 7 days</h2>[^]*<td>${olu.email}</td><td>Change the FX margin for company “Northfield Trading Ltd” \\(co_northfield\\) FROM default 0\\.50%; forwards as spot \\(the server default\\) TO default 0\\.80%; forwards 1\\.20%; GBPUSD sell 0\\.40%; EURUSD both 0\\.35%; from GBP 50000: 0\\.60%\\.`), path);
+  }
+  assert.match((await pat.browser.get('/ops/users')).body, /High-impact changes in the last 7 days/);
   // The other company is untouched.
   assert.equal(await h.stores.margins.get('co_castlebrook'), null);
 
@@ -1999,23 +2019,42 @@ test('ops: ONE member of staff changes a company’s FX margin, in percentages, 
   assert.equal((await stored())?.defaultBps, 70);
   assert.equal((await audit('ops.margin.changed')).length, 2);
 
-  // A REQUEST LEFT OVER from when a margin change needed a second person: it cannot be approved (its figures are old).
-  // Its requester cancels it; the change itself is made on the company's page.
-  await h.stores.ops.approvals.put('req_leftover', { id: 'req_leftover', action: 'company.margin', params: { id: 'co_northfield', config: JSON.stringify({ defaultBps: 15, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP' }), from: JSON.stringify({ defaultBps: 70, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP' }), allowHigh: 'no' }, summary: 'Change the FX margin (made before one person could)', warnings: [], target: { type: 'company', id: 'co_northfield', label: 'Northfield Trading Ltd' }, requestedBy: { id: olu.id, email: olu.email }, requestedAt: h.clock.now, expiresAt: h.clock.now + 60 * 60_000, status: 'pending', decidedBy: null, decidedAt: null });
-  const leftover = await admin.act('/ops/approvals/req_leftover/approve');
-  assert.equal(leftover.status, 409);
-  assert.match(leftover.body, /Margin changes no longer need a second person, so this request cannot be approved\. Its requester can cancel it/);
-  assert.equal((await stored())?.defaultBps, 70);
-  assert.equal((await olu.act('/ops/approvals/req_leftover/cancel')).status, 303);
-  assert.equal((await h.stores.ops.approvals.get('req_leftover'))?.status, 'cancelled');
-  // EVERYTHING ELSE still takes two people: the same ops user asking for something else only makes a request.
-  const other = await olu.act('/ops/users/usr_ben/activation-link');
-  assert.match(other.location, /^\/ops\/approvals\/req_/);
-  assert.equal((await h.stores.ops.approvals.get(idOf(other.location)))?.status, 'pending');
+  // REQUESTS LEFT OVER from two-person mode (a database that was started in it before): in single-person mode the
+  // member of staff who made one carries it out or cancels it; for the kinds only ops admins decide, so may an ops
+  // admin; another ops user may not. What it does is still checked when it is carried out.
+  const from = JSON.stringify((await h.rates.marginOf('co_northfield')).config);
+  const leftover = (id: string, bps: number, basedOn = from) =>
+    h.stores.ops.approvals.put(id, { id, action: 'company.margin', params: { id: 'co_northfield', config: JSON.stringify({ defaultBps: bps, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP' }), from: basedOn, allowHigh: 'no' }, summary: `Change the FX margin to ${bps} (made in two-person mode)`, warnings: [], target: { type: 'company', id: 'co_northfield', label: 'Northfield Trading Ltd' }, requestedBy: { id: olu.id, email: olu.email }, requestedAt: h.clock.now, expiresAt: h.clock.now + 60 * 60_000, status: 'pending', decidedBy: null, decidedAt: null });
+  await leftover('req_left1', 15);
+  await leftover('req_left2', 25);
+  await leftover('req_left3', 35);
+  assert.match((await olu.browser.get('/ops/approvals/req_left1')).body, /The console is now in single-person mode: you can carry it out yourself, or cancel it\./);
+  assert.match((await olu.browser.get('/ops/users')).body, /<a href="\/ops\/approvals">Approvals<\/a>/, 'something is waiting, so the page is in the navigation');
+  assert.equal((await pat.act('/ops/approvals/req_left1/approve')).status, 403, 'another ops user does not carry out somebody else’s request');
+  h.clock.advance(1000);
+  assert.equal((await olu.act('/ops/approvals/req_left1/approve')).status, 303);
+  assert.equal((await stored())?.defaultBps, 15);
+  assert.equal((await h.stores.ops.approvals.get('req_left1'))?.status, 'approved');
+  // The second was written against the margin as it was: it has moved, so it is refused and stays to be cancelled.
+  const moved = await admin.act('/ops/approvals/req_left2/approve');
+  assert.match(moved.body, /changed by somebody else since you opened this/);
+  assert.equal((await stored())?.defaultBps, 15);
+  assert.equal((await olu.act('/ops/approvals/req_left2/cancel')).status, 303);
+  assert.equal((await h.stores.ops.approvals.get('req_left2'))?.status, 'cancelled');
+  // An ops admin may carry out one of the kinds only ops admins decide (a margin change is one), made by somebody else.
+  await leftover('req_left4', 45, JSON.stringify((await h.rates.marginOf('co_northfield')).config));
+  h.clock.advance(1000);
+  assert.equal((await admin.act('/ops/approvals/req_left4/approve')).status, 303);
+  assert.equal((await stored())?.defaultBps, 45);
+  assert.equal((await olu.act('/ops/approvals/req_left3/cancel')).status, 303);
+  assert.equal((await audit('ops.margin.changed')).length, 4);
+  // Nothing is waiting any more: the Approvals page leaves the navigation (it is still there by its address).
+  assert.doesNotMatch((await olu.browser.get('/ops/users')).body, /<a href="\/ops\/approvals">Approvals<\/a>/);
+  assert.equal((await olu.browser.get('/ops/approvals')).status, 200);
   // After a week the change is no longer on the list (it stays in the audit log).
   h.clock.advance(7 * 24 * 60 * 60_000 + 1000);
   await signIn(admin.browser, admin.email, admin.secret);
-  assert.doesNotMatch((await admin.browser.get('/ops/approvals')).body, /Margin changes in the last 7 days/);
+  assert.doesNotMatch((await admin.browser.get('/ops/users')).body, /High-impact changes in the last 7 days/);
   h.clock.advance(-(7 * 24 * 60 * 60_000 + 1000));
   for (const person of [admin, olu, pat]) {
     await signIn(person.browser, person.email, person.secret);
@@ -2091,7 +2130,7 @@ test('ops: staff see a person’s notification state (counts and choices), never
   assert.equal(h.opsRoutes.filter((route) => /notif|alert/i.test(route.url)).length, 0);
 });
 
-test('ops: the console says honestly whether the WARNING before an authenticator reset has been delivered, and that the delay has not started until it has', async () => {
+twoPerson('ops: the console says honestly whether the WARNING before an authenticator reset has been delivered, and that the delay has not started until it has', async () => {
   h = await harness({ authenticatorResetDelayMs: 24 * HOUR_MS });
   const { admin, second } = await pair();
   await h.activate(AMIRA);
@@ -2116,4 +2155,191 @@ test('ops: the console says honestly whether the WARNING before an authenticator
   await h.authenticatorResets.runDue();
   const due = new Date(h.clock.now + 24 * HOUR_MS).toISOString().slice(0, 19).replace('T', ' ');
   assert.match((await second.browser.get('/ops/users/usr_amira')).body, new RegExp(`The warning reached the mail server on [^;]+; it takes effect on ${due} UTC`));
+});
+
+singlePerson('SINGLE-PERSON MODE: one member of staff, alone, carries out every action through its confirmation page (with their password for the highest-impact ones); nothing that protects without a second person is lost; each high-impact action is reported to the oversight address', async () => {
+  h = await harness({ fourEyes: false, opsOversightEmails: ['director@oversight.example'], authenticatorResetDelayMs: 24 * 60 * 60_000, mailPerRecipientPerHour: 2 });
+  // THE ONLY member of staff there is. Nothing below needs a second one to exist.
+  const admin = await staff();
+  assert.equal((await h.stores.ops.users.list()).length, 1);
+  const from = admin.browser.pages.length;
+  const DIRECTOR = 'director@oversight.example';
+  const notices = () => h.outbox.sent.filter((message) => message.to === DIRECTOR);
+  const overseen = async () => (await audit('ops.oversight')).map((entry) => entry.detail.action).reverse();
+  /** Starts an action and returns its confirmation page: what it says, and whether it asks for the password. */
+  const shown = async (url: string, form: Record<string, string> = {}) => {
+    const page = await admin.browser.post(url, form);
+    assert.equal(page.status, 200, `${url}: ${page.body.slice(-300)}`);
+    assert.match(page.body, /This takes effect as soon as you confirm\./, url);
+    return { body: page.body, password: /type="password" name="password"/.test(page.body), danger: /class="card narrow confirm danger"/.test(page.body) };
+  };
+  /** The whole action by this one person; asserts whether the password was asked for, and that no request was made. */
+  const alone = async (url: string, form: Record<string, string>, password: boolean) => {
+    const page = await shown(url, form);
+    assert.equal(page.password, password, `${url}: password ${password ? 'must' : 'must not'} be asked for`);
+    if (password) {
+      // The wrong password: nothing is done.
+      const wrong = await confirmed((to, fields) => admin.browser.post(to, fields), url, form, 'not the password');
+      assert.equal(wrong.status, 400, url);
+      assert.match(wrong.body, /That is not your password\. Nothing was done/, url);
+    }
+    const done = await admin.act(url, form);
+    assert.equal(done.status, 303, `${url}: ${done.body.slice(-300)}`);
+    assert.doesNotMatch(done.location, /^\/ops\/approvals\//, url);
+    return { ...page, location: done.location };
+  };
+
+  // A COMPANY, mapped to a provider account: password. The provider is still asked, and an account another company uses is still refused.
+  const taken = await admin.act('/ops/companies', { name: 'Copy Ltd', provider: 'provider-b', providerAccountId: (await h.stores.directory.getCompany('co_castlebrook'))?.providerAccountId ?? '' });
+  assert.equal(taken.status, 409, taken.body.slice(-300));
+  await alone('/ops/companies', { name: 'Tideway Ltd', provider: 'provider-b', providerAccountId: 'S00002' }, true);
+  const companyId = (await h.stores.directory.listCompanies()).find((item) => item.name === 'Tideway Ltd')?.id as string;
+  assert.ok(companyId);
+  // A CLIENT USER in it: confirmation only. The email-domain check is on the confirmation page (there is no approver to show it to).
+  const created = await alone('/ops/users', { name: 'Chidi Eze', email: 'chidi@tideway.example', company1: companyId, role1: 'admin' }, false);
+  assert.match(created.body, /Email domain tideway\.example\. Nobody is in “Tideway Ltd” \([\w-]+\) yet, so there is nothing to compare it with/);
+  const userId = (await h.stores.directory.findUserByEmail('chidi@tideway.example'))?.id as string;
+  // AN ACTIVATION LINK: it goes to the address on file and is never shown to the member of staff.
+  const mailed = await alone(`/ops/users/${userId}/activation-link`, {}, false);
+  assert.equal(mailed.location, `/ops/users/${userId}?done=mailed_sent`);
+  assert.equal(h.outbox.sent.filter((message) => message.to === 'chidi@tideway.example' && /\/activate#code=/.test(message.text)).length, 1);
+  const chidi = await activateClient('chidi@tideway.example');
+  // ATTACHED to another company: the stranger's email domain is flagged on the confirmation page.
+  const attached = await alone(`/ops/users/${userId}/memberships`, { companyId: 'co_northfield', role: 'creator' }, false);
+  assert.match(attached.body, /tideway\.example/);
+  assert.match(attached.body, /northfield\.example/);
+  // DISABLED (taking access away: not reported) and RE-ENABLED (giving it back: reported).
+  await alone(`/ops/users/${userId}/disable`, {}, false);
+  await alone(`/ops/users/${userId}/enable`, {}, false);
+  // THE PAYMENT-APPROVAL RULE of a company: password.
+  await alone(`/ops/companies/${companyId}/approvals`, { approvalsRequired: '0' }, true);
+  assert.equal((await h.stores.directory.getCompany(companyId))?.approvalsRequired, 0);
+  // A MARGIN: confirmation only (it has to be changeable at any moment), high-impact all the same.
+  await admin.browser.get(`/ops/companies/${companyId}`);
+  const margin = await admin.browser.submit(`/ops/companies/${companyId}/margin`, { defaultPercent: '0.75' });
+  assert.doesNotMatch(margin.body, /name="password"/);
+  assert.equal((await admin.browser.submit(`/ops/companies/${companyId}/margin`)).status, 303);
+  assert.equal((await h.stores.margins.get(companyId))?.defaultBps, 75);
+  // RE-POINTED to another provider account: password; and still refused while one of its payments is being sent.
+  await alone('/ops/companies/co_castlebrook', { name: 'Castlebrook Imports Ltd', provider: 'provider-b', providerAccountId: 'S00003' }, true);
+  // A CLIENT'S AUTHENTICATOR RESET: password, the identity-verification text, AND THE COOLING-OFF: nothing changes yet, the client is warned, with the link that cancels.
+  assert.equal((await admin.act(`/ops/users/${userId}/reset-authenticator`, { verification: '' })).status, 400);
+  await alone(`/ops/users/${userId}/reset-authenticator`, { verification: 'Called back on the number on file' }, true);
+  assert.equal((await h.stores.directory.getUser(userId))?.totpSecret, chidi.secret, 'nothing is cleared during the delay');
+  assert.deepEqual((await h.stores.auth.authenticatorResets.list({ userId })).map((item) => item.status), ['waiting']);
+  const warning = h.outbox.sent.find((message) => message.to === 'chidi@tideway.example' && /It has NOT happened yet/.test(message.text));
+  assert.match(warning?.text ?? '', /\/cancel-reset#token=ar_/);
+  // STAFF: invited (password), only at the allowed email domain.
+  assert.equal((await admin.act('/ops/staff', { name: 'Outsider', email: 'someone@elsewhere.example', role: 'ops' })).status, 403);
+  await alone('/ops/staff', { name: 'New Colleague', email: 'new@globalconnect.example', role: 'ops' }, true);
+  const colleague = (await h.stores.ops.users.findByEmail('new@globalconnect.example'))?.id as string;
+  assert.equal(h.outbox.sent.filter((message) => message.to === 'new@globalconnect.example' && /\/ops\/activate#code=/.test(message.text)).length, 1);
+  await alone(`/ops/staff/${colleague}/role`, { role: 'ops_admin' }, true);
+  await alone(`/ops/staff/${colleague}/disable`, {}, true);
+  // ABOUT YOUR OWN ACCOUNT: still refused, alone or not. And the last active admin cannot be removed.
+  for (const [path, form] of [['role', { role: 'ops' }], ['disable', {}], ['reset-authenticator', { verification: 'it is me, honestly' }]] as const) {
+    const self = await admin.act(`/ops/staff/${admin.id}/${path}`, form);
+    assert.equal(self.status, 403, path);
+    assert.match(self.body, /your own account/, path);
+  }
+  assert.equal((await h.stores.ops.users.get(admin.id))?.role, 'ops_admin');
+
+  // NO REQUEST WAS EVER MADE, and nothing waits for anybody.
+  assert.equal((await h.stores.ops.approvals.list()).length, 0);
+  // ON RECORD AND REPORTED: every high-impact action, in order, under one audit action...
+  assert.deepEqual(await overseen(), ['company.create', 'client.create', 'client.activation_link', 'client.membership.set', 'client.enable', 'company.approvals', 'company.margin', 'company.edit', 'client.reset_authenticator', 'staff.invite', 'staff.role', 'staff.disable']);
+  for (const entry of await audit('ops.oversight')) assert.deepEqual([entry.actor.label, entry.outcome, entry.detail.notice], [admin.email, 'success', 'queued for 1 oversight address']);
+  // ...and a notice of each was sent to the oversight address: who, what, when; no link, no code.
+  await h.mail.pump();
+  const sent = notices();
+  const queued = (await h.stores.mail.list()).filter((row) => row.template === 'ops.oversight');
+  assert.equal(queued.length, 12);
+  assert.ok(queued.every((row) => row.class === 'security'));
+  assert.equal(sent.length, 12, 'twelve in the hour: the security class allows that, whatever else was sent');
+  for (const message of sent) {
+    assert.equal(message.subject, 'Global Connect ops: a high-impact change was made');
+    assert.match(message.text, new RegExp(`\\nBy: admin\\[@\\]globalconnect\\[\\.\\]example \\(alone: the console is in single-person mode\\)\\nWhen: 2026-`));
+    assert.doesNotMatch(`${message.text}${message.html}`, /https?:|<a |code=|[A-Z2-7]{5}-[A-Z2-7]{5}-/);
+  }
+  assert.match(sent[1]?.text ?? '', /What: Create client user Chidi Eze/);
+  assert.match(sent[6]?.text ?? '', /What: Change the FX margin for company “Tideway Ltd” \([\w-]+\) FROM default 0\.50%; forwards as spot \(the server default\) TO default 0\.75%; forwards as spot\./);
+  // ORDINARY MAIL VOLUME CANNOT HOLD ONE BACK: the same address has had far more ordinary notifications than it is sent in an hour.
+  for (let n = 0; n < 6; n += 1) await h.mail.enqueue({ to: DIRECTOR, template: 'notification.digest', data: {}, key: `flood:${n}`, category: 'payments' } as never);
+  h.clock.advance(61 * 60_000);
+  await signIn(admin.browser, admin.email, admin.secret);
+  await admin.browser.get('/ops/users');
+  for (let n = 0; n < 6; n += 1) await h.mail.enqueue({ to: DIRECTOR, template: 'notification', data: { name: 'x', kind: 'payment_sent', note: { amount: '1.00', currency: 'GBP', payee: 'P' } }, key: `flood2:${n}`, category: 'payments' } as never);
+  const before = notices().filter((message) => /high-impact/.test(message.subject)).length;
+  await alone('/ops/users/usr_ben/activation-link', {}, false);
+  assert.equal(notices().filter((message) => /high-impact/.test(message.subject)).length, before + 1);
+  // The list of the week's high-impact changes is on the first page for everyone, and no standing warning: an oversight address is set.
+  const home = (await admin.browser.get('/ops/users')).body;
+  assert.match(home, /<h2>High-impact changes in the last 7 days<\/h2><p class="muted">In single-person mode each of these was carried out by one member of staff alone\. A notice of each was also sent to the oversight address\./);
+  assert.doesNotMatch(home, /NO OVERSIGHT ADDRESS/);
+  // The oversight address is in no page and cannot be changed from the console: there is no form for it.
+  const pages = admin.browser.pages.slice(from).join('\n');
+  assert.doesNotMatch(pages, /director@oversight|OPS_OVERSIGHT|name="oversight/i);
+  // NO PAGE this member of staff was ever shown holds an activation link, a code or a reset token.
+  assert.doesNotMatch(pages, LINK_OR_CODE);
+  assert.doesNotMatch(pages, /cancel-reset|token=ar_/);
+});
+
+singlePerson('single-person mode with NO oversight address: every page says so and so does the start-up line; the setting is checked; two-person mode is still a setting', async () => {
+  h = await harness({ fourEyes: false });
+  const admin = await staff();
+  const WARNING = /<p class="warn" role="note">Single-person mode is on and NO OVERSIGHT ADDRESS is configured: one member of staff carries out every action alone, and nobody is told afterwards\./;
+  for (const path of ['/ops/users', '/ops/companies', '/ops/audit', '/ops/mail', '/ops/staff']) assert.match((await admin.browser.get(path)).body, WARNING, path);
+  // An action is still on the week's list and in the audit log, which then are the only record; no notice is sent to anyone.
+  assert.equal((await admin.act('/ops/users/usr_ben/activation-link')).status, 303);
+  assert.deepEqual((await audit('ops.oversight')).map((entry) => [entry.detail.action, entry.detail.notice]), [['client.activation_link', 'no oversight address is configured']]);
+  assert.equal((await h.stores.mail.list()).filter((row) => row.template === 'ops.oversight').length, 0);
+  assert.match((await admin.browser.get('/ops/users')).body, /No oversight address is configured, so this list and the audit log are the only record\./);
+  // Not signed in: nothing about the mode is said.
+  assert.doesNotMatch((await new Browser().get('/ops/login')).body, /Single-person|OVERSIGHT/);
+
+  // THE SETTING. Single is the default, in development and outside it; two-person is asked for; anything else is refused.
+  const dev = (env: Record<string, string>) => loadConfig({ APP_ENV: 'development', ...env });
+  assert.deepEqual([dev({}).fourEyes, dev({ OPS_APPROVALS: 'single' }).fourEyes, dev({ OPS_APPROVALS: 'two-person' }).fourEyes], [false, false, true]);
+  assert.deepEqual([dev({ FOUR_EYES: 'off' }).fourEyes, dev({ FOUR_EYES: 'on' }).fourEyes, dev({ FOUR_EYES: 'on', OPS_APPROVALS: 'single' }).fourEyes], [false, true, false], 'the older name is still read, and the new one wins');
+  assert.throws(() => dev({ OPS_APPROVALS: 'none' }), /OPS_APPROVALS must be "single"/);
+  assert.deepEqual(dev({ OPS_OVERSIGHT_EMAILS: ' Director@Your-Domain.example , board@your-domain.example ' }).opsOversightEmails, ['director@your-domain.example', 'board@your-domain.example']);
+  assert.deepEqual(dev({}).opsOversightEmails, []);
+  for (const bad of ['director', 'a@b', 'a b@c.example', 'x@y.example;z@y.example', '<a@b.example>']) assert.throws(() => dev({ OPS_OVERSIGHT_EMAILS: bad }), /OPS_OVERSIGHT_EMAILS must be a comma-separated list of email addresses/, bad);
+  assert.match(opsModeLine(dev({})), /^OPS APPROVALS: single \(OPS_APPROVALS=single\): ONE member of staff carries out every ops action alone\. NO OVERSIGHT ADDRESS IS SET \(OPS_OVERSIGHT_EMAILS\)/);
+  assert.match(opsModeLine(dev({ OPS_OVERSIGHT_EMAILS: 'd@x.example' })), /alone\. High-impact ops actions are reported to 1 oversight address\.$/);
+  assert.match(opsModeLine(dev({ OPS_APPROVALS: 'two-person' })), /^OPS APPROVALS: two-person/);
+});
+
+twoPerson('TWO-PERSON MODE still enforces what it did, margins included: a margin change is a request, approved only by an ops admin with their password; the oversight notice names both people', async () => {
+  h = await harness({ fourEyes: true, opsOversightEmails: ['director@oversight.example'] });
+  const admin = await staff();
+  const olu = await staff('olu@globalconnect.example', 'ops');
+  const pat = await staff('pat@globalconnect.example', 'ops');
+  const url = '/ops/companies/co_northfield/margin';
+  await olu.browser.get('/ops/companies/co_northfield');
+  const confirmation = await olu.browser.submit(url, { defaultPercent: '0.80' });
+  assert.match(confirmation.body, /This only makes a request\. Nothing changes until a second staff member, who must be an ops admin, approves it\./);
+  const asked = await olu.browser.submit(url);
+  assert.match(asked.location, /^\/ops\/approvals\/req_[\w-]+\?done=requested$/);
+  const id = idOf(asked.location);
+  assert.equal(await h.stores.margins.get('co_northfield'), null);
+  assert.match((await h.stores.ops.approvals.get(id))?.summary ?? '', /FROM default 0\.50%; forwards as spot \(the server default\) TO default 0\.80%; forwards as spot\. Worked example at the provider’s rate when this was requested: /);
+  // Not the requester, not another ops user; an ops admin, and only with their password.
+  assert.equal((await olu.act(`/ops/approvals/${id}/approve`)).status, 403);
+  assert.equal((await pat.act(`/ops/approvals/${id}/approve`)).status, 403);
+  assert.match((await admin.browser.post(`/ops/approvals/${id}/approve`, {})).body, /name="password"/);
+  assert.notEqual((await confirmed((to, fields) => admin.browser.post(to, fields), `/ops/approvals/${id}/approve`, {}, 'not the password')).status, 303);
+  assert.equal(await h.stores.margins.get('co_northfield'), null);
+  assert.equal((await admin.act(`/ops/approvals/${id}/approve`)).status, 303);
+  const now = await h.stores.margins.get('co_northfield');
+  assert.deepEqual([now?.defaultBps, now?.updatedBy, now?.approvedBy], [80, olu.email, admin.email]);
+  assert.deepEqual((await audit('ops.margin.changed')).map((entry) => [entry.actor.label, entry.detail.approvedBy, entry.detail.to]), [[olu.email, admin.email, 'default 0.80%; forwards as spot']]);
+  // Everything else is a request too (here: an activation link), and the Approvals page stays in the navigation.
+  assert.match((await olu.act('/ops/users/usr_ben/activation-link')).location, /^\/ops\/approvals\/req_/);
+  assert.match((await olu.browser.get('/ops/users')).body, /<a href="\/ops\/approvals">Approvals<\/a>/);
+  assert.doesNotMatch((await olu.browser.get('/ops/users')).body, /Single-person mode/);
+  // The oversight address is told of what was carried out, with both names.
+  await h.mail.pump();
+  const notice = h.outbox.sent.find((message) => message.to === 'director@oversight.example');
+  assert.match(notice?.text ?? '', /\nBy: olu\[@\]globalconnect\[\.\]example, approved by admin\[@\]globalconnect\[\.\]example\n/);
 });

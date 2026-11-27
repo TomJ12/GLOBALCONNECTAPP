@@ -37,14 +37,16 @@ test('H3: strict by default. Only APP_ENV=development is lenient; NODE_ENV decid
   assert.throws(() => loadConfig({}), /Provider credentials are missing/);
   for (const NODE_ENV of [undefined, 'development', 'test', 'staging', 'production']) {
     const config = loadConfig({ ...LIVE, NODE_ENV });
-    assert.deepEqual([config.development, config.strict, config.fourEyes, config.databasePath], [false, true, true, LIVE.DATABASE_PATH], String(NODE_ENV));
+    // (Single-person ops mode is the default in every mode, and two-person is a setting: it is no longer a development convenience.)
+    assert.deepEqual([config.development, config.strict, config.fourEyes, config.databasePath], [false, true, false, LIVE.DATABASE_PATH], String(NODE_ENV));
+    assert.deepEqual([loadConfig({ ...LIVE, NODE_ENV, OPS_APPROVALS: 'two-person' }).fourEyes, loadConfig({ ...LIVE, NODE_ENV, OPS_APPROVALS: 'single' }).fourEyes, loadConfig({ ...LIVE, NODE_ENV, FOUR_EYES: 'off' }).fourEyes], [true, false, false]);
     // Everything that is a development convenience is refused.
     assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_FILE: '/tmp/accounts.json' }), /DATA_FILE \(the JSON demo file\) is no longer used/);
     // The database file and the key that encrypts authenticator keys are required, and the key must be a real one.
     assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATABASE_PATH: undefined }), /DATABASE_PATH must be set/);
     assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_ENCRYPTION_KEY: undefined }), /DATA_ENCRYPTION_KEY must be set/);
     for (const key of ['short', 'A'.repeat(43) + '=', Buffer.alloc(16, 7).toString('base64'), 'replace-with-openssl-rand-base64-32']) assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, DATA_ENCRYPTION_KEY: key }), /DATA_ENCRYPTION_KEY is refused/, key);
-    assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, FOUR_EYES: 'off' }), /FOUR_EYES=off is refused/);
+    assert.throws(() => loadConfig({ ...LIVE, NODE_ENV, OPS_APPROVALS: 'off' }), /OPS_APPROVALS must be "single"/);
     assert.throws(() => loadConfig({ NODE_ENV, OPS_URL: LIVE.OPS_URL }), /Provider credentials are missing/);
   }
   assert.throws(() => loadConfig({ ...LIVE, OPS_URL: 'http://ops.globalconnect.example' }), /OPS_URL must be set to the https/);

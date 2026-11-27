@@ -39,11 +39,15 @@ export interface Chrome {
   user: { name: string; role: string } | null;
   csrf: string;
   flash?: string;
+  /** Single-person mode with no request waiting: the Approvals page has nothing on it, so it is not in the navigation. */
+  hideApprovals?: boolean;
+  /** A standing warning shown at the top of every page (single-person mode with no oversight address). */
+  warning?: string;
 }
 
 export function layout(chrome: Chrome, body: Html): string {
   const nav = chrome.user
-    ? h`<nav><a href="/ops/companies">Companies</a><a href="/ops/users">Client users</a><a href="/ops/approvals">Approvals</a><a href="/ops/audit">Audit log</a><a href="/ops/mail">Mail</a>${
+    ? h`<nav><a href="/ops/companies">Companies</a><a href="/ops/users">Client users</a>${chrome.hideApprovals ? h`` : h`<a href="/ops/approvals">Approvals</a>`}<a href="/ops/audit">Audit log</a><a href="/ops/mail">Mail</a>${
         chrome.user.role === 'ops_admin' && h`<a href="/ops/revenue">Revenue</a><a href="/ops/staff">Ops staff</a>`
       }<span class="who">${chrome.user.name} · ${chrome.user.role === 'ops_admin' ? 'Ops admin' : 'Ops'}</span><form method="post" action="/ops/logout"><input type="hidden" name="_csrf" value="${chrome.csrf}"><button class="link">Sign out</button></form></nav>`
     : h``;
@@ -51,5 +55,5 @@ export function layout(chrome: Chrome, body: Html): string {
 <html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
 <title>${chrome.title} · Global Connect Ops</title><link rel="stylesheet" href="/ops/static/ops.css"><script src="/ops/static/ops.js" defer></script></head>
 <body><header><a class="brand" href="/ops"><img src="/ops/static/logo.png" alt="" width="26" height="29">Global Connect <span>Ops</span></a>${nav}</header>
-<main>${chrome.flash && h`<p class="flash" role="status">${chrome.flash}</p>`}<h1>${chrome.title}</h1>${body}</main></body></html>`.text;
+<main>${chrome.warning && chrome.user ? h`<p class="warn" role="note">${chrome.warning}</p>` : h``}${chrome.flash && h`<p class="flash" role="status">${chrome.flash}</p>`}<h1>${chrome.title}</h1>${body}</main></body></html>`.text;
 }

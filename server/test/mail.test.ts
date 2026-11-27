@@ -36,6 +36,7 @@ const SAMPLES: { [N in TemplateName]: Parameters<(typeof TEMPLATES)[N]>[0] } = {
   'reset.client': { name: 'Amira Shah', link: `${APP}/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, validForMs: 30 * 60_000 },
   'reset.staff': { name: 'Amira Shah', link: `${OPS}/ops/reset#code=ABCDE-FGHIJ-KLMNO-PQRST`, validForMs: 30 * 60_000 },
   'security.notice': { name: 'Amira Shah', audience: 'client', kind: 'password_changed', at: 0 },
+  'ops.oversight': { what: 'Create client user Chidi Eze (chidi@tideway.example)', by: 'ops.admin@staff.example', approvedBy: null, at: 0, mode: 'single' },
   'security.reset_warning': { name: 'Amira Shah', at: 0, delayMs: 24 * 60 * 60_000, cancelLink: `${APP}/cancel-reset#token=ar_0123456789abcdef.c2lnbmF0dXJl` },
   notification: { name: 'Amira Shah', kind: 'payment_awaiting', note: PAYMENT_NOTE },
   'notification.digest': {},

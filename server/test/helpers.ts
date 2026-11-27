@@ -117,7 +117,7 @@ function withLatency<T extends object>(target: T, hook?: (operation: string) => 
 }
 
 export async function harness(overrides: Partial<Config> = {}, directory: DirectoryData = seedDirectory(), options: HarnessOptions = {}): Promise<Harness> {
-  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, mailPerRecipientPerHour: 100_000, mailGlobalPerHour: 100_000, authenticatorResetDelayMs: 0, mockMovingRates: false, ...overrides };
+  const config: Config = { ...loadConfig({ APP_ENV: 'development', LOG: '0', ADMIN_TOKEN }), authRequestsPerMinute: 100_000, authRequestsPerNetworkPerMinute: 100_000, writeRequestsPerMinute: 100_000, readRequestsPerMinute: 100_000, mailPerRecipientPerHour: 100_000, mailGlobalPerHour: 100_000, authenticatorResetDelayMs: 0, mockMovingRates: false, /* The suites written around a second member of staff keep running in two-person mode; single-person mode (the product's default) is asked for explicitly: ops.single.test.ts runs the console's suite in it. */ fourEyes: true, ...overrides };
   const clock = options.clock ?? {
     now: Date.UTC(2026, 10, 11, 10, 0, 0),
     advance(ms: number) {

@@ -1,5 +1,5 @@
 /** Starts the server. See startup.ts for what it refuses to start on. */
-import { loadConfig } from './config';
+import { loadConfig, opsModeLine } from './config';
 import { buildApp } from './http/app';
 import { createRuntime, seedInvitations } from './startup';
 
@@ -60,6 +60,9 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   });
 }
 
+// Which ops mode is on is said at every start, in every mode.
+if (!config.development) app.log.warn(opsModeLine(config));
+
 if (config.development) {
   // EXPLICIT DEVELOPMENT MODE ONLY (APP_ENV=development). There is no email
   // delivery, so activation codes for the SAMPLE accounts that are not
@@ -72,7 +75,7 @@ if (config.development) {
       : 'No DATABASE_PATH: the database is in memory and everything is forgotten when the server stops.',
   );
   if (config.openOnNetwork) lines.push(`WARNING: DEV_OPEN_ON_NETWORK=1. This development server listens on ${config.host} WITHOUT the demo gate: anyone who can reach this machine sees the sample accounts and the codes printed below.`);
-  if (!config.fourEyes) lines.push('FOUR-EYES APPROVAL IS OFF (FOUR_EYES=off): one staff member alone can make sensitive changes.');
+  lines.push(opsModeLine(config));
   if (config.demoAccessPassword) lines.push('THE DEMO GATE IS ON: nothing but /healthz is served until a visitor has typed the demo password.');
   if (config.publicDemo && !config.demoSetupCodes) {
     // On a public address the log is not the place for activation codes, except during first-time set-up, when it is asked for.

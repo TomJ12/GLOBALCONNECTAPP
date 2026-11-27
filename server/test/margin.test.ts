@@ -4,7 +4,7 @@ import { test } from 'node:test';
 
 import Big from 'big.js';
 
-import { canonicalTrade, checkMarginConfig, describeMargin, clientRate, clientTermsOf, directionOf, effectiveBps, indicativePair, indicativeRate, MarginError, marginBps, rateDecimals, tierAmountOf, workedExample, type MarginConfig, type ProviderTerms } from '../src/rates/margin';
+import { canonicalTrade, checkMarginConfig, describeMargin, clientRate, clientTermsOf, directionOf, effectiveBps, indicativePair, indicativeRate, MarginError, marginBps, marginPercent, parseMarginPercent, rateDecimals, tierAmountOf, workedExample, type MarginConfig, type ProviderTerms } from '../src/rates/margin';
 
 const config = (extra: Partial<MarginConfig> = {}): MarginConfig => ({ defaultBps: 50, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP', ...extra });
 const sellGbp = (amount: string, rate = '1.2500'): ProviderTerms => ({ sellCurrency: 'GBP', buyCurrency: 'USD', sellAmount: amount, buyAmount: new Big(amount).times(rate).round(2, Big.roundDown).toFixed(2), fixedSide: 'sell', rateBase: 'GBP', rateQuote: 'USD', rate });
@@ -98,10 +98,10 @@ test('bounds: never negative, never absurd, high only when the request says so; 
   for (const bad of [config({ defaultBps: -1 }), config({ forwardBps: -5 }), config({ overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: -1 }] }), config({ tiers: [{ fromAmount: '100', bps: -1 }] })]) {
     for (const allowHigh of [false, true]) assert.throws(() => checkMarginConfig(bad, allowHigh), /cannot be negative/);
   }
-  assert.throws(() => checkMarginConfig(config({ defaultBps: 301 }), false), /is 301 basis points \(3\.01%\), which is more than 300[^]*allow a margin this high/);
+  assert.throws(() => checkMarginConfig(config({ defaultBps: 301 }), false), /The default margin: 3\.01% is above the usual limit of 3\.00%[^]*allow a margin this high/);
   assert.equal(checkMarginConfig(config({ defaultBps: 301 }), true).defaultBps, 301);
-  assert.throws(() => checkMarginConfig(config({ defaultBps: 2001 }), true), /cannot be more than 2000/);
-  for (const value of [1.5, Number.NaN, '50' as unknown as number, Infinity]) assert.throws(() => checkMarginConfig(config({ defaultBps: value }), true), /whole number of basis points/);
+  assert.throws(() => checkMarginConfig(config({ defaultBps: 2001 }), true), /20\.01% is above the maximum of 20\.00%/);
+  for (const value of [1.5, Number.NaN, '50' as unknown as number, Infinity]) assert.throws(() => checkMarginConfig(config({ defaultBps: value }), true), /must be a percentage in steps of 0\.01%/);
   for (const pair of ['GBP', 'GBPGBP', 'gbpusd', 'GBP/USD', '<b>USD']) assert.throws(() => checkMarginConfig(config({ overrides: [{ pair, direction: 'sell', bps: 10 }] }), false), /is not a currency pair/);
   assert.throws(() => checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'both', bps: 10 }, { pair: 'GBPUSD', direction: 'sell', bps: 20 }] }), false), /listed twice/);
   assert.throws(() => checkMarginConfig(config({ overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 10 }, { pair: 'USDGBP', direction: 'buy', bps: 20 }] }), false), /listed twice/);
@@ -119,7 +119,7 @@ test('the worked example for staff says what a change does to a concrete trade',
   );
   assert.equal(workedExample(config({ defaultBps: 50 }), config({ defaultBps: 20 }), '1.2500', 'GBPUSD', '10000', 'buy'), 'buying GBP 10,000 with USD: the client rate changes from 1.256250 to 1.252500, so they pay USD 12525.00 instead of USD 12562.50');
   assert.equal(workedExample(config({ defaultBps: 50 }), config({ defaultBps: 50, forwardBps: 100 }), '1.2500', 'GBPUSD', '10000', 'sell', 'forward'), 'a forward selling GBP 10,000 for USD: the client rate changes from 1.243750 to 1.237500, so they receive USD 12375.00 instead of USD 12437.50');
-  assert.equal(describeMargin(config({ forwardBps: 90, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }], tiers: [{ fromAmount: '50000', bps: 45 }] })), 'default 50 bp; forwards 90 bp; GBPUSD sell 40 bp; from GBP 50000: 45 bp');
+  assert.equal(describeMargin(config({ forwardBps: 90, overrides: [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }], tiers: [{ fromAmount: '50000', bps: 45 }] })), 'default 0.50%; forwards 0.90%; GBPUSD sell 0.40%; from GBP 50000: 0.45%');
 });
 
 test('a client rate keeps seven significant figures whatever its size, so rounding never adds a margin of its own; the margin really applied is worked out', () => {
@@ -190,4 +190,25 @@ test('indicative rates are given to display precision, against the client in eac
       if (sellBps === buyBps) assert.notEqual(buy.minus(sell).div(buy.plus(sell)).round(6, Big.roundHalfUp).toFixed(6), new Big(sellBps).div(10_000).toFixed(6), `${rate} at ${sellBps} bp gives the margin away: ${shown.sell} / ${shown.buy}`);
     }
   }
+});
+
+test('PERCENTAGES at the edges, basis points inside: what a person types becomes whole basis points, exactly, and anything ambiguous is refused with the unit in the message', () => {
+  // What is typed -> what is stored.
+  for (const [typed, bps] of [['0.5', 50], ['1', 100], ['1.25', 125], ['0,75', 75], ['0.50%', 50], ['0,75 %', 75], [' 2 ', 200], ['0', 0], ['0.01', 1], ['20', 2000], ['3.00', 300], ['12.3', 1230]] as const) {
+    assert.equal(parseMarginPercent(typed, 'The default margin'), bps, typed);
+  }
+  // "50" MEANS FIFTY PERCENT. It is not quietly read as basis points: the ceiling refuses it, and says so in percent.
+  assert.equal(parseMarginPercent('50', 'The default margin'), 5000);
+  const fifty = { defaultBps: parseMarginPercent('50', 'The default margin'), forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP' };
+  for (const allowHigh of [false, true]) assert.throws(() => checkMarginConfig(fifty, allowHigh), /The default margin: 50\.00% is above the maximum of 20\.00%\. \(Margins are percentages: for half a percent write 0\.50\.\)/);
+  // Refused: more than two decimal places (0.005 would be half a basis point), thousands separators, signs, units, words, nothing.
+  for (const typed of ['0.005', '1.234', '0,005']) assert.throws(() => parseMarginPercent(typed, 'The default margin'), /The default margin is a percentage with at most two decimal places \(steps of 0\.01%\)/, typed);
+  for (const typed of ['1,000', '1.000,5', '1,000.5']) assert.throws(() => parseMarginPercent(typed, 'The default margin'), /percentage/, typed);
+  for (const typed of ['', ' ', '.5', '5.', '1..2', '1,2,3', '+1', '50bp', '50 bp', '0.5 percent', 'half', '1e2', '0x10', '%', '1%%', '１.５']) assert.throws(() => parseMarginPercent(typed, 'The default margin'), /is written as a percentage, like 0\.50 or 0\.50%/, JSON.stringify(typed));
+  assert.throws(() => parseMarginPercent('-0.5', 'The default margin'), /cannot be negative/);
+  // What is stored -> what is shown: always two places and a % sign, exactly (no floating point).
+  assert.deepEqual([0, 1, 50, 75, 100, 125, 300, 2000, 1999].map((bps) => marginPercent(bps)), ['0.00%', '0.01%', '0.50%', '0.75%', '1.00%', '1.25%', '3.00%', '20.00%', '19.99%']);
+  assert.deepEqual(['49.97', '80.00', '0.4'].map((bps) => marginPercent(bps)), ['0.50%', '0.80%', '0.00%'], 'the effective margin after rounding, to two places');
+  // There and back for every whole basis point a margin can be.
+  for (let bps = 0; bps <= 2000; bps += 1) assert.equal(parseMarginPercent(marginPercent(bps), 'x'), bps);
 });

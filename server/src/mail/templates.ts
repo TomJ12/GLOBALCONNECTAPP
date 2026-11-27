@@ -229,6 +229,23 @@ export const TEMPLATES = {
       NOT_YOU,
     ],
   }),
+  /**
+   * OVERSIGHT: to the addresses in OPS_OVERSIGHT_EMAILS (not staff of the console; typically a director), after a
+   * high-impact ops action. It reports; it has no link and nothing to press. `what` is the action's own summary
+   * (who or which company, old and new values), already made plain text.
+   */
+  'ops.oversight': (data: { what: string; by: string; approvedBy: string | null; at: number; mode: 'single' | 'two-person' }): Draft => ({
+    subject: 'Global Connect ops: a high-impact change was made',
+    lines: [
+      'A high-impact change was made in the Global Connect ops console.',
+      '',
+      `What: ${typed(data.what, 600)}`,
+      `By: ${typed(data.by, 254)}${data.approvedBy ? `, approved by ${typed(data.approvedBy, 254)}` : data.mode === 'single' ? ' (alone: the console is in single-person mode)' : ''}`,
+      `When: ${utc(data.at)}.`,
+      '',
+      'You are sent this because your address is the oversight address in the server’s settings. Staff cannot change that from the console. If you did not expect this change, ask the person named above, and look at the audit log in the console.',
+    ],
+  }),
   // A NOTIFICATION the person can turn off (rate alerts, approvals, their own payments). No link, no code, no bank details.
   notification: (data: { name: string; kind: NotificationKind; note: unknown }): Draft => ({
     subject: NOTIFICATION_SUBJECT(data.kind),

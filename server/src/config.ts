@@ -97,8 +97,10 @@ export interface Config {
   demoSetupCodes: boolean;
   /** Staff accounts may only be created for addresses at these domains. */
   staffEmailDomains: string[];
-  /** Sensitive ops actions need a second staff member. Can be turned off only in development. */
+  /** OPS_APPROVALS=two-person: sensitive ops actions need a second staff member. False (`single`, the default): the person who starts an action carries it out. */
   fourEyes: boolean;
+  /** OPS_OVERSIGHT_EMAILS: who is emailed a notice of every high-impact ops action. Empty: nobody (the console and the start-up log say so). */
+  opsOversightEmails: string[];
   approvalTtlMs: number;
   /** Folder of the exported web app to serve from the same origin, or null. */
   webDir: string | null;
@@ -260,8 +262,21 @@ export function loadConfig(env: Env = process.env): Config {
     const problem = value ? dataKeyProblem(value) : null;
     if (problem) throw new Error(`${name} is refused because ${problem}.`);
   }
-  const fourEyes = env.FOUR_EYES !== 'off';
-  if (strict && !fourEyes) throw new Error('FOUR_EYES=off is refused unless APP_ENV=development: sensitive ops actions must need a second staff member.');
+  // HOW MANY STAFF AN OPS ACTION TAKES. `single` (the default): the member of staff who starts an action carries it
+  // out, after its confirmation page (and their password for the highest-impact ones). `two-person`: the sensitive
+  // actions only make a request, which a second member of staff approves. Allowed in every mode, development or not.
+  // (FOUR_EYES=off|on is the older name for the same choice and is still read when OPS_APPROVALS is not set.)
+  const approvals = env.OPS_APPROVALS?.trim() || (env.FOUR_EYES === undefined ? 'single' : env.FOUR_EYES === 'off' ? 'single' : 'two-person');
+  if (approvals !== 'single' && approvals !== 'two-person') throw new Error('OPS_APPROVALS must be "single" (one member of staff carries out an action; the default) or "two-person" (sensitive actions need a second member of staff).');
+  const fourEyes = approvals === 'two-person';
+  // WHO IS TOLD AFTERWARDS. Nobody sees a change before it happens in single mode, so each high-impact action is
+  // reported to these addresses (typically a director). Set here only: nothing in the console can change it.
+  const opsOversightEmails = (env.OPS_OVERSIGHT_EMAILS ?? '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  if (opsOversightEmails.some((address) => address.length > 254 || !/^[^\s@<>,;:"]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(address))) throw new Error('OPS_OVERSIGHT_EMAILS must be a comma-separated list of email addresses (for example director@your-domain.example).');
+  if (opsOversightEmails.length > 10) throw new Error('OPS_OVERSIGHT_EMAILS: at most 10 addresses.');
   if (env.ADMIN_TOKEN) {
     const problem = adminTokenProblem(env.ADMIN_TOKEN);
     if (problem) throw new Error(`ADMIN_TOKEN is refused because ${problem}. Generate one with: openssl rand -base64 32 (or leave it unset to disable the operator commands).`);
@@ -404,6 +419,7 @@ export function loadConfig(env: Env = process.env): Config {
     serverSecret: env.SERVER_SECRET ?? randomBytes(32).toString('base64url'),
     staffEmailDomains,
     fourEyes,
+    opsOversightEmails,
     approvalTtlMs: 24 * 60 * MINUTE,
     webDir: env.WEB_DIR || null,
     log: env.LOG !== '0',
@@ -425,4 +441,11 @@ export function loadConfig(env: Env = process.env): Config {
     readRequestsPerMinute: 600,
     providers,
   };
+}
+
+/** One line for the start-up log (and the demo): which ops mode is on, and whether anybody is told of high-impact actions afterwards. */
+export function opsModeLine(config: Pick<Config, 'fourEyes' | 'opsOversightEmails'>): string {
+  const told = config.opsOversightEmails.length > 0 ? `High-impact ops actions are reported to ${config.opsOversightEmails.length} oversight address${config.opsOversightEmails.length === 1 ? '' : 'es'}.` : null;
+  if (config.fourEyes) return `OPS APPROVALS: two-person (OPS_APPROVALS=two-person): sensitive ops actions need a second member of staff.${told ? ` ${told}` : ''}`;
+  return `OPS APPROVALS: single (OPS_APPROVALS=single): ONE member of staff carries out every ops action alone. ${told ?? 'NO OVERSIGHT ADDRESS IS SET (OPS_OVERSIGHT_EMAILS): nobody is told of a high-impact action after it happens.'}`;
 }
