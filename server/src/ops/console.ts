@@ -51,7 +51,7 @@ import { approvalsRequiredOf, StoreConflict, type ApprovalRecord, type Approvals
 import { isActiveStaff, opsParty, type OpsAuthService, type OpsContext } from './auth';
 import { h, Html, layout, qrSvg, when } from './html';
 import { currencyDecimals } from '@/lib/money';
-import { checkMarginConfig, DEFAULT_TIER_CURRENCY, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
+import { checkMarginConfig, DEFAULT_TIER_CURRENCY, describeMargin, MARGIN_USUAL_MAX_BPS, MarginError, marginPercent, parseMarginPercent, workedExample, type MarginConfig, type MarginOverride } from '../rates/margin';
 import { DELIVERY_WORDS, mailedDetail } from '../mail/queue';
 import { marginConfigOf, type ClientRates } from '../rates/service';
 import type { Notifier } from '../notify/notifier';
@@ -307,6 +307,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         apply(params: Record<string, string>, actors: Actors): Promise<Applied>;
       }
       const actions = new Map<string, ActionDef>();
+      const MARGIN_ACTION = 'company.margin';
       const needsApproval = (def: ActionDef, params: Record<string, string>): boolean =>
         config.fourEyes && (typeof def.fourEyes === 'function' ? def.fourEyes(params) : def.fourEyes === true);
       const needsAdminApproval = (def: ActionDef, params: Record<string, string>): boolean =>
@@ -887,6 +888,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         const interrupted = all.filter((item) => item.status === 'applying' && !carrying.has(item.id));
         const resets = (await authenticatorResets.waitingWithWarning()).sort((a, b) => a.dueAt - b.dueAt);
         const people = new Map(await Promise.all(resets.map(async (item) => [item.userId, await stores.directory.getUser(item.userId)] as const)));
+        // ONE PERSON CAN CHANGE A MARGIN, so everybody else is shown that it happened: the last seven days, who and when.
+        const marginChanges = await stores.audit.query({ action: 'ops.margin.changed', from: now() - 7 * 24 * 60 * 60_000, limit: 100 });
+        const marginCard =
+          marginChanges.length > 0
+            ? h`<div class="card"><h2>Margin changes in the last 7 days</h2><p class="muted">A margin is changed by one member of staff, without a second approval. Each change is listed here for everybody else, and is in the audit log (ops.margin.changed).</p><table><tr><th>When</th><th>Company</th><th>Changed by</th><th>From</th><th>To</th></tr>${marginChanges.map(
+                (entry) => h`<tr><td>${when(entry.at)}</td><td>${entry.target?.id ? h`<a href="/ops/companies/${entry.target.id}">${entry.detail.company ?? entry.target.label}</a>` : (entry.detail.company ?? '')}</td><td>${entry.actor.label}</td><td>${entry.detail.from ?? ''}</td><td>${entry.detail.to ?? ''}</td></tr>`,
+              )}</table></div>`
+            : '';
         const resetsCard =
           resets.length > 0
             ? h`<div class="card"><h2>Authenticator resets waiting out their delay</h2><p class="muted">Approved, and nothing has changed yet. Each takes effect at the time shown unless the client signs in with their current credentials first, or an ops admin cancels it.</p><table><tr><th>Client</th><th>Requested by</th><th>Approved by</th><th>Takes effect</th><th></th></tr>${resets.map(
@@ -898,7 +907,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           200,
           layout(
             chromeOf(ctx, 'Approvals', flashOf(request)),
-            h`${resetsCard}${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
+            h`${marginCard}${resetsCard}${interrupted.length > 0 ? h`<div class="card"><h2>Approved, but not finished</h2><p class="warn">These were approved and then interrupted while being carried out. Each may be partly done. Open it to finish it or close it.</p><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${interrupted.map(row)}</table></div>` : ''}<div class="card"><h2>Waiting for a second staff member</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th></th></tr>${pending.map(row)}</table>${pending.length === 0 && h`<p class="muted">Nothing is waiting.</p>`}<p class="muted">A request is approved by a different staff member than the one who made it, and expires after 24 hours.</p></div>
 <div class="card"><h2>Decided (latest 50)</h2><table><tr><th>Request</th><th>Requested by</th><th>When</th><th>Status</th><th>Decided</th></tr>${all.filter((item) => item.status !== 'pending' && item.status !== 'applying').slice(0, 50).map(row)}</table></div>`,
           ),
         );
@@ -947,6 +956,10 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         if (item.target) aim(item.target);
         const def = actions.get(item.action);
         if (!def || item.status !== 'pending') throw new OpsError('This request is no longer waiting for a decision.', 409, 'not_pending');
+        // A margin change is no longer a request (one person makes it directly). One left over from before is NOT carried
+        // out: its worked example and its "from" are old. Its requester cancels it (anyone else can reject it) and whoever
+        // wants the change makes it on the company's page.
+        if (item.action === MARGIN_ACTION) throw new OpsError('Margin changes no longer need a second person, so this request cannot be approved. Its requester can cancel it (anyone else can reject it); the change itself is made on the company’s page.', 409, 'superseded');
         // Four eyes: never the person who asked, and never the person the request is about (see assertMayDecide).
         const requester = (await assertMayDecide(item, def, ctx.user, true)) as OpsUserRecord;
         const history = await pairHistory(item.requestedBy.id, ctx.user.id);
@@ -1173,7 +1186,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
               'Change payment approvals',
               { request: true },
             )}</div>
-<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount (the trade’s size in the tier currency, converted at the provider’s rate); otherwise the default. A client is shown a rate for each direction and can estimate a midpoint from those, as from any two-way price; no field names the margin. A change needs a second staff member, an ops admin, who types their password again.</p>`, 'Change FX margin', { request: true })}</div>
+<div class="card"><h2>FX margin</h2><p>Now: <strong>${describeMargin(margin.config)}</strong>${margin.record ? h` (set ${when(margin.record.updatedAt)} by ${margin.record.updatedBy}${margin.record.approvedBy ? h`, approved by ${margin.record.approvedBy}` : ''})` : ' (the server default: this company has no configuration of its own)'}.</p>${rates.appliedBy(company) === 'provider' ? h`<p class="warn">For this company’s provider the margin is applied by the provider, not by this server: the figures here are not used to price anything.</p>` : ''}${form(ctx, `/ops/companies/${company.id}/margin`, h`${marginFields(margin.config)}<p class="muted">A client only ever sees their own rate: never the provider’s rate and never this margin. Which margin applies to a trade: for a forward, the forward margin if one is set; otherwise an override for the pair and direction; otherwise the tier for the amount (the trade’s size in the tier currency, converted at the provider’s rate); otherwise the default. A client is shown a rate for each direction and can estimate a midpoint from those, as from any two-way price; no field names the margin. A change takes effect as soon as you confirm it: no second person is needed. It is recorded in your name and listed for the other staff under Approvals.</p>`, 'Change FX margin')}</div>
 <div class="card"><h2>${company.deactivatedAt ? 'Reactivate' : 'Deactivate'}</h2><p class="muted">A deactivated company cannot be selected or used by any client.</p>${
               company.deactivatedAt
                 ? form(ctx, `/ops/companies/${company.id}/reactivate`, h``, 'Reactivate company', { request: true })
@@ -1298,32 +1311,38 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
 
       // --- FX margin ------------------------------------------------------------------
       // What Global Connect earns on a client's conversions. Staff can see it; no client API returns any of it.
+      // PERCENTAGES on every page and in every form; whole basis points in storage and arithmetic (rates/margin.ts converts).
+      const typedPercent = (bps: number): string => marginPercent(bps).slice(0, -1);
       const marginFields = (current: MarginConfig) =>
-        h`<label>Default margin, in basis points (100 = 1%) <input name="defaultBps" inputmode="numeric" required maxlength="5" value="${String(current.defaultBps)}"></label>
-<label>Forward contracts, in basis points (leave empty to price forwards as spot) <input name="forwardBps" inputmode="numeric" maxlength="5" value="${current.forwardBps === null ? '' : String(current.forwardBps)}"></label>
-<label>Overrides for a currency pair and direction, one per line: pair, then sell, buy or both (what the client does with the pair’s FIRST currency), then basis points. Example: GBPUSD sell 40 <textarea name="overrides" rows="3" maxlength="2000">${current.overrides.map((item) => `${item.pair} ${item.direction} ${item.bps}`).join('\n')}</textarea></label>
-<label>Tiers by amount, one per line: from this amount, then basis points. Larger amounts, smaller margin. Example: 50000 35 <textarea name="tiers" rows="3" maxlength="1000">${current.tiers.map((item) => `${item.fromAmount} ${item.bps}`).join('\n')}</textarea></label>
+        h`<label>Default margin, as a percentage (0.50 is half of one percent; steps of 0.01) <input name="defaultPercent" inputmode="decimal" required maxlength="8" value="${typedPercent(current.defaultBps)}"></label>
+<label>Forward contracts, as a percentage (leave empty to price forwards as spot) <input name="forwardPercent" inputmode="decimal" maxlength="8" value="${current.forwardBps === null ? '' : typedPercent(current.forwardBps)}"></label>
+<label>Overrides for a currency pair and direction, one per line: pair, then sell, buy or both (what the client does with the pair’s FIRST currency), then the percentage. Example: GBPUSD sell 0.40 <textarea name="overrides" rows="3" maxlength="2000">${current.overrides.map((item) => `${item.pair} ${item.direction} ${typedPercent(item.bps)}`).join('\n')}</textarea></label>
+<label>Tiers by amount, one per line: from this amount, then the percentage. Larger amounts, smaller margin. Example: 50000 0.35 <textarea name="tiers" rows="3" maxlength="1000">${current.tiers.map((item) => `${item.fromAmount} ${typedPercent(item.bps)}`).join('\n')}</textarea></label>
 <label>The ONE currency tier amounts are in, for every pair (a trade’s size is converted to it at the provider’s rate before a tier is chosen) <input name="tierCurrency" required maxlength="3" value="${current.tierCurrency}"></label>
-<label><input type="checkbox" name="allowHigh" value="yes"> Allow a margin above ${String(MARGIN_USUAL_MAX_BPS)} basis points (${String(MARGIN_USUAL_MAX_BPS / 100)}%) in this request</label>`;
+<label><input type="checkbox" name="allowHigh" value="yes"> Allow a margin above ${marginPercent(MARGIN_USUAL_MAX_BPS)} in this change</label>`;
       const marginOfForm = (input: Form): { config: MarginConfig; allowHigh: boolean } => {
         const bps = (value: string, what: string): number => {
-          if (!/^\d{1,5}$/.test(value)) throw new OpsError(`${what} must be a whole number of basis points, zero or more (100 = 1%). A negative margin is never accepted.`);
-          return Number(value);
+          try {
+            return parseMarginPercent(value, what);
+          } catch (error) {
+            throw new OpsError(error instanceof MarginError ? error.message : 'That margin cannot be read.');
+          }
         };
-        const lines = (name: string): string[] => text(input, name).split(/[\n;,]+/).map((line) => line.trim()).filter(Boolean);
-        const forward = text(input, 'forwardBps');
+        // (One per line, or separated by semicolons. Not by commas: a comma may be the decimal separator of a percentage.)
+        const lines = (name: string): string[] => text(input, name).split(/[\n;]+/).map((line) => line.trim()).filter(Boolean);
+        const forward = text(input, 'forwardPercent');
         const allowHigh = text(input, 'allowHigh') === 'yes';
         const wanted: MarginConfig = {
-          defaultBps: bps(text(input, 'defaultBps'), 'The default margin'),
+          defaultBps: bps(text(input, 'defaultPercent'), 'The default margin'),
           forwardBps: forward === '' ? null : bps(forward, 'The margin for forward contracts'),
           overrides: lines('overrides').map((line) => {
-            const match = /^([A-Za-z]{6})\s+(sell|buy|both)\s+(-?\d+)$/i.exec(line);
-            if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not an override. Write the pair, then sell, buy or both, then basis points: GBPUSD sell 40`);
+            const match = /^([A-Za-z]{6})\s+(sell|buy|both)\s+(\S+(?: %)?)$/i.exec(line);
+            if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not an override. Write the pair, then sell, buy or both, then the percentage: GBPUSD sell 0.40`);
             return { pair: (match[1] ?? '').toUpperCase(), direction: (match[2] ?? '').toLowerCase() as MarginOverride['direction'], bps: bps(match[3] ?? '', `The margin for ${(match[1] ?? '').toUpperCase()}`) };
           }),
           tiers: lines('tiers').map((line) => {
-            const match = /^(\d+(?:\.\d+)?)\s+(-?\d+)$/.exec(line);
-            if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not a tier. Write the amount it starts from, then basis points: 50000 35`);
+            const match = /^(\d+(?:\.\d+)?)\s+(\S+(?: %)?)$/.exec(line);
+            if (!match) throw new OpsError(`“${line.slice(0, 40)}” is not a tier. Write the amount it starts from, then the percentage: 50000 0.35`);
             return { fromAmount: match[1] ?? '', bps: bps(match[2] ?? '', `The margin from ${match[1] ?? ''}`) };
           }),
           tierCurrency: (text(input, 'tierCurrency') || DEFAULT_TIER_CURRENCY).toUpperCase(),
@@ -1344,13 +1363,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
         }
       };
       action('/companies/:id/margin', {
-        name: 'company.margin',
-        fourEyes: true,
-        // What every client of this company pays on every conversion: two staff, the second an ops admin who types
-        // their password again.
-        adminApproval: true,
+        name: MARGIN_ACTION,
+        // What every client of this company pays on every conversion. ONE member of staff changes it, at once (a
+        // product decision: either of two people must be able to, alone, at any time). So there is no second
+        // approver and no password re-check for THIS action; in their place the confirmation page with the worked
+        // example, the bounds, an audit entry of its own (`ops.margin.changed`, written with the change) and a
+        // list of recent margin changes that every other member of staff sees on the Approvals page.
+        fourEyes: false,
         danger: true,
-        password: true,
         async prepare({ form: input, params, aim }) {
           const company = await companyOf(params.id);
           aim(companyParty(company));
@@ -1359,7 +1379,7 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           if (record && JSON.stringify(current) === JSON.stringify(wanted)) throw new OpsError('That is already this company’s margin.');
           // A WORKED EXAMPLE, at the provider's rate now: the approver sees what the change does to a real trade.
           const rate = await providerRateFor(company, 'GBPUSD');
-          if (!rate) throw new OpsError('The provider’s rate could not be fetched just now, so the worked example cannot be shown. Nothing was requested; try again in a moment.', 503, 'provider_unavailable');
+          if (!rate) throw new OpsError('The provider’s rate could not be fetched just now, so the worked example cannot be shown. Nothing was changed; try again in a moment.', 503, 'provider_unavailable');
           const examples = [workedExample(current, wanted, rate), workedExample(current, wanted, rate, 'GBPUSD', '10000', 'buy')];
           const topTier = [...wanted.tiers, ...current.tiers].map((item) => item.fromAmount).sort((a, b) => Number(b) - Number(a))[0];
           if (topTier) examples.push(workedExample(current, wanted, rate, 'GBPUSD', topTier));
@@ -1368,14 +1388,14 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
             const other = await providerRateFor(company, item.pair);
             if (other) examples.push(workedExample(current, wanted, other, item.pair, '10000', item.direction === 'buy' ? 'buy' : 'sell'));
           }
-          const warnings = [`Every conversion this company’s people book from the moment this is approved is priced with the new margin. A quote one of them is holding from before the change cannot be booked: they are told it has expired and get a new one at the new margin.`];
+          const warnings = [`Every conversion this company’s people book from the moment you confirm is priced with the new margin. Nobody else approves this: it is recorded in your name and shown to the other staff.`, `A quote one of them is holding from before the change cannot be booked: they are told it has expired and get a new one at the new margin.`];
           const highest = Math.max(wanted.defaultBps, wanted.forwardBps ?? 0, ...wanted.overrides.map((item) => item.bps), ...wanted.tiers.map((item) => item.bps));
-          if (highest > MARGIN_USUAL_MAX_BPS) warnings.push(`This sets a margin of ${highest} basis points (${highest / 100}%), above the usual limit of ${MARGIN_USUAL_MAX_BPS}. It was asked for explicitly.`);
+          if (highest > MARGIN_USUAL_MAX_BPS) warnings.push(`This sets a margin of ${marginPercent(highest)}, above the usual limit of ${marginPercent(MARGIN_USUAL_MAX_BPS)}. It was asked for explicitly.`);
           if (wanted.defaultBps === 0) warnings.push('The default margin becomes ZERO: Global Connect earns nothing on this company’s conversions unless an override or tier applies.');
           if (rates.appliedBy(company) === 'provider') warnings.push('For this company’s provider the margin is applied BY THE PROVIDER (MARGIN_APPLIED_BY_… = provider). This configuration is stored but is NOT used to price anything while that is so.');
           return {
             params: { id: company.id, config: JSON.stringify(wanted), from: JSON.stringify(current), allowHigh: allowHigh ? 'yes' : 'no' },
-            summary: `Change the FX margin for company ${describe(company)} FROM ${describeMargin(current)}${record ? '' : ' (the server default)'} TO ${describeMargin(wanted)}. Worked example at the provider’s rate when this was requested: ${examples.join('; ')}.`,
+            summary: `Change the FX margin for company ${describe(company)} FROM ${describeMargin(current)}${record ? '' : ' (the server default)'} TO ${describeMargin(wanted)}. Worked example at the provider’s rate now: ${examples.join('; ')}.`,
             warnings,
           };
         },
@@ -1390,13 +1410,24 @@ export async function registerOps(app: FastifyInstance, deps: OpsDeps): Promise<
           }
           const fallback = (await rates.marginOf('')).config;
           let from = params.from ?? '';
-          await stores.margins.mutate(company.id, (current) => {
-            const now_ = JSON.stringify(current ? marginConfigOf(current) : fallback);
-            // What was approved was a change FROM a particular configuration. If it moved since, it is asked for again.
-            if (now_ !== JSON.stringify(wanted) && now_ !== params.from) throw new OpsError('The company’s margin changed since this was requested. Make the request again.', 409, 'stale');
-            from = now_ === JSON.stringify(wanted) ? from : now_;
-            return { ...wanted, companyId: company.id, updatedAt: now(), updatedBy: actors.requester.email, approvedBy: actors.approver?.email ?? null };
-          });
+          const at = now();
+          let changed = false;
+          await stores.margins.mutate(
+            company.id,
+            (current) => {
+              const now_ = JSON.stringify(current ? marginConfigOf(current) : fallback);
+              // What was confirmed was a change FROM a particular configuration. If a colleague changed it meanwhile, it is looked at again.
+              if (now_ !== JSON.stringify(wanted) && now_ !== params.from) throw new OpsError('The company’s margin was changed by somebody else since you opened this. Nothing was changed; look at it again.', 409, 'stale');
+              changed = now_ !== JSON.stringify(wanted);
+              from = changed ? now_ : from;
+              return { ...wanted, companyId: company.id, updatedAt: at, updatedBy: actors.requester.email, approvedBy: actors.approver?.email ?? null };
+            },
+            // ON RECORD WITH THE CHANGE ITSELF (one transaction): who, which company, from what, to what. One person did this alone.
+            (saved) =>
+              changed && saved
+                ? { at, actor: opsParty(actors.requester), target: companyParty(company), action: 'ops.margin.changed', outcome: 'success', source: actors.source, detail: { company: company.name, from: describeMargin(JSON.parse(from) as MarginConfig), to: describeMargin(wanted), by: actors.requester.email, approvedBy: actors.approver?.email ?? 'nobody: one person may change a margin' } }
+                : null,
+          );
           return { target: companyParty(company), detail: { from: describeMargin(JSON.parse(from) as MarginConfig), to: describeMargin(wanted) }, redirect: `/ops/companies/${company.id}?done=saved` };
         },
       });
@@ -1446,7 +1477,7 @@ ${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s 
             )}</table></div>` : ''}
 <div class="card"><h2>Conversions</h2><table><tr><th>When</th><th>Company</th><th>Trade</th><th>Provider rate</th><th>Client rate</th><th>Margin</th><th>Revenue</th><th>Status</th></tr>${rows.slice(0, 200).map(
               (row) =>
-                h`<tr><td>${when(row.bookedAt ?? row.createdAt)}</td><td><a href="/ops/companies/${row.companyId}">${companies.get(row.companyId) ?? row.companyId}</a></td><td>${row.kind === 'forward' ? 'Forward: ' : ''}sold ${row.sellCurrency} ${row.clientSellAmount}, bought ${row.buyCurrency} ${row.clientBuyAmount}</td><td>${row.providerRate}</td><td>${row.clientRate}</td><td>${row.marginBps === null ? 'by the provider' : `${row.marginBps} bp${row.effectiveBps ? ` (${row.effectiveBps} after rounding)` : ''}`}</td><td>${row.revenueAmount === null ? 'not known here' : row.mismatch ? 'not counted' : `${row.revenueCurrency ?? ''} ${row.revenueAmount}`}</td><td>${row.status === 'booked' ? (row.mismatch ? h`<span class="tag bad">Booked: CHECK, the provider did not confirm the client’s terms</span>` : 'Booked') : h`<span class="tag bad">Not confirmed by the provider</span>`}</td></tr>`,
+                h`<tr><td>${when(row.bookedAt ?? row.createdAt)}</td><td><a href="/ops/companies/${row.companyId}">${companies.get(row.companyId) ?? row.companyId}</a></td><td>${row.kind === 'forward' ? 'Forward: ' : ''}sold ${row.sellCurrency} ${row.clientSellAmount}, bought ${row.buyCurrency} ${row.clientBuyAmount}</td><td>${row.providerRate}</td><td>${row.clientRate}</td><td>${row.marginBps === null ? 'by the provider' : `${marginPercent(row.marginBps)}${row.effectiveBps ? ` (${marginPercent(row.effectiveBps)} after rounding)` : ''}`}</td><td>${row.revenueAmount === null ? 'not known here' : row.mismatch ? 'not counted' : `${row.revenueCurrency ?? ''} ${row.revenueAmount}`}</td><td>${row.status === 'booked' ? (row.mismatch ? h`<span class="tag bad">Booked: CHECK, the provider did not confirm the client’s terms</span>` : 'Booked') : h`<span class="tag bad">Not confirmed by the provider</span>`}</td></tr>`,
             )}</table>${rows.length === 0 && h`<p class="muted">No conversions in this period.</p>`}${rows.length > 200 && h`<p class="muted">Showing the latest 200 of ${String(rows.length)}. The CSV has them all.</p>`}</div>`,
           ),
         );
@@ -1459,9 +1490,9 @@ ${mismatched.length > 0 ? h`<div class="card"><h2>Booked WITHOUT the client’s 
           const safe = /^[=+\-@\t\r]/.test(textValue) && !/^-?\d+(\.\d+)?$/.test(textValue) ? `'${textValue}` : textValue;
           return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
         };
-        const header = ['booked_at', 'company_id', 'company', 'conversion_id', 'status', 'kind', 'pair', 'direction', 'sell_currency', 'buy_currency', 'provider_rate', 'client_rate', 'provider_sell_amount', 'provider_buy_amount', 'client_sell_amount', 'client_buy_amount', 'margin_bps', 'effective_margin_bps', 'margin_applied_by', 'revenue_amount', 'revenue_currency', 'counted_in_totals', 'booked_sell_amount', 'booked_buy_amount', 'needs_checking'];
+        const header = ['booked_at', 'company_id', 'company', 'conversion_id', 'status', 'kind', 'pair', 'direction', 'sell_currency', 'buy_currency', 'provider_rate', 'client_rate', 'provider_sell_amount', 'provider_buy_amount', 'client_sell_amount', 'client_buy_amount', 'margin_percent', 'effective_margin_percent', 'margin_applied_by', 'revenue_amount', 'revenue_currency', 'counted_in_totals', 'booked_sell_amount', 'booked_buy_amount', 'needs_checking'];
         const lines = rows.map((row) =>
-          [new Date(row.bookedAt ?? row.createdAt).toISOString(), row.companyId, companies.get(row.companyId) ?? '', row.conversionId, row.status, row.kind, row.pair, row.direction, row.sellCurrency, row.buyCurrency, row.providerRate, row.clientRate, row.providerSellAmount, row.providerBuyAmount, row.clientSellAmount, row.clientBuyAmount, row.marginBps, row.effectiveBps ?? null, row.appliedBy, row.revenueAmount, row.revenueCurrency, row.status === 'booked' && !row.mismatch && row.revenueAmount !== null ? 'yes' : 'no', row.bookedSellAmount ?? null, row.bookedBuyAmount ?? null, row.mismatch || row.status !== 'booked' ? 'yes' : 'no'].map(cell).join(','),
+          [new Date(row.bookedAt ?? row.createdAt).toISOString(), row.companyId, companies.get(row.companyId) ?? '', row.conversionId, row.status, row.kind, row.pair, row.direction, row.sellCurrency, row.buyCurrency, row.providerRate, row.clientRate, row.providerSellAmount, row.providerBuyAmount, row.clientSellAmount, row.clientBuyAmount, row.marginBps === null ? null : marginPercent(row.marginBps).slice(0, -1), row.effectiveBps ? marginPercent(row.effectiveBps).slice(0, -1) : null, row.appliedBy, row.revenueAmount, row.revenueCurrency, row.status === 'booked' && !row.mismatch && row.revenueAmount !== null ? 'yes' : 'no', row.bookedSellAmount ?? null, row.bookedBuyAmount ?? null, row.mismatch || row.status !== 'booked' ? 'yes' : 'no'].map(cell).join(','),
         );
         await append(opsParty(ctx.user), 'ops.revenue.export', 'success', null, request.ip, { rows: String(rows.length), company: filters.company || 'all', from: filters.from || '-', to: filters.to || '-' });
         return reply.status(200).type('text/csv; charset=utf-8').header('Content-Disposition', 'attachment; filename="global-connect-revenue.csv"').send(`${[header.join(','), ...lines].join('\r\n')}\r\n`);

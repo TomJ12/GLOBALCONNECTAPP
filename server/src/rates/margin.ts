@@ -102,16 +102,42 @@ const canonical = (pair: string, direction: Direction): string => {
 const isBps = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value);
 
 /**
+ * PEOPLE READ AND TYPE PERCENTAGES; THE SERVER KEEPS WHOLE BASIS POINTS. These two functions are the only place
+ * the two meet: nothing else converts, and all arithmetic stays in basis points.
+ *
+ * "0.50%": a margin of so many basis points, as a percentage to two places (exact: decimal arithmetic).
+ */
+export const marginPercent = (bps: number | string): string => `${new Big(bps).div(100).toFixed(2)}%`;
+
+/**
+ * What a person typed as a percentage, in basis points. Accepted: digits, optionally one decimal separator (a dot
+ * or a comma) and up to two decimal places (steps of 0.01%, which is one basis point), optionally a % sign.
+ * "0.5", "0,75", "1.25%", "1 %". Everything else is refused, with the unit in the message: a third decimal place
+ * ("0.005"), a thousands separator ("1,000"), a sign, "bp", an empty value. NOTE "50" MEANS 50%: it is returned
+ * as 5000 and the ceiling refuses it in words that show the unit.
+ */
+export function parseMarginPercent(typed: string, what: string): number {
+  const value = typed.trim();
+  if (/^-/.test(value)) throw new MarginError(`${what} cannot be negative: a negative margin would pay the client to trade.`);
+  const match = /^(\d{1,4})(?:[.,](\d{1,2}))?\s*%?$/.exec(value);
+  if (!match) {
+    if (/^\d{1,4}[.,]\d{3,}\s*%?$/.test(value)) throw new MarginError(`${what} is a percentage with at most two decimal places (steps of 0.01%): “${value.slice(0, 12)}” has more. For half a percent write 0.50.`);
+    throw new MarginError(`${what} is written as a percentage, like 0.50 or 0.50% (that is half of one percent). “${value.slice(0, 12)}” is not one.`);
+  }
+  return Number(match[1]) * 100 + Number((match[2] ?? '').padEnd(2, '0'));
+}
+
+/**
  * Checks a margin configuration. Negative margins are never accepted (the
  * client would be paid to trade). One above MARGIN_USUAL_MAX_BPS is accepted
  * only with `allowHigh`, and never above MARGIN_HARD_MAX_BPS.
  */
 export function checkMarginConfig(config: MarginConfig, allowHigh: boolean): MarginConfig {
   const bps = (value: unknown, what: string): number => {
-    if (!isBps(value)) throw new MarginError(`${what} must be a whole number of basis points.`);
+    if (!isBps(value)) throw new MarginError(`${what} must be a percentage in steps of 0.01%.`);
     if (value < 0) throw new MarginError(`${what} cannot be negative: a negative margin would pay the client to trade.`);
-    if (value > MARGIN_HARD_MAX_BPS) throw new MarginError(`${what} cannot be more than ${MARGIN_HARD_MAX_BPS} basis points (${MARGIN_HARD_MAX_BPS / 100}%).`);
-    if (value > MARGIN_USUAL_MAX_BPS && !allowHigh) throw new MarginError(`${what} is ${value} basis points (${value / 100}%), which is more than ${MARGIN_USUAL_MAX_BPS}. If that is really meant, tick "allow a margin this high".`);
+    if (value > MARGIN_HARD_MAX_BPS) throw new MarginError(`${what}: ${marginPercent(value)} is above the maximum of ${marginPercent(MARGIN_HARD_MAX_BPS)}. (Margins are percentages: for half a percent write 0.50.)`);
+    if (value > MARGIN_USUAL_MAX_BPS && !allowHigh) throw new MarginError(`${what}: ${marginPercent(value)} is above the usual limit of ${marginPercent(MARGIN_USUAL_MAX_BPS)}. If that is really meant, tick "allow a margin this high". (Margins are percentages: for half a percent write 0.50.)`);
     return value;
   };
   const defaultBps = bps(config.defaultBps, 'The default margin');
@@ -133,7 +159,7 @@ export function checkMarginConfig(config: MarginConfig, allowHigh: boolean): Mar
     const amount = new Big(item.fromAmount);
     const value = bps(item.bps, `The margin from ${item.fromAmount}`);
     if (!amount.gt(previous.amount)) throw new MarginError('Tiers must be in ascending order of amount, each amount once.');
-    if (value > previous.bps) throw new MarginError(`The tier from ${item.fromAmount} has a HIGHER margin (${value}) than the one before it (${previous.bps}). Larger amounts get a smaller margin, or the same.`);
+    if (value > previous.bps) throw new MarginError(`The tier from ${item.fromAmount} has a HIGHER margin (${marginPercent(value)}) than the one before it (${marginPercent(previous.bps)}). Larger amounts get a smaller margin, or the same.`);
     previous = { amount, bps: value };
     return { fromAmount: amount.toString(), bps: value };
   });
@@ -295,10 +321,10 @@ export function clientTermsOf(provider: ProviderTerms, bps: number): ClientTerms
 /** One line of a margin configuration in words, for staff and the audit log. */
 export function describeMargin(config: MarginConfig): string {
   return [
-    `default ${config.defaultBps} bp`,
-    config.forwardBps === null ? 'forwards as spot' : `forwards ${config.forwardBps} bp`,
-    ...config.overrides.map((item) => `${item.pair} ${item.direction} ${item.bps} bp`),
-    ...config.tiers.map((item) => `from ${config.tierCurrency ?? DEFAULT_TIER_CURRENCY} ${item.fromAmount}: ${item.bps} bp`),
+    `default ${marginPercent(config.defaultBps)}`,
+    config.forwardBps === null ? 'forwards as spot' : `forwards ${marginPercent(config.forwardBps)}`,
+    ...config.overrides.map((item) => `${item.pair} ${item.direction} ${marginPercent(item.bps)}`),
+    ...config.tiers.map((item) => `from ${config.tierCurrency ?? DEFAULT_TIER_CURRENCY} ${item.fromAmount}: ${marginPercent(item.bps)}`),
   ].join('; ');
 }
 

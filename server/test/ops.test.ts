@@ -45,6 +45,33 @@ class Browser {
   post(url: string, form: Record<string, string> = {}, headers: Record<string, string> = {}) {
     return this.request('POST', url, { _csrf: this.csrf, ...form }, headers);
   }
+  /**
+   * SUBMITS A FORM AS THE PAGE RENDERS IT: the form that posts to `action` on the page this browser received
+   * last. Hidden fields go as the page gave them, other fields as the page pre-filled them unless `values` says
+   * otherwise, a checkbox only when `values` names it. A value for a field THE FORM DOES NOT HOLD is refused: a
+   * person can only send what the form offers, so a test that could send more would pass on a page nobody can use.
+   */
+  submit(action: string, values: Record<string, string> = {}, headers: Record<string, string> = {}) {
+    const unescape = (text: string) => text.replace(/&(amp|lt|gt|quot|#39);/g, (_all, name: string) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" })[name] as string);
+    const page = this.pages.at(-1) ?? '';
+    const form = [...page.matchAll(/<form method="post" action="([^"]*)"[^>]*>([^]*?)<\/form>/g)].find((match) => unescape(match[1] ?? '') === action)?.[2];
+    if (form === undefined) throw new Error(`the page has no form that posts to ${action}`);
+    const body: Record<string, string> = {};
+    const offered = new Set<string>();
+    for (const [, tag = '', attributes = '', content = ''] of form.matchAll(/<(input|select|textarea)\b([^>]*)>(?:([^<]*)<\/textarea>)?/g)) {
+      const name = /\bname="([^"]*)"/.exec(attributes)?.[1];
+      if (!name) continue;
+      offered.add(name);
+      const type = tag === 'input' ? (/\btype="([^"]*)"/.exec(attributes)?.[1] ?? 'text') : tag;
+      if (type === 'checkbox' || type === 'radio' || type === 'select') continue;
+      body[name] = unescape(tag === 'textarea' ? content : (/\bvalue="([^"]*)"/.exec(attributes)?.[1] ?? ''));
+    }
+    for (const [name, value] of Object.entries(values)) {
+      if (!offered.has(name)) throw new Error(`the form that posts to ${action} has no field "${name}": a person could not send it`);
+      body[name] = value;
+    }
+    return this.request('POST', action, body, headers);
+  }
 }
 
 interface Staff {
@@ -61,17 +88,17 @@ async function activateStaff(email: string, role: OpsRole, password = OPS_PASSWO
   const user = (await h.stores.ops.users.findByEmail(email)) ?? (await h.opsAuth.createUser(email, 'Staff Person', role));
   const { activationCode } = await h.opsAuth.createInvite(user.id);
   const browser = new Browser();
+  // Every step is SUBMITTED FROM THE FORM THE PAGE SHOWS (Browser.submit): a field the page does not offer cannot be sent.
   assert.equal((await browser.get('/ops/activate')).status, 200);
-  assert.match((await browser.post('/ops/activate', { activationCode })).body, /Choose a password/);
-  const enrol = await browser.post('/ops/activate/password', { activationCode, password });
+  assert.match((await browser.submit('/ops/activate', { activationCode })).body, /Choose a password/);
+  const enrol = await browser.submit('/ops/activate/password', { password });
   assert.match(enrol.body, /<svg class="qr"/);
-  // The page must offer the field this step posts: a person, unlike this test, can only send what the form holds.
   assert.match(enrol.body, /<form method="post" action="\/ops\/activate\/confirm">[^]*?<input name="code"[^]*?<\/form>/);
-  const refused = await browser.post('/ops/activate/confirm', { activationCode, code: '000000' });
+  const refused = await browser.submit('/ops/activate/confirm', { code: '000000' });
   assert.match(refused.body, /not accepted[^]*<input name="code"/);
   const secret = /<p class="secret">([A-Z2-7]+)<\/p>/.exec(enrol.body)?.[1] ?? '';
   assert.ok(secret.length >= 32);
-  const done = await browser.post('/ops/activate/confirm', { activationCode, code: h.code(secret) });
+  const done = await browser.submit('/ops/activate/confirm', { code: h.code(secret) });
   assert.equal(done.status, 200);
   const recoveryCodes = [...done.body.matchAll(/<li>([A-Z2-7-]+)<\/li>/g)].map((match) => match[1] as string);
   assert.equal(recoveryCodes.length, 10);
@@ -81,10 +108,9 @@ async function activateStaff(email: string, role: OpsRole, password = OPS_PASSWO
 
 async function signIn(browser: Browser, email: string, secret: string, password = OPS_PASSWORD) {
   await browser.get('/ops/login');
-  const first = await browser.post('/ops/login', { email, password });
-  const challengeId = /name="challengeId" value="([^"]+)"/.exec(first.body)?.[1];
-  if (!challengeId) return first;
-  return browser.post('/ops/login/verify', { challengeId, code: h.freshCode(secret), method: 'totp' });
+  const first = await browser.submit('/ops/login', { email, password });
+  if (!/name="challengeId" value="([^"]+)"/.test(first.body)) return first;
+  return browser.submit('/ops/login/verify', { code: h.freshCode(secret) });
 }
 
 async function staff(email = 'admin@globalconnect.example', role: OpsRole = 'ops_admin'): Promise<Staff> {
@@ -1749,7 +1775,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   const ask = async (email: string) => {
     const browser = fresh();
     await browser.get('/ops/forgot');
-    const reply = await browser.post('/ops/forgot', { email });
+    const reply = await browser.submit('/ops/forgot', { email });
     await h.opsAuth.settle();
     return reply;
   };
@@ -1765,7 +1791,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   const opened = async (url: string, form: Record<string, string>) => {
     const browser = fresh();
     await browser.get(url);
-    return browser.post(url, form);
+    return browser.submit(url, form);
   };
   // A second request for the same person: the earlier link STILL works (anyone can ask, so asking kills nothing).
   // From one network, two links an hour for one account; a third request makes none.
@@ -1785,21 +1811,22 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   const before = await h.stores.ops.users.get(admin.id);
   const browser = fresh();
   await browser.get('/ops/reset');
-  assert.match((await browser.post('/ops/reset', { resetCode: 'AAAAA-BBBBB-CCCCC-DDDDD' })).body, /That reset link is not valid any more/);
-  assert.match((await browser.post('/ops/reset', { resetCode: live })).body, /Choose a new password[^]*Code from your authenticator app, or a recovery code/);
+  assert.match((await browser.submit('/ops/reset', { resetCode: 'AAAAA-BBBBB-CCCCC-DDDDD' })).body, /That reset link is not valid any more/);
+  assert.match((await browser.submit('/ops/reset', { resetCode: live })).body, /Choose a new password[^]*Code from your authenticator app, or a recovery code/);
   // The link without the second factor: refused, nothing changed, nobody signed out.
   for (const code of ['', '000000', OPS_PASSWORD]) {
-    const refused = await browser.post('/ops/reset/complete', { resetCode: live, code, password: 'a completely new staff password' });
+    // (Submitted from the form each page shows: after a refusal the form, with the link's code in it, is there again.)
+    const refused = await browser.submit('/ops/reset/complete', { code, password: 'a completely new staff password' });
     assert.ok(refused.status >= 400, code);
   }
   assert.equal((await h.stores.ops.users.get(admin.id))?.passwordHash, before?.passwordHash);
   assert.equal((await admin.browser.get('/ops/users')).status, 200);
-  assert.match((await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'password1234' })).body, /password/i);
+  assert.match((await browser.submit('/ops/reset/complete', { code: h.freshCode(admin.secret), password: 'password1234' })).body, /password/i);
   // With a code: the password changes, only the password; every session of theirs ends; the new password signs in.
   // (A confirmation page open in the session they have now: its token must not outlive that session.)
   const heldToken = confirmTokenOf((await admin.browser.post('/ops/users/usr_ben/disable')).body) as string;
   assert.ok(heldToken);
-  const done = await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'a completely new staff password' });
+  const done = await browser.submit('/ops/reset/complete', { code: h.freshCode(admin.secret), password: 'a completely new staff password' });
   assert.deepEqual([done.status, done.location], [303, '/ops/login?done=password_reset']);
   assert.match((await opened('/ops/reset', { resetCode: firstLink })).body, /That reset link is not valid any more/, 'a reset ends every link that was live');
   // The session is gone and so is what its confirmation token could do: in the old session, and carried into a new one.
@@ -1820,11 +1847,13 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.equal((await signIn(fresh(), admin.email, admin.secret, 'a completely new staff password')).status, 303);
   assert.match(h.outbox.sent.at(-1)?.subject ?? '', /^Security notice for your Global Connect staff account$/);
   // Once only; and a recovery code does as well as the authenticator.
+  // (A replay, not a person at a page: posted by hand.)
   assert.match((await browser.post('/ops/reset/complete', { resetCode: live, code: h.freshCode(admin.secret), password: 'one more long staff password' })).body, /not valid any more/);
   await ask(second.email);
   const other = fresh();
   await other.get('/ops/reset');
-  const recovered = await other.post('/ops/reset/complete', { resetCode: resetLink(second.email), code: second.recoveryCodes[0] as string, method: 'recovery', password: 'a completely new staff password 2' });
+  await other.submit('/ops/reset', { resetCode: resetLink(second.email) });
+  const recovered = await other.submit('/ops/reset/complete', { code: second.recoveryCodes[0] as string, method: 'recovery', password: 'a completely new staff password 2' });
   assert.equal(recovered.status, 303);
   assert.equal((await h.stores.ops.users.get(second.id))?.recoveryCodeHashes.length, 9);
   // On record, without the code, the link or the password.
@@ -1857,7 +1886,7 @@ test('staff password reset: the same page whoever asks; the emailed link AND a c
   assert.equal(h.outbox.sent.length, count);
 });
 
-test('ops: a company’s FX margin is changed by request with a worked example, approved only by an ops admin with their password, bounded, audited with old and new values; revenue is for ops admins only', async () => {
+test('ops: ONE member of staff changes a company’s FX margin, in percentages, after a confirmation page with a worked example; bounded; audited and shown to the other staff; a held quote from before cannot be booked; revenue is for ops admins only', async () => {
   h = await harness();
   const admin = await staff();
   const olu = await staff('olu@globalconnect.example', 'ops');
@@ -1867,93 +1896,131 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const clientRate = async () => (await h.call('GET', '/v1/rates/GBP/USD', { token: amira })).json;
   const stored = () => h.stores.margins.get('co_northfield');
   const url = '/ops/companies/co_northfield/margin';
-  const form = (extra: Record<string, string> = {}) => ({ defaultBps: '80', forwardBps: '', overrides: '', tiers: '', ...extra });
+  // The form is filled in and submitted AS THE COMPANY PAGE RENDERS IT, and then the confirmation page's own form.
+  const fill = async (who: Staff, fields: Record<string, string>) => {
+    await who.browser.get('/ops/companies/co_northfield');
+    return who.browser.submit(url, { forwardPercent: '', overrides: '', tiers: '', ...fields });
+  };
+  const change = async (who: Staff, fields: Record<string, string>) => {
+    const shown = await fill(who, fields);
+    return shown.status === 200 && confirmTokenOf(shown.body) ? who.browser.submit(url) : shown;
+  };
 
-  // Anyone on staff can see the configuration (here: the server default), and what it means.
+  // Anyone on staff can see the configuration (here: the server default), IN PERCENT, and the form is pre-filled in percent.
   const page = await olu.browser.get('/ops/companies/co_northfield');
-  assert.match(page.body, /<h2>FX margin<\/h2><p>Now: <strong>default 50 bp; forwards as spot<\/strong> \(the server default: this company has no configuration of its own\)/);
-  assert.match(page.body, /A client only ever sees their own rate: never the provider’s rate and never this margin/);
+  assert.match(page.body, /<h2>FX margin<\/h2><p>Now: <strong>default 0\.50%; forwards as spot<\/strong> \(the server default: this company has no configuration of its own\)/);
+  assert.match(page.body, /Default margin, as a percentage \(0\.50 is half of one percent; steps of 0\.01\) <input name="defaultPercent" inputmode="decimal" required maxlength="8" value="0\.50">/);
+  assert.match(page.body, /A change takes effect as soon as you confirm it: no second person is needed/);
+  assert.doesNotMatch(page.body, /basis point|\d bp\b/);
   assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.2934', '1.3065']);
 
-  // BOUNDS. Negative: never. Above 300 bp: only when the request says so. Above 2000: never. Nothing is requested.
+  // BOUNDS, said in percent. Negative: never. Above 3%: only with the tick-box. Above 20%: never. "50" MEANS 50%.
   const refused = async (fields: Record<string, string>, message: RegExp) => {
-    const reply = await olu.act(url, form(fields));
+    const reply = await change(olu, { defaultPercent: '0.80', ...fields });
     assert.equal(reply.status, 400, `${JSON.stringify(fields)} -> ${reply.status}`);
     assert.match(reply.body, message, JSON.stringify(fields));
   };
-  await refused({ defaultBps: '-5' }, /A negative margin is never accepted/);
-  await refused({ overrides: 'GBPUSD sell -10' }, /A negative margin is never accepted/);
-  await refused({ tiers: '50000 -1' }, /A negative margin is never accepted/);
-  await refused({ defaultBps: '301' }, /is 301 basis points \(3\.01%\), which is more than 300/);
-  await refused({ forwardBps: '450' }, /more than 300/);
-  await refused({ defaultBps: '2001', allowHigh: 'yes' }, /cannot be more than 2000/);
-  await refused({ defaultBps: 'lots' }, /whole number of basis points/);
-  await refused({ overrides: 'GBPUSD sideways 10' }, /is not an override/);
-  await refused({ overrides: 'GBPGBP sell 10' }, /is not a currency pair/);
-  await refused({ tiers: '50000 90' }, /HIGHER margin/);
+  await refused({ defaultPercent: '-0.05' }, /cannot be negative/);
+  await refused({ overrides: 'GBPUSD sell -0.10' }, /cannot be negative/);
+  await refused({ tiers: '50000 -0.01' }, /cannot be negative/);
+  await refused({ defaultPercent: '3.01' }, /The default margin: 3\.01% is above the usual limit of 3\.00%\. If that is really meant, tick/);
+  await refused({ forwardPercent: '4.5' }, /4\.50% is above the usual limit of 3\.00%/);
+  await refused({ defaultPercent: '20.01', allowHigh: 'yes' }, /20\.01% is above the maximum of 20\.00%/);
+  await refused({ defaultPercent: '50' }, /The default margin: 50\.00% is above the maximum of 20\.00%\. \(Margins are percentages: for half a percent write 0\.50\.\)/);
+  await refused({ defaultPercent: '50', allowHigh: 'yes' }, /50\.00% is above the maximum of 20\.00%/);
+  await refused({ defaultPercent: '0.005' }, /at most two decimal places \(steps of 0\.01%\)/);
+  await refused({ defaultPercent: '1,000' }, /at most two decimal places/);
+  await refused({ defaultPercent: 'lots' }, /is written as a percentage, like 0\.50 or 0\.50%/);
+  await refused({ defaultPercent: '50bp' }, /is written as a percentage/);
+  await refused({ overrides: 'GBPUSD sideways 0.10' }, /is not an override/);
+  await refused({ overrides: 'GBPGBP sell 0.10' }, /is not a currency pair/);
+  await refused({ tiers: '50000 0.90' }, /HIGHER margin \(0\.90%\) than the one before it \(0\.80%\)/);
   assert.equal(await stored(), null);
-  assert.equal((await h.stores.ops.approvals.list()).filter((item) => item.action === 'company.margin').length, 0);
 
-  // The confirmation page (before anything is requested) is marked high-impact and shows the worked example.
-  const confirmation = await olu.browser.post(url, form({ overrides: 'GBPUSD sell 40\nEURUSD both 35', tiers: '50000 60' }));
+  // A quote the client is holding from before the change.
+  const heldBefore = (await h.call('POST', '/v1/quotes', { token: amira, body: { kind: 'spot', sellCurrency: 'GBP', buyCurrency: 'USD', fixedSide: 'sell', amount: '100.00' } })).json;
+
+  // THE CONFIRMATION PAGE: high-impact, old and new values in percent, the worked example, and NO password and NO second person.
+  // (Typed with a comma, a % sign and a space before it: all mean the same.)
+  const wanted = { defaultPercent: '0,80', forwardPercent: '1.2%', overrides: 'GBPUSD sell 0.40\nEURUSD both 0,35 %', tiers: '50000 0.6' };
+  const confirmation = await fill(olu, wanted);
   assert.equal(confirmation.status, 200);
-  assert.match(confirmation.body, /selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800, so they receive USD 12948\.00 instead of USD 12935\.00/);
-
-  // An ops user asks. Nothing changes yet. The request says old and new and what it does to a real trade.
-  const asked = await olu.act(url, form({ overrides: 'GBPUSD sell 40\nEURUSD both 35', tiers: '50000 60', forwardBps: '120' }));
-  assert.equal(asked.status, 303, asked.body.slice(-400));
-  const id = idOf(asked.location);
+  assert.match(confirmation.body, /Change the FX margin for company “Northfield Trading Ltd” \(co_northfield\) FROM default 0\.50%; forwards as spot \(the server default\) TO default 0\.80%; forwards 1\.20%; GBPUSD sell 0\.40%; EURUSD both 0\.35%; from GBP 50000: 0\.60%\./);
+  assert.match(confirmation.body, /Worked example at the provider’s rate now: selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800, so they receive USD 12948\.00 instead of USD 12935\.00; buying GBP 10,000 with USD: the client rate changes from 1\.306500 to 1\.310400, so they pay USD 13104\.00 instead of USD 13065\.00; selling GBP 50,000 for USD: [^;]+; a forward selling GBP 10,000 for USD: /);
+  assert.match(confirmation.body, /This takes effect as soon as you confirm\./);
+  assert.match(confirmation.body, /Nobody else approves this: it is recorded in your name and shown to the other staff\./);
+  assert.match(confirmation.body, /A quote one of them is holding from before the change cannot be booked/);
+  assert.match(confirmation.body, /class="danger"/);
+  assert.doesNotMatch(confirmation.body, /name="password"|keep the rate|basis point|\d bp\b/);
+  // Looking is not doing: nothing has changed.
   assert.equal(await stored(), null);
   assert.equal((await clientRate()).rate, '1.2934');
-  const request = await h.stores.ops.approvals.get(id);
-  assert.match(request?.summary ?? '', /Change the FX margin for company “Northfield Trading Ltd” \(co_northfield\) FROM default 50 bp; forwards as spot \(the server default\) TO default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from GBP 50000: 60 bp\./);
-  assert.match(request?.summary ?? '', /Worked example at the provider’s rate when this was requested: selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800, so they receive USD 12948\.00 instead of USD 12935\.00; buying GBP 10,000 with USD: the client rate changes from 1\.306500 to 1\.310400, so they pay USD 13104\.00 instead of USD 13065\.00; selling GBP 50,000 for USD: [^;]+; a forward selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.284400[^;]+; selling EUR 10,000 for USD: /);
-  const approvalPage = await admin.browser.get(`/ops/approvals/${id}`);
-  assert.match(approvalPage.body, /selling GBP 10,000 for USD: the client rate changes from 1\.293500 to 1\.294800/);
-  assert.match(approvalPage.body, /Every conversion this company’s people book from the moment this is approved is priced with the new margin/);
-  // ...and the truth about quotes already held: they cannot be booked after the change (the page used to say they keep their rate).
-  assert.match(approvalPage.body, /A quote one of them is holding from before the change cannot be booked/);
-  assert.doesNotMatch(approvalPage.body, /keep the rate/);
-  // Another ops USER cannot approve it, nor can the requester; an ops admin can, and only with their password.
-  assert.equal((await pat.act(`/ops/approvals/${id}/approve`)).status, 403);
-  assert.equal((await olu.act(`/ops/approvals/${id}/approve`)).status, 403);
-  const approve = `/ops/approvals/${id}/approve`;
-  const needsPassword = await admin.browser.post(approve, {});
-  assert.match(needsPassword.body, /name="password"/);
-  const wrong = await confirmed((to, fields) => admin.browser.post(to, fields), approve, {}, 'not the password');
-  assert.notEqual(wrong.status, 303);
-  assert.equal(await stored(), null);
-  assert.equal((await clientRate()).rate, '1.2934');
-  assert.equal((await admin.act(approve)).status, 303);
 
-  // Done: stored, the client's rate moved (override: 40 bp selling GBP; default 80 bp buying), audited with old and new values and both people.
+  // CONFIRMED BY THAT ONE PERSON, an ops USER: done at once. No request is made and nobody else is asked.
+  h.clock.advance(1000);
+  const done = await olu.browser.submit(url);
+  assert.deepEqual([done.status, done.location], [303, '/ops/companies/co_northfield?done=saved']);
+  assert.equal((await h.stores.ops.approvals.list()).filter((item) => item.action === 'company.margin').length, 0);
   const now = await stored();
-  assert.deepEqual([now?.defaultBps, now?.forwardBps, now?.overrides, now?.tiers, now?.updatedBy, now?.approvedBy], [80, 120, [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }, { pair: 'EURUSD', direction: 'both', bps: 35 }], [{ fromAmount: '50000', bps: 60 }], olu.email, admin.email]);
+  assert.deepEqual([now?.defaultBps, now?.forwardBps, now?.overrides, now?.tiers, now?.updatedBy, now?.approvedBy], [80, 120, [{ pair: 'GBPUSD', direction: 'sell', bps: 40 }, { pair: 'EURUSD', direction: 'both', bps: 35 }], [{ fromAmount: '50000', bps: 60 }], olu.email, null]);
   assert.deepEqual([(await clientRate()).rate, (await clientRate()).buyRate], ['1.2947', '1.3104']);
+  // The quote held under the old margin cannot be booked now.
+  const late = await h.call('POST', '/v1/conversions', { token: amira, body: { quoteId: heldBefore.id }, headers: { 'idempotency-key': 'ops-margin-held-0001' } });
+  assert.deepEqual([late.status, late.json], [409, { error: { kind: 'quote_expired' } }]);
+  // ON RECORD, prominently: its own entry, written with the change, with who, which company, old and new values.
+  const changes = await audit('ops.margin.changed');
+  assert.deepEqual(changes.map((item) => [item.actor.label, item.target?.id, item.outcome, item.detail.company, item.detail.from, item.detail.to, item.detail.approvedBy]), [
+    [olu.email, 'co_northfield', 'success', 'Northfield Trading Ltd', 'default 0.50%; forwards as spot', 'default 0.80%; forwards 1.20%; GBPUSD sell 0.40%; EURUSD both 0.35%; from GBP 50000: 0.60%', 'nobody: one person may change a margin'],
+  ]);
   const entry = (await audit('ops.company.margin')).find((item) => item.outcome === 'success');
-  assert.deepEqual([entry?.target?.id, entry?.detail.from, entry?.detail.to, entry?.detail.approvedBy, entry?.actor.label], ['co_northfield', 'default 50 bp; forwards as spot', 'default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from GBP 50000: 60 bp', admin.email, olu.email]);
-  assert.equal((await audit('ops.approval.approve')).find((item) => item.detail.request === id)?.detail.passwordChecked, 'yes');
-  assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, new RegExp(`Now: <strong>default 80 bp; forwards 120 bp; GBPUSD sell 40 bp; EURUSD both 35 bp; from GBP 50000: 60 bp</strong> \\(set [^)]* by ${olu.email}, approved by ${admin.email}\\)`));
+  assert.deepEqual([entry?.target?.id, entry?.detail.from, entry?.detail.to, entry?.actor.label], ['co_northfield', 'default 0.50%; forwards as spot', 'default 0.80%; forwards 1.20%; GBPUSD sell 0.40%; EURUSD both 0.35%; from GBP 50000: 0.60%', olu.email]);
+  assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, new RegExp(`Now: <strong>default 0\\.80%; forwards 1\\.20%; GBPUSD sell 0\\.40%; EURUSD both 0\\.35%; from GBP 50000: 0\\.60%</strong> \\(set [^)]* by ${olu.email}\\)`));
+  // The form now shows what is stored, in percent, ready to be edited.
+  assert.match((await pat.browser.get('/ops/companies/co_northfield')).body, /name="defaultPercent"[^>]*value="0\.80">[^]*name="forwardPercent"[^>]*value="1\.20">[^]*>GBPUSD sell 0\.40\nEURUSD both 0\.35<\/textarea>[^]*>50000 0\.60<\/textarea>/);
+  // THE OTHER STAFF ARE SHOWN IT: a list of the last seven days' margin changes, with who and when, where they look for approvals.
+  const told = (await admin.browser.get('/ops/approvals')).body;
+  assert.match(told, new RegExp(`<h2>Margin changes in the last 7 days</h2>[^]*<td><a href="/ops/companies/co_northfield">Northfield Trading Ltd</a></td><td>${olu.email}</td><td>default 0\\.50%; forwards as spot</td><td>default 0\\.80%; forwards 1\\.20%; GBPUSD sell 0\\.40%; EURUSD both 0\\.35%; from GBP 50000: 0\\.60%</td>`));
+  assert.match((await pat.browser.get('/ops/approvals')).body, /Margin changes in the last 7 days/);
   // The other company is untouched.
   assert.equal(await h.stores.margins.get('co_castlebrook'), null);
 
-  // Asking for what is already there is refused; a high margin is accepted only with the flag, and the approver is warned.
-  assert.match((await olu.act(url, form({ overrides: 'GBPUSD sell 40\nEURUSD both 35', tiers: '50000 60', forwardBps: '120' }))).body, /That is already this company’s margin/);
-  const high = await olu.act(url, form({ defaultBps: '450', allowHigh: 'yes' }));
-  assert.equal(high.status, 303, high.body.slice(-300));
-  assert.match((await h.stores.ops.approvals.get(idOf(high.location)))?.warnings.join(' ') ?? '', /This sets a margin of 450 basis points \(4\.5%\), above the usual limit of 300\. It was asked for explicitly\./);
-  // What is stored is checked again when the request is carried out: a request whose stored figures were altered is refused.
-  const tampered = await pat.act(url, form({ defaultBps: '60' }));
-  await h.stores.ops.approvals.mutate(idOf(tampered.location), (record) => (record ? { ...record, params: { ...record.params, config: JSON.stringify({ defaultBps: 1500, forwardBps: null, overrides: [], tiers: [] }) } } : record));
-  assert.match((await admin.act(`/ops/approvals/${idOf(tampered.location)}/approve`)).body, /is 1500 basis points/);
-  assert.equal((await stored())?.defaultBps, 80);
-  // STALE: a second request made from the same starting point is refused once the first has been carried out.
-  const other = await pat.act(url, form({ defaultBps: '70' }));
-  assert.equal((await admin.act(`/ops/approvals/${idOf(high.location)}/approve`)).status, 303);
-  assert.equal((await stored())?.defaultBps, 450);
-  const stale = await admin.act(`/ops/approvals/${idOf(other.location)}/approve`);
-  assert.match(stale.body, /margin changed since this was requested/);
-  assert.equal((await stored())?.defaultBps, 450);
+  // What is already there is refused; a high margin needs the tick-box, and the confirmation page then warns.
+  assert.match((await change(pat, wanted)).body, /That is already this company’s margin/);
+  const high = await fill(pat, { defaultPercent: '4.5', allowHigh: 'yes' });
+  assert.match(high.body, /This sets a margin of 4\.50%, above the usual limit of 3\.00%\. It was asked for explicitly\./);
+  assert.match(high.body, /Allow|allowHigh/);
+  // STALE: two people start from the same margin. The second to confirm is refused, because it changed under them.
+  h.clock.advance(1000);
+  assert.equal((await change(admin, { defaultPercent: '0.70' })).status, 303);
+  const stale = await pat.browser.submit(url);
+  assert.equal(stale.status, 409);
+  assert.match(stale.body, /That confirmation has expired, or what it would do has changed since it was shown\. Nothing was done\. Check what is shown now and confirm again\./);
+  assert.match(stale.body, /FROM default 0\.70%; forwards as spot TO default 4\.50%/, 'the page now shows the change from where things really stand');
+  assert.equal((await stored())?.defaultBps, 70);
+  assert.equal((await audit('ops.margin.changed')).length, 2);
+
+  // A REQUEST LEFT OVER from when a margin change needed a second person: it cannot be approved (its figures are old).
+  // Its requester cancels it; the change itself is made on the company's page.
+  await h.stores.ops.approvals.put('req_leftover', { id: 'req_leftover', action: 'company.margin', params: { id: 'co_northfield', config: JSON.stringify({ defaultBps: 15, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP' }), from: JSON.stringify({ defaultBps: 70, forwardBps: null, overrides: [], tiers: [], tierCurrency: 'GBP' }), allowHigh: 'no' }, summary: 'Change the FX margin (made before one person could)', warnings: [], target: { type: 'company', id: 'co_northfield', label: 'Northfield Trading Ltd' }, requestedBy: { id: olu.id, email: olu.email }, requestedAt: h.clock.now, expiresAt: h.clock.now + 60 * 60_000, status: 'pending', decidedBy: null, decidedAt: null });
+  const leftover = await admin.act('/ops/approvals/req_leftover/approve');
+  assert.equal(leftover.status, 409);
+  assert.match(leftover.body, /Margin changes no longer need a second person, so this request cannot be approved\. Its requester can cancel it/);
+  assert.equal((await stored())?.defaultBps, 70);
+  assert.equal((await olu.act('/ops/approvals/req_leftover/cancel')).status, 303);
+  assert.equal((await h.stores.ops.approvals.get('req_leftover'))?.status, 'cancelled');
+  // EVERYTHING ELSE still takes two people: the same ops user asking for something else only makes a request.
+  const other = await olu.act('/ops/users/usr_ben/activation-link');
+  assert.match(other.location, /^\/ops\/approvals\/req_/);
+  assert.equal((await h.stores.ops.approvals.get(idOf(other.location)))?.status, 'pending');
+  // After a week the change is no longer on the list (it stays in the audit log).
+  h.clock.advance(7 * 24 * 60 * 60_000 + 1000);
+  await signIn(admin.browser, admin.email, admin.secret);
+  assert.doesNotMatch((await admin.browser.get('/ops/approvals')).body, /Margin changes in the last 7 days/);
+  h.clock.advance(-(7 * 24 * 60 * 60_000 + 1000));
+  for (const person of [admin, olu, pat]) {
+    await signIn(person.browser, person.email, person.secret);
+    await person.browser.get('/ops/users');
+  }
 
   // REVENUE: a booked conversion appears, with both rates, the margin and the revenue; totals by company and month; CSV. Ops admins only.
   await h.stores.margins.mutate('co_northfield', (current) => (current ? { ...current, defaultBps: 80, overrides: [], tiers: [], forwardBps: null } : current));
@@ -1971,7 +2038,7 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const revenue = await admin.browser.get('/ops/revenue');
   assert.equal(revenue.status, 200);
   assert.match(revenue.body, /<td>Northfield Trading Ltd<\/td><td>2026-11<\/td><td>1<\/td><td>USD 10\.40<\/td>/);
-  assert.match(revenue.body, /sold GBP 1000\.00, bought USD 1289\.60<\/td><td>1\.3000<\/td><td>1\.289600<\/td><td>80 bp \(80\.00 after rounding\)<\/td><td>USD 10\.40<\/td><td>Booked<\/td>/);
+  assert.match(revenue.body, /sold GBP 1000\.00, bought USD 1289\.60<\/td><td>1\.3000<\/td><td>1\.289600<\/td><td>0\.80% \(0\.80% after rounding\)<\/td><td>USD 10\.40<\/td><td>Booked<\/td>/);
   assert.match((await admin.browser.get('/ops/revenue?company=co_castlebrook')).body, /No conversions in this period/);
   assert.match((await admin.browser.get('/ops/revenue?from=2026-11-11&to=2026-11-11')).body, /USD 10\.40/);
   assert.match((await admin.browser.get('/ops/revenue?from=2026-11-12')).body, /No conversions in this period/);
@@ -1981,9 +2048,9 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   assert.equal(csv.status, 200);
   assert.match(String(csv.headers['content-type']), /^text\/csv/);
   const lines = csv.body.trim().split('\r\n');
-  assert.equal(lines[0], 'booked_at,company_id,company,conversion_id,status,kind,pair,direction,sell_currency,buy_currency,provider_rate,client_rate,provider_sell_amount,provider_buy_amount,client_sell_amount,client_buy_amount,margin_bps,effective_margin_bps,margin_applied_by,revenue_amount,revenue_currency,counted_in_totals,booked_sell_amount,booked_buy_amount,needs_checking');
+  assert.equal(lines[0], 'booked_at,company_id,company,conversion_id,status,kind,pair,direction,sell_currency,buy_currency,provider_rate,client_rate,provider_sell_amount,provider_buy_amount,client_sell_amount,client_buy_amount,margin_percent,effective_margin_percent,margin_applied_by,revenue_amount,revenue_currency,counted_in_totals,booked_sell_amount,booked_buy_amount,needs_checking');
   assert.equal(lines.length, 2);
-  assert.equal(lines[1], `2026-11-11T${new Date(h.clock.now).toISOString().slice(11)},co_northfield,Northfield Trading Ltd,${booked.json.id},booked,spot,GBPUSD,sell,GBP,USD,1.3000,1.289600,1000.00,1300.00,1000.00,1289.60,80,80.00,server,10.40,USD,yes,1000.00,1289.60,no`);
+  assert.equal(lines[1], `2026-11-11T${new Date(h.clock.now).toISOString().slice(11)},co_northfield,Northfield Trading Ltd,${booked.json.id},booked,spot,GBPUSD,sell,GBP,USD,1.3000,1.289600,1000.00,1300.00,1000.00,1289.60,0.80,0.80,server,10.40,USD,yes,1000.00,1289.60,no`);
   const exported = (await audit('ops.revenue.export'))[0];
   assert.equal((await audit('ops.revenue.export')).length, exports + 1);
   assert.deepEqual([exported?.actor.label, exported?.detail.rows, exported?.detail.company], [admin.email, '1', 'co_northfield']);
@@ -2000,7 +2067,7 @@ test('ops: a company’s FX margin is changed by request with a worked example, 
   const withOdd = (await admin.browser.get('/ops/revenue')).body;
   assert.match(withOdd, /<td>Northfield Trading Ltd<\/td><td>2026-11<\/td><td>1<\/td><td>USD 10\.40<\/td>/, 'the total did not grow');
   assert.match(withOdd, /<h2>Booked WITHOUT the client’s terms: not in the totals<\/h2>[^]*<td>sell GBP 500\.00, buy USD 644\.80 at 1\.289600<\/td><td>sell GBP 500\.00, buy USD 650\.00 at 1\.3000<\/td><td>USD 5\.20<\/td>/);
-  assert.match((await admin.browser.get('/ops/revenue.csv?company=co_northfield')).body, /,644\.80,80,80\.00,server,5\.20,USD,no,500\.00,650\.00,yes\r\n/);
+  assert.match((await admin.browser.get('/ops/revenue.csv?company=co_northfield')).body, /,644\.80,0\.80,0\.80,server,5\.20,USD,no,500\.00,650\.00,yes\r\n/);
   // A company name that a spreadsheet would run as a formula is written as text.
   await h.stores.directory.updateCompany('co_northfield', (company) => ({ ...company, name: '=HYPERLINK("http://x.example","Northfield, Ltd")' }));
   assert.match((await admin.browser.get('/ops/revenue.csv')).body, /,co_northfield,"'=HYPERLINK\(""http:\/\/x\.example"",""Northfield, Ltd""\)",/);
