@@ -262,6 +262,22 @@ The server restarts and from then on sends through that service; nothing is prin
 the log any more, so activation links arrive only by email. The **Mail** page in the ops
 console shows how many messages are waiting, sent or failed (never their content). To go
 back to the log: `fly secrets unset SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD MAIL_FROM`.
+
+**One staff account can do everything (single-person mode).** The ops console runs in
+single-person mode by default: the member of staff who starts an action carries it out
+after a confirmation page, with no second person. The server log says so at every
+start. Until an oversight address is set, every console page also carries a warning
+that nobody is told of high-impact changes afterwards. To have each one reported to
+somebody who is not using the console (with real email set up as above; without it
+the notice is printed in the log like every other email):
+
+```bash
+fly secrets set OPS_OVERSIGHT_EMAILS=director@your-domain.example
+```
+
+To require a second member of staff for sensitive actions instead:
+`fly secrets set OPS_APPROVALS=two-person`. The README section "Ops modes" says what
+each mode does and does not protect against.
 Only use addresses you own: this is a demo with sample accounts, and the footer of every
 email is still a placeholder.
 

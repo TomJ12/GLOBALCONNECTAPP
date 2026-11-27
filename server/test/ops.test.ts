@@ -2334,6 +2334,11 @@ twoPerson('TWO-PERSON MODE still enforces what it did, margins included: a margi
   const now = await h.stores.margins.get('co_northfield');
   assert.deepEqual([now?.defaultBps, now?.updatedBy, now?.approvedBy], [80, olu.email, admin.email]);
   assert.deepEqual((await audit('ops.margin.changed')).map((entry) => [entry.actor.label, entry.detail.approvedBy, entry.detail.to]), [[olu.email, admin.email, 'default 0.80%; forwards as spot']]);
+  // Nobody approves their own request, ops admin or not.
+  const own = await admin.act('/ops/users/usr_dana/activation-link');
+  const mine = await admin.act(`/ops/approvals/${idOf(own.location)}/approve`);
+  assert.equal(mine.status, 403);
+  assert.match(mine.body, /You cannot approve, finish or close your own request\. A different staff member must do it\./);
   // Everything else is a request too (here: an activation link), and the Approvals page stays in the navigation.
   assert.match((await olu.act('/ops/users/usr_ben/activation-link')).location, /^\/ops\/approvals\/req_/);
   assert.match((await olu.browser.get('/ops/users')).body, /<a href="\/ops\/approvals">Approvals<\/a>/);
